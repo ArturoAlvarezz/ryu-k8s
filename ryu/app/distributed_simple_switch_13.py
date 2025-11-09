@@ -54,15 +54,17 @@ class DistributedSimpleSwitch13(app_manager.RyuApp):
                     port=redis_port,
                     db=redis_db,
                     decode_responses=True,
-                    socket_connect_timeout=5,
+                    socket_connect_timeout=10,
+                    socket_timeout=10,
                     socket_keepalive=True,
-                    health_check_interval=30
+                    health_check_interval=30,
+                    retry_on_timeout=True
                 )
                 # Test connection
                 self.redis_client.ping()
                 self.logger.info("Connected to Redis at %s:%d", redis_host, redis_port)
             except Exception as e:
-                self.logger.error("Failed to connect to Redis: %s", e)
+                self.logger.warning("Failed to connect to Redis: %s - Falling back to local memory", e)
                 self.redis_client = None
         
         # Fallback to local memory if Redis is not available
