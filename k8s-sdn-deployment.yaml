@@ -1,0 +1,91 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sdn-controller
+---
+# ==========================
+# Redis Components
+# ==========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: sdn-controller
+spec:
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: sdn-controller
+spec:
+  replicas: 1 # For production, consider using a Redis cluster or Sentinel
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+# ==========================
+# Distributed Ryu Controller Components
+# ==========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ryu-openflow
+  namespace: sdn-controller
+spec:
+  type: LoadBalancer # Exposes the service externally. For K3s, this will use Klipper. NodePort is also a valid fallback.
+  ports:
+  - name: openflow-6653
+    port: 6653
+    targetPort: 6653
+    protocol: TCP
+  - name: openflow-6633
+    port: 6633
+    targetPort: 6633
+    protocol: TCP
+  selector:
+    app: ryu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ryu
+  namespace: sdn-controller
+spec:
+  replicas: 3 # Scaling out Ryu for resiliency
+  selector:
+    matchLabels:
+      app: ryu
+  template:
+    metadata:
+      labels:
+        app: ryu
+    spec:
+      containers:
+      - name: ryu
+        image: arturoalvarez/ryu-controller:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: REDIS_HOST
+          value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
+        - name: REDIS_PORT
+          value: "6379"
+        ports:
+        - containerPort: 6653
+        - containerPort: 6633
