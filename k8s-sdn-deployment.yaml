@@ -80,7 +80,7 @@ spec:
       containers:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         env:
         - name: REDIS_HOST
           value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
