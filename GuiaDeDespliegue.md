@@ -46,9 +46,32 @@ network:
         addresses:
           - 8.8.8.8
           - 1.1.1.1
+
+network:
+  version: 2
+  ethernets:
+    ens3:
+      dhcp4: false
+    ens4:
+      dhcp4: false
+    ens5:
+      dhcp4: false
+  bridges:
+    br0:
+      interfaces: [ens3, ens4, ens5]
+      addresses:
+        - 192.168.122.103/24
+      routes:
+        - to: default
+          via: 192.168.122.1
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 1.1.1.1
 ```
 
 ```bash
+sudo iptables -I FORWARD -i br0 -o br0 -j ACCEPT
 sudo netplan apply
 sudo reboot
 ```
