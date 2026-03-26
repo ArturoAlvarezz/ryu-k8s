@@ -89,3 +89,68 @@ spec:
         - containerPort: 6653
         - containerPort: 6633
 
+---
+# ==========================
+# Auto-Configurador de OVS Host (DaemonSet) - Compatible Kernel Host
+# ==========================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ovs-sdn-initializer
+  namespace: sdn-controller
+spec:
+  selector:
+    matchLabels:
+      app: ovs-init
+  template:
+    metadata:
+      labels:
+        app: ovs-init
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: ovs-configurator
+        image: ubuntu:22.04  # Usamos la misma base nativa del nodo anfitrión
+        securityContext:
+          privileged: true
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Instalando Open vSwitch..."
+          apt-get update > /dev/null
+          apt-get install -y openvswitch-switch kmod iproute2 > /dev/null
+          
+          echo "Cargando módulo del kernel..."
+          modprobe openvswitch || true
+          
+          echo "Iniciando servicio OVS..."
+          service openvswitch-switch start
+          
+          sleep 5
+          
+          echo "Creando br-sdn..."
+          ovs-vsctl --may-exist add-br br-sdn
+          
+          echo "Conectando al controlador Ryu..."
+          ovs-vsctl set bridge br-sdn protocols=OpenFlow13
+          ovs-vsctl set-controller br-sdn tcp:192.168.122.100:6653
+          
+          echo "Listo. Manteniendo Pod vivo..."
+          tail -f /dev/null
+        volumeMounts:
+        - name: libmodules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: run-openvswitch
+          mountPath: /var/run/openvswitch
+      volumes:
+      - name: libmodules
+        hostPath:
+          path: /lib/modules
+      - name: run-openvswitch
+        hostPath:
+          path: /var/run/openvswitch
+          type: DirectoryOrCreate
+
