@@ -63,12 +63,11 @@ spec:
     app: ryu
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: ryu
   namespace: sdn-controller
 spec:
-  replicas: 3 # Scaling out Ryu for resiliency
   selector:
     matchLabels:
       app: ryu
