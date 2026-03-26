@@ -137,8 +137,33 @@ spec:
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
           ovs-vsctl set-controller br-sdn tcp:192.168.122.100:6653
           
-          echo "Listo. Manteniendo Pod vivo..."
-          tail -f /dev/null
+          echo "Auto-Configurando Túneles VXLAN..."
+          MY_IP=$(ip a show br0 | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+          if [ "$MY_IP" != "192.168.122.100" ]; then
+             # Los Workers se conectan al Maestro
+             ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
+          else
+             # El Maestro se conecta a los Workers
+             ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101
+             ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102
+             ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103
+          fi
+          
+          echo "Entrando en modo Plug&Play para atrapar Guests..."
+          while true; do
+            for intf in $(ls /sys/class/net | grep -E "^ens|^eth"); do
+              # Ignorar cables principales (que están en el br0 físico de K3s)
+              if ! ip link show $intf | grep -q "master br0"; then
+                 # Si el cable está libre, forzar encendido y meter a OVS
+                 if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then
+                    echo "Auto-detectado nuevo Guest en $intf. Añadiendo a la red SDN..."
+                    ip link set $intf up > /dev/null 2>&1 || true
+                    ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
+                 fi
+              fi
+            done
+            sleep 5
+          done
         volumeMounts:
         - name: libmodules
           mountPath: /lib/modules
