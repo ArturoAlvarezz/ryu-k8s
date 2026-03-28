@@ -132,12 +132,11 @@ spec:
           echo "Limpiando estado anterior para evitar fantasmas..."
           ovs-vsctl --if-exists del-br br-sdn
           
-          # Generar un ID predecible para OVS (DPID) basado en su IP (Ej: 192.168.122.103 -> 0000000000000103)
-          MY_IP=$(ip a show br0 | grep "inet " | awk '{print $2}' | cut -d/ -f1)
-          LAST_OCTET=$(echo $MY_IP | cut -d. -f4)
-          DPID=$(printf "0000000000000%03d" $LAST_OCTET)
+          # Generar el DPID permanente usando la MAC principal de la máquina (br0) tal como los switches físicos
+          MAC_ADDR=$(ip link show br0 | awk '/ether/ {print $2}' | tr -d ':')
+          DPID="0000${MAC_ADDR}"
           
-          echo "Creando br-sdn con DPID estático: $DPID..."
+          echo "Creando br-sdn con DPID físico estático: $DPID..."
           ovs-vsctl --may-exist add-br br-sdn
           ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
           
