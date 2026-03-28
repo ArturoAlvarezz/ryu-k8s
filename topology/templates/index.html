@@ -255,19 +255,10 @@
             fetch('/api/topology')
                 .then(res => res.json())
                 .then(data => {
-                    currentData = data;
-                    buildSidebar(data);
+                    // Inicializar contenedores vacíos para permitir usar updateNetwork con Dataset vacío
+                    nodesDataset = new vis.DataSet();
+                    edgesDataset = new vis.DataSet();
                     
-                    // Map groups to styling
-                    data.nodes.forEach(n => {
-                        if (n.group === 'maestro') Object.assign(n, maestroIcon);
-                        else if (n.group === 'worker') Object.assign(n, workerIcon);
-                        else if (n.group === 'guest') Object.assign(n, guestIcon);
-                    });
-
-                    nodesDataset = new vis.DataSet(data.nodes);
-                    edgesDataset = new vis.DataSet(data.edges);
-
                     const container = document.getElementById('mynetwork');
                     const graphData = { nodes: nodesDataset, edges: edgesDataset };
                     
@@ -292,6 +283,9 @@
                     };
 
                     network = new vis.Network(container, graphData, options);
+
+                    // Reutilizar la función centralizada
+                    updateNetwork(data);
                 })
                 .catch(err => console.error("Error fetching topology", err));
         }
@@ -342,19 +336,55 @@
             });
         }
 
-        function resetColors() {
-            // Revert edges to original colors
-            const updates = edgesDataset.get().map(e => {
-                let color = "#00ffcc"; // link to worker
-                if(e.dashes) color = "#ff00ee"; // link to guest
-                return {
-                    id: e.id,
-                    color: { color: color, highlight: color, hover: color },
-                    width: e.dashes ? 1 : 3,
-                    shadow: { enabled: true, color: "rgba(0,0,0,0.5)" }
-                };
+        function updateNetwork(data) {
+            currentData = data;
+            buildSidebar(data);
+            let currentBlocked = data.blocked_edges || [];
+
+            // Refrescar Nodos
+            data.nodes.forEach(n => {
+                if(!nodesDataset.get(n.id)) {
+                     if (n.group === 'maestro') Object.assign(n, maestroIcon);
+                     else if (n.group === 'worker') Object.assign(n, workerIcon);
+                     else if (n.group === 'guest') Object.assign(n, guestIcon);
+                     nodesDataset.add(n);
+                }
             });
-            edgesDataset.update(updates);
+
+            // Refrescar y colorear Enlaces basado en la realidad de Spanning Tree (RSTP Analytics)
+            data.edges.forEach(e => {
+                let isBlocked = currentBlocked.find(b => 
+                   (b.from === e.from && b.to === e.to) || (b.from === e.to && b.to === e.from)
+                );
+                
+                let isGuestLink = (e.title === "Cable Físico Local" || e.color === "#ff00ee");
+                let targetColor = isBlocked ? "#880000" : (isGuestLink ? "#ff00ee" : "#00ffcc");
+                
+                let newProps = {
+                    color: { color: targetColor, highlight: targetColor, hover: targetColor },
+                    dashes: isBlocked ? [10, 10] : (isGuestLink ? true : false),
+                    width: (isBlocked || isGuestLink) ? 1 : 3,
+                    is_blocked: isBlocked ? true : false,
+                    title: isBlocked ? "⛔ ENLACE DESACTIVADO (SPANNING TREE)" : (e.title || "Enlace VXLAN Activo")
+                };
+
+                const existing = edgesDataset.get({
+                    filter: item => (item.from === e.from && item.to === e.to) || (item.from === e.to && item.to === e.from)
+                });
+                
+                if(existing.length === 0) {
+                    e.id = e.from + "-" + e.to; // force predictable IDs
+                    edgesDataset.add(Object.assign(e, newProps));
+                } else {
+                    edgesDataset.update({id: existing[0].id, ...newProps});
+                }
+            });
+        }
+
+        function resetColors() {
+            if(currentData) {
+                updateNetwork(currentData);
+            }
         }
 
         function getEdge(n1, n2) {
@@ -387,8 +417,10 @@
                 }
 
                 // Encontrar vecinos a través del Dataset de Enlaces Vis.js
+                // IMPORTANTE: El BFS ahora tiene PROHIBIDO usar túneles apagados por RSTP.
+                // Replicando así el viaje matemático exacto de los paquetes en la vida real.
                 let connectedEdges = edgesDataset.get({
-                    filter: item => item.from === lastNode || item.to === lastNode
+                    filter: item => (item.from === lastNode || item.to === lastNode) && item.is_blocked !== true
                 });
 
                 for(let edge of connectedEdges) {
@@ -440,26 +472,7 @@
             fetch('/api/topology')
                 .then(res => res.json())
                 .then(data => {
-                    currentData = data;
-                    buildSidebar(data);
-                    
-                    // Simple logic to add missing nodes/edges without destroying physical positions
-                    data.nodes.forEach(n => {
-                        if(!nodesDataset.get(n.id)) {
-                             if (n.group === 'maestro') Object.assign(n, maestroIcon);
-                             else if (n.group === 'worker') Object.assign(n, workerIcon);
-                             else if (n.group === 'guest') Object.assign(n, guestIcon);
-                             nodesDataset.add(n);
-                        }
-                    });
-                    data.edges.forEach(e => {
-                        const existing = edgesDataset.get({
-                            filter: item => (item.from === e.from && item.to === e.to) || (item.from === e.to && item.to === e.from)
-                        });
-                        if(existing.length === 0) {
-                            edgesDataset.add(e);
-                        }
-                    });
+                    updateNetwork(data);
                 });
         }, 10000);
 

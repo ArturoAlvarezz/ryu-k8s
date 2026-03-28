@@ -160,30 +160,40 @@ spec:
           # El anillo lógico será: Maestro -> W1 -> W2 -> W3 -> W4 -> Maestro
           case "$NODE_NAME" in
              "nodo-k3s-maestro")
-                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101
-                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104
+                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
+                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
                 ;;
              "nodo-k3s-worker1")
-                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
-                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102
+                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
+                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
                 ;;
              "nodo-k3s-worker2")
-                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101
-                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103
+                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
+                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
                 ;;
              "nodo-k3s-worker3")
-                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102
-                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104
+                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
+                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
                 ;;
              "nodo-k3s-worker4")
-                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103
-                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
+                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
+                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
                 ;;
           esac
           
-          echo "Entrando en modo Plug&Play blindado para Guests..."
+          echo "Entrando en modo Plug&Play blindado para Guests y Sonda Analítica BFD/RSTP..."
           while true; do
-            # Solo buscar a partir del puerto ens6 en adelante para no robar las tarjetas principales de K3s (ens3, ens4, ens5)
+            # 1. Telemetría a Redis de túneles descartados/bloqueados por Spanning Tree
+            for port in $(ovs-vsctl list-ports br-sdn | grep vx-); do
+                 state=$(ovs-vsctl get port $port rstp_status:rstp_port_state 2>/dev/null | tr -d '"')
+                 if [ "$state" = "Discarding" ]; then
+                     redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:blocked_ports "$DPID:$port" 1 > /dev/null 2>&1 || true
+                 else
+                     redis-cli -h redis.sdn-controller.svc.cluster.local HDEL topology:blocked_ports "$DPID:$port" > /dev/null 2>&1 || true
+                 fi
+            done
+            
+            # 2. Solo buscar a partir del puerto ens6 en adelante para añadir Guests locales de la máquina física
             for intf in $(ls /sys/class/net | grep -E "ens[6-9]|ens[1-9][0-9]"); do
                  # Si el cable está libre, forzar encendido y meter a OVS
                  if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then

@@ -114,6 +114,39 @@ def get_topology():
                     "width": 3,
                     "smooth": {"type": "curvedCW"}
                 })
+                
+        # Extraer Telemetría de Protección de Bucles (RSTP Analytics)
+        blocked_ports = r.hgetall('topology:blocked_ports')
+        blocked_edges = []
+        for key in blocked_ports.keys():
+            if ":" not in key:
+                continue
+            src_raw_dpid, port_name = key.split(":")
+            
+            # Encontrar el DPID numérico original del source
+            src_dpid = None
+            for d in switches:
+                if get_raw_dpid(d) == src_raw_dpid:
+                    src_dpid = d
+                    break
+                    
+            if not src_dpid:
+                continue
+                
+            # Determinar el nodo destino inspeccionando el nombre físico del puerto (ej: vx-m -> maestro)
+            dst_role = None
+            if port_name == "vx-m": dst_role = "maestro"
+            elif port_name == "vx-w1": dst_role = "w1"
+            elif port_name == "vx-w2": dst_role = "w2"
+            elif port_name == "vx-w3": dst_role = "w3"
+            elif port_name == "vx-w4": dst_role = "w4"
+            
+            dst_dpid = role_to_dpid.get(dst_role)
+            if src_dpid and dst_dpid:
+                blocked_edges.append({
+                    "from": src_dpid,
+                    "to": dst_dpid
+                })
 
         # Agregar los guests al gráfico y dibujar sus conexiones a sus switches padre
         for guest in guests:
@@ -135,6 +168,7 @@ def get_topology():
             "nodes": nodes,
             "edges": edges,
             "guests": guests,
+            "blocked_edges": blocked_edges,
             "maestro_dpid": maestro_dpid
         })
     except Exception as e:
