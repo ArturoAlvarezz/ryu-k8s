@@ -370,30 +370,37 @@
             
             const srcGuest = currentData.guests.find(g => g.id === srcGuestId);
             const dstGuest = currentData.guests.find(g => g.id === dstGuestId);
-            const maestro = currentData.maestro_dpid;
 
             if(!srcGuest || !dstGuest) return [];
 
-            let pathNodes = [];
-            
-            // If they are on the exact same switch
-            if(srcGuest.switch === dstGuest.switch) {
-                pathNodes = [srcGuest.id, srcGuest.switch, dstGuest.id];
-            } 
-            // If Source is on Maestro, Destination on Worker
-            else if(srcGuest.switch === maestro) {
-                pathNodes = [srcGuest.id, maestro, dstGuest.switch, dstGuest.id];
-            }
-            // If Source is on Worker, Destination on Maestro
-            else if(dstGuest.switch === maestro) {
-                pathNodes = [srcGuest.id, srcGuest.switch, maestro, dstGuest.id];
-            }
-            // Both are on different Workers
-            else {
-                pathNodes = [srcGuest.id, srcGuest.switch, maestro, dstGuest.switch, dstGuest.id];
+            // Algoritmo BFS (Breadth-First Search) para encontrar el camino más corto en el Anillo
+            let queue = [[srcGuest.id]];
+            let visited = new Set();
+            visited.add(srcGuest.id);
+
+            while(queue.length > 0) {
+                let path = queue.shift();
+                let lastNode = path[path.length - 1];
+
+                if(lastNode === dstGuest.id) {
+                    return path;
+                }
+
+                // Encontrar vecinos a través del Dataset de Enlaces Vis.js
+                let connectedEdges = edgesDataset.get({
+                    filter: item => item.from === lastNode || item.to === lastNode
+                });
+
+                for(let edge of connectedEdges) {
+                    let neighbor = (edge.from === lastNode) ? edge.to : edge.from;
+                    if(!visited.has(neighbor)) {
+                        visited.add(neighbor);
+                        queue.push([...path, neighbor]);
+                    }
+                }
             }
 
-            return pathNodes;
+            return [];
         }
 
         function tracePath() {

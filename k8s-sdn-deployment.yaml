@@ -153,17 +153,33 @@ spec:
           echo "Registrando nodo en base de datos global (Redis)..."
           redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:node_names $DPID $NODE_NAME || true
           
-          echo "Auto-Configurando Túneles VXLAN..."
-          if [ "$NODE_NAME" != "nodo-k3s-maestro" ]; then
-             # Los Workers se conectan al Maestro
-             ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
-          else
-             # El Maestro pre-construye túneles para todas las IPs trabajadoras esperadas (.101 a .110)
-             for i in 1 2 3 4 5 6 7 8 9 10; do
-                ip_suffix=$((100 + i))
-                ovs-vsctl --may-exist add-port br-sdn vx-w${i} -- set interface vx-w${i} type=vxlan options:remote_ip=192.168.122.${ip_suffix} > /dev/null 2>&1 || true
-             done
-          fi
+          echo "Activando Protocolo RSTP (Anti-Bucles)..."
+          ovs-vsctl set bridge br-sdn rstp_enable=true
+          
+          echo "Auto-Configurando Túneles VXLAN en Modo Anillo (Ring Topology)..."
+          # El anillo lógico será: Maestro -> W1 -> W2 -> W3 -> W4 -> Maestro
+          case "$NODE_NAME" in
+             "nodo-k3s-maestro")
+                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101
+                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104
+                ;;
+             "nodo-k3s-worker1")
+                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
+                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102
+                ;;
+             "nodo-k3s-worker2")
+                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101
+                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103
+                ;;
+             "nodo-k3s-worker3")
+                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102
+                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104
+                ;;
+             "nodo-k3s-worker4")
+                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103
+                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
+                ;;
+          esac
           
           echo "Entrando en modo Plug&Play blindado para Guests..."
           while true; do

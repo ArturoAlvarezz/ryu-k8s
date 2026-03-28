@@ -24,23 +24,32 @@ def get_topology():
         edges = []
         guests = []
         
-        maestro_dpid = None
-        
         def get_raw_dpid(dpid_decimal):
             try:
                 return "0000" + hex(int(dpid_decimal))[2:].zfill(12)
             except Exception:
                 return dpid_decimal
         
-        # Identificar qué DPID pertenece al Maestro
+        maestro_dpid = None
+        role_to_dpid = {}
+
+        # Mapear roles lógicos a sus respectivos DPID dinámicos
         for dpid in switches:
             raw_dpid = get_raw_dpid(dpid)
-            name = node_names.get(raw_dpid, "")
-            if "maestro" in name.lower():
+            name = node_names.get(raw_dpid, "").lower()
+            if "maestro" in name:
                 maestro_dpid = dpid
-                break
+                role_to_dpid["maestro"] = dpid
+            elif "worker1" in name:
+                role_to_dpid["w1"] = dpid
+            elif "worker2" in name:
+                role_to_dpid["w2"] = dpid
+            elif "worker3" in name:
+                role_to_dpid["w3"] = dpid
+            elif "worker4" in name:
+                role_to_dpid["w4"] = dpid
 
-        # Construir la red física de switches (K3s Nodes)
+        # Construir nodos físicos de switches (K3s Nodes)
         for dpid in switches:
             raw_dpid = get_raw_dpid(dpid)
             # Convertir el identificador decimal de vuelta a la MAC hexadecimal original para la UI
@@ -63,16 +72,6 @@ def get_topology():
                 "title": f"DPID Numérico: {dpid}"
             })
             
-            # Dibujar el enlace maestro-worker de la topología estrella de VXLAN
-            if not is_maestro and maestro_dpid:
-                edges.append({
-                    "from": maestro_dpid,
-                    "to": dpid,
-                    "color": "#00ffcc",
-                    "width": 3,
-                    "smooth": {"type": "curvedCW"}
-                })
-            
             # Escanear tabla de direcciones MAC aprendidas para encontrar a los Guests locales
             mac_table = r.hgetall(f"mac_to_port:{dpid}")
             for mac, port_str in mac_table.items():
@@ -81,18 +80,11 @@ def get_topology():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
                     
-                # Filtro algorítmico infalible:
-                # El script OVS en el DaemonSet asigna primero los puertos VXLAN.
-                # En Maestro: puertos VXLAN son 1..10.
-                # En Workers: puerto VXLAN es 1.
-                # Cualquier MAC aprendida en un puerto superior a su cuota VXLAN, significa que está físicamente conectada (Local Guest).
-                is_local_guest = False
-                if is_maestro and port > 10:
-                    is_local_guest = True
-                elif not is_maestro and port > 1:
-                    is_local_guest = True
-                    
-                if is_local_guest:
+                # Filtro algorítmico de Anillo (Ring):
+                # Cada nodo tiene ahora exactamente 2 túneles VXLAN configurados en su script inicial (Left/Right).
+                # Es decir, los puertos OVS virtuales 1 y 2 son las salidas del anillo al resto del clúster K3s.
+                # Cualquier MAC aprendida en un puerto > 2 pertenece obligadamente a un cable físico enchufado localmente (Guest).
+                if port > 2:
                     guest_id = mac
                     if guest_id not in [g['id'] for g in guests]:
                         guests.append({
@@ -102,6 +94,27 @@ def get_topology():
                             "switch": dpid
                         })
                         
+        # Enlazar la red OVS centralizada según la estructura topológica de Pentágono/Anillo Físico
+        ring_links = [
+            ("maestro", "w1"),
+            ("w1", "w2"),
+            ("w2", "w3"),
+            ("w3", "w4"),
+            ("w4", "maestro")
+        ]
+        
+        for src_role, dst_role in ring_links:
+            src_dpid = role_to_dpid.get(src_role)
+            dst_dpid = role_to_dpid.get(dst_role)
+            if src_dpid and dst_dpid:
+                edges.append({
+                    "from": src_dpid,
+                    "to": dst_dpid,
+                    "color": "#00ffcc",
+                    "width": 3,
+                    "smooth": {"type": "curvedCW"}
+                })
+
         # Agregar los guests al gráfico y dibujar sus conexiones a sus switches padre
         for guest in guests:
             nodes.append({
