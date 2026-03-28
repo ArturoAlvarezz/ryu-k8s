@@ -254,6 +254,12 @@ HGETALL mac_to_port:77356373094209
 kubectl logs -f -l app=ryu -n sdn-controller --prefix
 ```
 
+### 7.3 Asignarle ip a un guest
+
+```bash
+ip addr add 10.0.0.5/24 dev eth0
+```
+
 ---
 
 ## Referencia rápida de IPs

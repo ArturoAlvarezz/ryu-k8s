@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>⚡ SDN Controller | Neon Topology Live</title>
+    <!-- Use Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <!-- Vis.js -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #040404;
+            --panel-bg: rgba(28, 44, 100, 0.4);
+            --neon-blue: #00ffcc;
+            --neon-pink: #ff00ee;
+            --text-color: #e0f2fe;
+            --accent: #facc15;
+            --border: #00ffcc40;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            font-family: 'Share Tech Mono', monospace;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+            background-image: 
+                linear-gradient(rgba(0, 255, 204, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 255, 204, 0.05) 1px, transparent 1px);
+            background-size: 30px 30px;
+        }
+
+        h1, h2, h3 {
+            font-family: 'Orbitron', sans-serif;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-top: 0;
+            color: var(--neon-blue);
+            text-shadow: 0 0 10px rgba(0, 255, 204, 0.8);
+        }
+
+        /* Lateral Panel */
+        #sidebar {
+            width: 320px;
+            background: var(--panel-bg);
+            border-right: 1px solid var(--border);
+            backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+            z-index: 10;
+            box-shadow: 4px 0 15px rgba(0,0,0,0.5);
+        }
+
+        header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+            text-align: center;
+        }
+
+        header h1 {
+            font-size: 1.4rem;
+            margin-bottom: 5px;
+        }
+        .live-status {
+            color: var(--neon-pink);
+            font-size: 0.9rem;
+            text-shadow: 0 0 5px var(--neon-pink);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+
+        /* Accordion List */
+        #switch-list {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 15px;
+        }
+
+        .switch-block {
+            background: rgba(0,0,0,0.4);
+            border-left: 3px solid var(--neon-blue);
+            margin-bottom: 15px;
+            padding: 10px;
+            transition: all 0.3s ease;
+        }
+
+        .switch-block:hover {
+            border-left-color: var(--accent);
+            background: rgba(0,0,0,0.6);
+        }
+
+        .switch-title {
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: var(--text-color);
+            margin-bottom: 8px;
+        }
+
+        .guest-item {
+            font-size: 0.85rem;
+            padding: 5px;
+            margin-left: 10px;
+            color: var(--neon-pink);
+            border-top: 1px dashed rgba(255,0,238,0.3);
+            display: flex;
+            align-items: center;
+        }
+        
+        .guest-item::before {
+            content: "►";
+            margin-right: 8px;
+            font-size: 0.7rem;
+        }
+
+        /* Routing Tool Panel */
+        #routing-tool {
+            padding: 20px;
+            border-top: 1px solid var(--border);
+            background: rgba(0,0,0,0.5);
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--accent);
+            font-size: 0.9rem;
+            text-shadow: 0 0 5px rgba(250, 204, 21, 0.4);
+        }
+
+        select {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            color: var(--neon-blue);
+            border: 1px solid var(--neon-blue);
+            padding: 8px;
+            font-family: 'Share Tech Mono', monospace;
+            outline: none;
+            cursor: pointer;
+        }
+
+        button {
+            width: 100%;
+            background: var(--bg-color);
+            color: var(--neon-pink);
+            border: 2px solid var(--neon-pink);
+            padding: 10px;
+            font-family: 'Orbitron', sans-serif;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-shadow: 0 0 5px var(--neon-pink);
+            box-shadow: 0 0 10px rgba(255,0,238,0.2) inset;
+        }
+
+        button:hover {
+            background: var(--neon-pink);
+            color: black;
+            text-shadow: none;
+            box-shadow: 0 0 20px rgba(255,0,238,0.6);
+        }
+
+        /* Center Graph */
+        #network-container {
+            flex-grow: 1;
+            position: relative;
+        }
+
+        #mynetwork {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Tooltip style override */
+        .vis-tooltip {
+            background-color: rgba(0, 0, 0, 0.9) !important;
+            border: 1px solid var(--neon-blue) !important;
+            color: var(--neon-blue) !important;
+            font-family: 'Share Tech Mono', monospace !important;
+            box-shadow: 0 0 10px rgba(0, 255, 204, 0.4) !important;
+        }
+
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <header>
+            <h1>Ryu K8s SDN</h1>
+            <div class="live-status">● LIVE TOPOLOGY SYNC</div>
+        </header>
+        
+        <div id="switch-list">
+            <!-- Dynamic switch list populates here -->
+        </div>
+
+        <div id="routing-tool">
+            <h3 style="font-size:1rem; color:var(--text-color);">Trace Route</h3>
+            <div class="control-group">
+                <label for="srcGuest">Source Guest:</label>
+                <select id="srcGuest"></select>
+            </div>
+            <div class="control-group">
+                <label for="dstGuest">Dest Guest:</label>
+                <select id="dstGuest"></select>
+            </div>
+            <button onclick="tracePath()">ILUMINAR CAMINO</button>
+            <button onclick="resetColors()" style="margin-top:10px; border-color:var(--neon-blue); color:var(--neon-blue); text-shadow:0 0 5px var(--neon-blue); box-shadow:0 0 10px rgba(0,255,204,0.2) inset;">LIMPIAR RUTAS</button>
+        </div>
+    </div>
+
+    <div id="network-container">
+        <div id="mynetwork"></div>
+    </div>
+
+    <script>
+        let network;
+        let edgesDataset;
+        let nodesDataset;
+        let currentData = null;
+
+        // Custom Vis.js icons based on groups
+        const maestroIcon = {
+            shape: 'icon',
+            icon: { face: "'Orbitron'", code: '\u2605', size: 60, color: '#00ffcc' },
+            font: { color: '#00ffcc', face: "'Share Tech Mono'" },
+            shadow: { enabled: true, color: '#00ffcc', size: 15 }
+        };
+
+        const workerIcon = {
+            shape: 'icon',
+            icon: { face: "'Share Tech Mono'", code: '\u25A0', size: 40, color: '#e0f2fe' },
+            font: { color: '#e0f2fe', face: "'Share Tech Mono'" }
+        };
+
+        const guestIcon = {
+            shape: 'icon',
+            icon: { face: "'Share Tech Mono'", code: '\u25B2', size: 30, color: '#ff00ee' },
+            font: { color: '#ff00ee', face: "'Share Tech Mono'", size: 10 },
+            shadow: { enabled: true, color: '#ff00ee', size: 5 }
+        };
+
+        function initNetwork() {
+            fetch('/api/topology')
+                .then(res => res.json())
+                .then(data => {
+                    currentData = data;
+                    buildSidebar(data);
+                    
+                    // Map groups to styling
+                    data.nodes.forEach(n => {
+                        if (n.group === 'maestro') Object.assign(n, maestroIcon);
+                        else if (n.group === 'worker') Object.assign(n, workerIcon);
+                        else if (n.group === 'guest') Object.assign(n, guestIcon);
+                    });
+
+                    nodesDataset = new vis.DataSet(data.nodes);
+                    edgesDataset = new vis.DataSet(data.edges);
+
+                    const container = document.getElementById('mynetwork');
+                    const graphData = { nodes: nodesDataset, edges: edgesDataset };
+                    
+                    const options = {
+                        physics: {
+                            solver: 'forceAtlas2Based',
+                            forceAtlas2Based: {
+                                gravitationalConstant: -50,
+                                centralGravity: 0.01,
+                                springLength: 100,
+                                springConstant: 0.08
+                            }
+                        },
+                        edges: {
+                            smooth: true,
+                            shadow: { enabled: true, color: "rgba(0,0,0,0.5)", size: 10 }
+                        },
+                        interaction: {
+                            hover: true,
+                            tooltipDelay: 200
+                        }
+                    };
+
+                    network = new vis.Network(container, graphData, options);
+                })
+                .catch(err => console.error("Error fetching topology", err));
+        }
+
+        function buildSidebar(data) {
+            const listDiv = document.getElementById('switch-list');
+            const srcSelect = document.getElementById('srcGuest');
+            const dstSelect = document.getElementById('dstGuest');
+            
+            listDiv.innerHTML = '';
+            srcSelect.innerHTML = '';
+            dstSelect.innerHTML = '';
+
+            // Group guests by switch
+            const switches = data.nodes.filter(n => n.group === 'worker' || n.group === 'maestro');
+            
+            switches.forEach(sw => {
+                const swBlock = document.createElement('div');
+                swBlock.className = 'switch-block';
+                if(sw.group === 'maestro') swBlock.style.borderLeftColor = 'var(--accent)';
+                
+                const title = document.createElement('div');
+                title.className = 'switch-title';
+                title.innerText = sw.label.replace('\n', ' ');
+                swBlock.appendChild(title);
+
+                const swGuests = data.guests.filter(g => g.switch === sw.id);
+                if(swGuests.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.className = 'guest-item';
+                    empty.style.color = '#555';
+                    empty.innerText = 'No guests detected';
+                    swBlock.appendChild(empty);
+                } else {
+                    swGuests.forEach(g => {
+                        const gDiv = document.createElement('div');
+                        gDiv.className = 'guest-item';
+                        gDiv.innerText = g.id;
+                        swBlock.appendChild(gDiv);
+                        
+                        // Add to dropdowns
+                        const opt = new Option(`${g.id} (${sw.label.split('\n')[0]})`, g.id);
+                        srcSelect.add(opt.cloneNode(true));
+                        dstSelect.add(opt);
+                    });
+                }
+                listDiv.appendChild(swBlock);
+            });
+        }
+
+        function resetColors() {
+            // Revert edges to original colors
+            const updates = edgesDataset.get().map(e => {
+                let color = "#00ffcc"; // link to worker
+                if(e.dashes) color = "#ff00ee"; // link to guest
+                return {
+                    id: e.id,
+                    color: { color: color, highlight: color, hover: color },
+                    width: e.dashes ? 1 : 3,
+                    shadow: { enabled: true, color: "rgba(0,0,0,0.5)" }
+                };
+            });
+            edgesDataset.update(updates);
+        }
+
+        function getEdge(n1, n2) {
+            return edgesDataset.get({
+                filter: function (item) {
+                    return (item.from === n1 && item.to === n2) || (item.from === n2 && item.to === n1);
+                }
+            })[0];
+        }
+
+        function extractPath(srcGuestId, dstGuestId) {
+            if(!currentData) return [];
+            
+            const srcGuest = currentData.guests.find(g => g.id === srcGuestId);
+            const dstGuest = currentData.guests.find(g => g.id === dstGuestId);
+            const maestro = currentData.maestro_dpid;
+
+            if(!srcGuest || !dstGuest) return [];
+
+            let pathNodes = [];
+            
+            // If they are on the exact same switch
+            if(srcGuest.switch === dstGuest.switch) {
+                pathNodes = [srcGuest.id, srcGuest.switch, dstGuest.id];
+            } 
+            // If Source is on Maestro, Destination on Worker
+            else if(srcGuest.switch === maestro) {
+                pathNodes = [srcGuest.id, maestro, dstGuest.switch, dstGuest.id];
+            }
+            // If Source is on Worker, Destination on Maestro
+            else if(dstGuest.switch === maestro) {
+                pathNodes = [srcGuest.id, srcGuest.switch, maestro, dstGuest.id];
+            }
+            // Both are on different Workers
+            else {
+                pathNodes = [srcGuest.id, srcGuest.switch, maestro, dstGuest.switch, dstGuest.id];
+            }
+
+            return pathNodes;
+        }
+
+        function tracePath() {
+            resetColors();
+            
+            const srcId = document.getElementById('srcGuest').value;
+            const dstId = document.getElementById('dstGuest').value;
+            
+            if(srcId === dstId) {
+                alert("Selecciona dos Guests diferentes");
+                return;
+            }
+
+            const path = extractPath(srcId, dstId);
+            let edgeIdsToHighlight = [];
+
+            for(let i=0; i < path.length - 1; i++) {
+                const edge = getEdge(path[i], path[i+1]);
+                if(edge) edgeIdsToHighlight.push(edge.id);
+            }
+
+            // Apply Neon Highlight
+            const updates = edgeIdsToHighlight.map(id => {
+                return {
+                    id: id,
+                    color: { color: '#facc15', highlight: '#facc15' }, // cyber-yellow
+                    width: 5,
+                    shadow: { enabled: true, color: '#facc15', size: 20 }
+                };
+            });
+            
+            edgesDataset.update(updates);
+        }
+
+        // Auto-refresh topology structurally every 10 seconds silently
+        setInterval(() => {
+            fetch('/api/topology')
+                .then(res => res.json())
+                .then(data => {
+                    currentData = data;
+                    buildSidebar(data);
+                    
+                    // Simple logic to add missing nodes/edges without destroying physical positions
+                    data.nodes.forEach(n => {
+                        if(!nodesDataset.get(n.id)) {
+                             if (n.group === 'maestro') Object.assign(n, maestroIcon);
+                             else if (n.group === 'worker') Object.assign(n, workerIcon);
+                             else if (n.group === 'guest') Object.assign(n, guestIcon);
+                             nodesDataset.add(n);
+                        }
+                    });
+                    data.edges.forEach(e => {
+                        const existing = edgesDataset.get({
+                            filter: item => (item.from === e.from && item.to === e.to) || (item.from === e.to && item.to === e.from)
+                        });
+                        if(existing.length === 0) {
+                            edgesDataset.add(e);
+                        }
+                    });
+                });
+        }, 10000);
+
+        // Start
+        window.onload = initNetwork;
+    </script>
+</body>
+</html>

@@ -125,7 +125,7 @@ spec:
         - |
           echo "Instalando Open vSwitch..."
           apt-get update > /dev/null
-          apt-get install -y openvswitch-switch kmod iproute2 > /dev/null
+          apt-get install -y openvswitch-switch kmod iproute2 redis-tools > /dev/null
           
           echo "Cargando módulo del kernel..."
           modprobe openvswitch || true
@@ -148,6 +148,9 @@ spec:
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
           ovs-vsctl set-controller br-sdn tcp:192.168.122.100:6653
+          
+          echo "Registrando nodo en base de datos global (Redis)..."
+          redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:node_names $DPID $NODE_NAME || true
           
           echo "Auto-Configurando Túneles VXLAN..."
           if [ "$NODE_NAME" != "nodo-k3s-maestro" ]; then
@@ -189,3 +192,51 @@ spec:
           path: /var/run/openvswitch
           type: DirectoryOrCreate
 
+---
+# ==========================
+# Web Dashboard de Topología (Backend + Frontend)
+# ==========================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ryu-topology
+  namespace: sdn-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ryu-topology
+  template:
+    metadata:
+      labels:
+        app: ryu-topology
+    spec:
+      containers:
+      - name: dashboard
+        image: arturoalvarez/ryu-topology:latest
+        imagePullPolicy: Always
+        env:
+        - name: REDIS_HOST
+          value: "redis.sdn-controller.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"
+        ports:
+        - containerPort: 5000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ryu-topology
+  namespace: sdn-controller
+  labels:
+    app: ryu-topology
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    targetPort: 5000
+    nodePort: 30080
+    protocol: TCP
+  selector:
+    app: ryu-topology
