@@ -26,23 +26,31 @@ def get_topology():
         
         maestro_dpid = None
         
+        def get_raw_dpid(dpid_decimal):
+            try:
+                return "0000" + hex(int(dpid_decimal))[2:].zfill(12)
+            except Exception:
+                return dpid_decimal
+        
         # Identificar qué DPID pertenece al Maestro
         for dpid in switches:
-            name = node_names.get(dpid, "")
+            raw_dpid = get_raw_dpid(dpid)
+            name = node_names.get(raw_dpid, "")
             if "maestro" in name.lower():
                 maestro_dpid = dpid
                 break
 
         # Construir la red física de switches (K3s Nodes)
         for dpid in switches:
-            # Convertir el identificador decimal (ej: 25029943184097) de vuelta a la MAC hexadecimal original
+            raw_dpid = get_raw_dpid(dpid)
+            # Convertir el identificador decimal de vuelta a la MAC hexadecimal original para la UI
             try:
                 hex_dpid = hex(int(dpid))[2:].zfill(12)
                 formatted_hex = ':'.join(hex_dpid[i:i+2] for i in range(0, 12, 2))
             except Exception:
                 formatted_hex = dpid
                 
-            raw_name = node_names.get(dpid, f"Nuevo Nodo")
+            raw_name = node_names.get(raw_dpid, "Nuevo Nodo")
             # El panel lateral leerá esta etiqueta saltando los retornos de carro
             name = f"{raw_name}\n({formatted_hex})"
             
