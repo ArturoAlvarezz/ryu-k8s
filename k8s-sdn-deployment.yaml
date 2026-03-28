@@ -143,10 +143,11 @@ spec:
              # Los Workers se conectan al Maestro
              ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
           else
-             # El Maestro se conecta a los Workers
-             ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101
-             ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102
-             ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103
+             # El Maestro pre-construye túneles para todas las IPs trabajadoras esperadas (.101 a .110)
+             for i in 1 2 3 4 5 6 7 8 9 10; do
+                ip_suffix=$((100 + i))
+                ovs-vsctl --may-exist add-port br-sdn vx-w${i} -- set interface vx-w${i} type=vxlan options:remote_ip=192.168.122.${ip_suffix} > /dev/null 2>&1 || true
+             done
           fi
           
           echo "Entrando en modo Plug&Play para atrapar Guests..."

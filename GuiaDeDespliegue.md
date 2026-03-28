@@ -103,6 +103,13 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now k3s-iptables.service
 sudo netplan apply
+
+# En el nodo maestro:
+sudo hostnamectl set-hostname nodo-k3s-maestro
+
+# En el nodo worker:
+sudo hostnamectl set-hostname nodo-k3s-worker1
+
 sudo reboot
 ```
 
@@ -115,12 +122,6 @@ Con la red ya configurada y el sistema reiniciado, actualiza los paquetes y conf
 ```bash
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y net-tools
-
-# En el nodo maestro:
-sudo hostnamectl set-hostname nodo-k3s-maestro
-
-# En el nodo worker:
-sudo hostnamectl set-hostname nodo-k3s-worker1
 ```
 
 ---
@@ -152,14 +153,14 @@ sudo apt-get install -y \
 sudo usermod -aG docker $USER
 
 # Verificar instalación
-docker run hello-world
+sudo docker run hello-world
 ```
 
 ---
 
 ## 5. Instalación de K3s
 
-### 4.1 Nodo maestro
+### 5.1 Nodo maestro
 
 ```bash
 curl -sfL https://get.k3s.io | sh -
@@ -183,7 +184,7 @@ sudo crontab -e
 kubectl get nodes
 ```
 
-### 4.2 Nodo worker
+### 5.2 Nodo worker
 
 Reemplaza `<TOKEN>` con el token obtenido en el paso anterior:
 
@@ -211,7 +212,7 @@ kubectl -n sdn-controller get pods -o wide
 kubectl -n sdn-controller get svc
 ```
 
-### 5.1 Operaciones de mantenimiento
+### 6.1 Operaciones de mantenimiento
 
 ```bash
 # Reiniciar el controlador RYU
@@ -226,33 +227,9 @@ kubectl logs -f -l app=ryu -n sdn-controller --prefix
 
 ---
 
-## 7. Configuración de Open vSwitch (OVS)
+## 7. Verificación y monitoreo
 
-Ejecuta estos comandos en el **nodo OVS**, no en los nodos K3s:
-
-```bash
-# Verificar el estado actual del bridge
-ovs-vsctl show
-
-# Asignar IP al bridge y levantarlo
-ip addr flush dev eth0
-ip addr add 192.168.122.53/24 dev br0
-ip link set br0 up
-
-# Configurar OpenFlow 1.3 y apuntar al controlador RYU
-ovs-vsctl set bridge br0 protocols=OpenFlow13
-ovs-vsctl set-controller br0 tcp:192.168.122.100:6653
-
-# Verificar configuración
-ovs-vsctl show
-ovs-vsctl list controller
-```
-
----
-
-## 8. Verificación y monitoreo
-
-### 8.1 Consultar Redis
+### 7.1 Consultar Redis
 
 ```bash
 kubectl exec -it deployment/redis -n sdn-controller -- redis-cli
@@ -271,7 +248,7 @@ SMEMBERS topology:switches
 HGETALL mac_to_port:77356373094209
 ```
 
-### 8.2 Logs del controlador RYU
+### 7.2 Logs del controlador RYU
 
 ```bash
 kubectl logs -f -l app=ryu -n sdn-controller --prefix
