@@ -127,18 +127,25 @@ spec:
           
           echo "Iniciando servicio OVS..."
           service openvswitch-switch start
+          sleep 2
           
-          sleep 5
+          echo "Limpiando estado anterior para evitar fantasmas..."
+          ovs-vsctl --if-exists del-br br-sdn
           
-          echo "Creando br-sdn..."
+          # Generar un ID predecible para OVS (DPID) basado en su IP (Ej: 192.168.122.103 -> 0000000000000103)
+          MY_IP=$(ip a show br0 | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+          LAST_OCTET=$(echo $MY_IP | cut -d. -f4)
+          DPID=$(printf "0000000000000%03d" $LAST_OCTET)
+          
+          echo "Creando br-sdn con DPID estático: $DPID..."
           ovs-vsctl --may-exist add-br br-sdn
+          ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
           
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
           ovs-vsctl set-controller br-sdn tcp:192.168.122.100:6653
           
           echo "Auto-Configurando Túneles VXLAN..."
-          MY_IP=$(ip a show br0 | grep "inet " | awk '{print $2}' | cut -d/ -f1)
           if [ "$MY_IP" != "192.168.122.100" ]; then
              # Los Workers se conectan al Maestro
              ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
@@ -150,18 +157,16 @@ spec:
              done
           fi
           
-          echo "Entrando en modo Plug&Play para atrapar Guests..."
+          echo "Entrando en modo Plug&Play blindado para Guests..."
           while true; do
-            for intf in $(ls /sys/class/net | grep -E "^ens|^eth"); do
-              # Ignorar cables principales (que están en el br0 físico de K3s)
-              if ! ip link show $intf | grep -q "master br0"; then
+            # Solo buscar a partir del puerto ens6 en adelante para no robar las tarjetas principales de K3s (ens3, ens4, ens5)
+            for intf in $(ls /sys/class/net | grep -E "ens[6-9]|ens[1-9][0-9]"); do
                  # Si el cable está libre, forzar encendido y meter a OVS
                  if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then
                     echo "Auto-detectado nuevo Guest en $intf. Añadiendo a la red SDN..."
                     ip link set $intf up > /dev/null 2>&1 || true
                     ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
                  fi
-              fi
             done
             sleep 5
           done
