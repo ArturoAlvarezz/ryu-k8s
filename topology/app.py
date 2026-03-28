@@ -35,14 +35,24 @@ def get_topology():
 
         # Construir la red física de switches (K3s Nodes)
         for dpid in switches:
-            name = node_names.get(dpid, f"Nuevo Nodo\n{dpid[-6:]}")
+            # Convertir el identificador decimal (ej: 25029943184097) de vuelta a la MAC hexadecimal original
+            try:
+                hex_dpid = hex(int(dpid))[2:].zfill(12)
+                formatted_hex = ':'.join(hex_dpid[i:i+2] for i in range(0, 12, 2))
+            except Exception:
+                formatted_hex = dpid
+                
+            raw_name = node_names.get(dpid, f"Nuevo Nodo")
+            # El panel lateral leerá esta etiqueta saltando los retornos de carro
+            name = f"{raw_name}\n({formatted_hex})"
+            
             is_maestro = (dpid == maestro_dpid)
             
             nodes.append({
                 "id": dpid,
                 "label": name,
                 "group": "maestro" if is_maestro else "worker",
-                "title": f"DPID: {dpid}"
+                "title": f"DPID Numérico: {dpid}"
             })
             
             # Dibujar el enlace maestro-worker de la topología estrella de VXLAN
