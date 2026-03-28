@@ -9,44 +9,34 @@
 
 1. [Preparación de nodos](#1-preparación-de-nodos)
 2. [Configuración de red (IP fija + bridge)](#2-configuración-de-red-ip-fija--bridge)
-3. [Instalación de Docker](#3-instalación-de-docker)
-4. [Instalación de K3s](#4-instalación-de-k3s)
-5. [Despliegue de RYU en K3s](#5-despliegue-de-ryu-en-k3s)
-6. [Configuración de Open vSwitch (OVS)](#6-configuración-de-open-vswitch-ovs)
-7. [Verificación y monitoreo](#7-verificación-y-monitoreo)
+3. [Actualizar sistema e instalar utilidades](#3-actualizar-sistema-e-instalar-utilidades)
+4. [Instalación de Docker](#4-instalación-de-docker)
+4. [Instalación de Docker](#4-instalación-de-docker)
+5. [Instalación de K3s](#5-instalación-de-k3s)
+6. [Despliegue de RYU en K3s](#6-despliegue-de-ryu-en-k3s)
+7. [Configuración de Open vSwitch (OVS)](#7-configuración-de-open-vswitch-ovs)
+8. [Verificación y monitoreo](#8-verificación-y-monitoreo)
 
 ---
 
 ## 1. Preparación de nodos
 
-Antes de comenzar, ajusta los recursos de cada VM según el rol:
+Antes de comenzar, ajusta los recursos de cada VM desde el hipervisor (virt-manager, Proxmox, etc.) **antes de encender las máquinas**:
 
-| Nodo              | RAM recomendada | CPU (hilos) | Almacenamiento |
-|-------------------|-----------------|-------------|----------------|
-| `nodo-k3s-maestro` | ≥ 2 GB         | ≥ 2         | ≥ 20 GB        |
-| `nodo-k3s-worker1` | ≥ 1 GB         | ≥ 1         | ≥ 10 GB        |
+| Nodo               | RAM recomendada | CPU (hilos) | Almacenamiento | Adaptadores de red |
+|--------------------|-----------------|-------------|----------------|--------------------|
+| `nodo-k3s-maestro` | ≥ 2 GB          | ≥ 2         | ≥ 20 GB        | **5**              |
+| `nodo-k3s-worker1` | ≥ 1 GB          | ≥ 1         | ≥ 10 GB        | **5**              |
 
-### 1.1 Actualizar el sistema y configurar el hostname
-
-Ejecuta en **cada nodo**, ajustando el hostname correspondiente:
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y net-tools
-
-# En el nodo maestro:
-sudo hostnamectl set-hostname nodo-k3s-maestro
-
-# En el nodo worker:
-sudo hostnamectl set-hostname nodo-k3s-worker1
-```
+> ℹ️ Los 5 adaptadores son necesarios para que el bridge `br0` tenga interfaces físicas suficientes. `ens3`–`ens5` se asignan al bridge; las restantes quedan disponibles para tráfico de gestión y K3s.
 
 ---
 
 ## 2. Configuración de red (IP fija + bridge)
 
-> ⚠️ Los nodos de control SDN **no deben** estar sobre la red SDN gestionada.  
-> Asegúrate de que `ens3`, `ens4` y `ens5` sean las interfaces correctas en tu VM.
+> ⚠️ **Este paso debe realizarse antes de instalar cualquier paquete.** Sin la red configurada correctamente, las VMs no tendrán acceso a internet.  
+> Asegúrate de que `ens3`, `ens4` y `ens5` sean las interfaces correctas en tu VM.  
+> Los nodos de control SDN **no deben** estar sobre la red SDN gestionada.
 
 ### 2.1 Configurar Netplan con bridge `br0`
 
@@ -60,10 +50,13 @@ network:
   ethernets:
     ens3:
       dhcp4: false
+      optional: true
     ens4:
       dhcp4: false
+      optional: true
     ens5:
       dhcp4: false
+      optional: true
   bridges:
     br0:
       interfaces: [ens3, ens4, ens5]
@@ -115,7 +108,24 @@ sudo reboot
 
 ---
 
-## 3. Instalación de Docker
+## 3. Actualizar sistema e instalar utilidades
+
+Con la red ya configurada y el sistema reiniciado, actualiza los paquetes y configura el hostname en **cada nodo**:
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y net-tools
+
+# En el nodo maestro:
+sudo hostnamectl set-hostname nodo-k3s-maestro
+
+# En el nodo worker:
+sudo hostnamectl set-hostname nodo-k3s-worker1
+```
+
+---
+
+## 4. Instalación de Docker
 
 ```bash
 # Dependencias y repositorio oficial de Docker
@@ -147,7 +157,7 @@ docker run hello-world
 
 ---
 
-## 4. Instalación de K3s
+## 5. Instalación de K3s
 
 ### 4.1 Nodo maestro
 
@@ -186,7 +196,7 @@ curl -sfL https://get.k3s.io | \
 
 ---
 
-## 5. Despliegue de RYU en K3s
+## 6. Despliegue de RYU en K3s
 
 ```bash
 git clone https://github.com/ArturoAlvarezz/ryu-k8s.git
@@ -216,7 +226,7 @@ kubectl logs -f -l app=ryu -n sdn-controller --prefix
 
 ---
 
-## 6. Configuración de Open vSwitch (OVS)
+## 7. Configuración de Open vSwitch (OVS)
 
 Ejecuta estos comandos en el **nodo OVS**, no en los nodos K3s:
 
@@ -240,9 +250,9 @@ ovs-vsctl list controller
 
 ---
 
-## 7. Verificación y monitoreo
+## 8. Verificación y monitoreo
 
-### 7.1 Consultar Redis
+### 8.1 Consultar Redis
 
 ```bash
 kubectl exec -it deployment/redis -n sdn-controller -- redis-cli
@@ -261,7 +271,7 @@ SMEMBERS topology:switches
 HGETALL mac_to_port:77356373094209
 ```
 
-### 7.2 Logs del controlador RYU
+### 8.2 Logs del controlador RYU
 
 ```bash
 kubectl logs -f -l app=ryu -n sdn-controller --prefix
