@@ -114,6 +114,11 @@ spec:
         image: ubuntu:22.04  # Usamos la misma base nativa del nodo anfitrión
         securityContext:
           privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         command:
         - /bin/bash
         - -c
@@ -145,7 +150,7 @@ spec:
           ovs-vsctl set-controller br-sdn tcp:192.168.122.100:6653
           
           echo "Auto-Configurando Túneles VXLAN..."
-          if [ "$MY_IP" != "192.168.122.100" ]; then
+          if [ "$NODE_NAME" != "nodo-k3s-maestro" ]; then
              # Los Workers se conectan al Maestro
              ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100
           else
