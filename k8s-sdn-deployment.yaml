@@ -109,6 +109,7 @@ spec:
     spec:
       hostNetwork: true
       hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: ovs-configurator
         image: ubuntu:22.04  # Usamos la misma base nativa del nodo anfitrión
