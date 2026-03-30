@@ -224,12 +224,11 @@ spec:
 # Web Dashboard de Topología (Backend + Frontend)
 # ==========================
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: ryu-topology
   namespace: sdn-controller
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: ryu-topology
