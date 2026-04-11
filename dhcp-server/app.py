@@ -7,13 +7,17 @@ REDIS_HOST = os.environ.get('REDIS_HOST', 'redis.sdn-controller.svc.cluster.loca
 REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
 IFACE = "br-sdn"
 
-try:
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-    r.ping()
-    print("Conexión a Redis SDN exitosa.")
-except Exception as e:
-    print(f"Error conectando a Redis: {e}")
-    exit(1)
+print("Inicializando entorno de red...")
+r = None
+while True:
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        r.ping()
+        print("Conexión a Redis SDN exitosa.")
+        break
+    except Exception as e:
+        print(f"Esperando a Redis en {REDIS_HOST}:{REDIS_PORT}... ({e})")
+        time.sleep(3)
 
 def get_ip_for_mac(mac):
     allocated = r.get(f"dhcp:bind:{mac}")
@@ -121,6 +125,15 @@ if __name__ == "__main__":
     # Inicializar semilla del contador si la BD está limpia
     if not r.exists("dhcp:next_ip"):
         r.set("dhcp:next_ip", 10)
+        
+    while True:
+        try:
+            get_if_hwaddr(IFACE)
+            print(f"Interfaz {IFACE} detectada correctamente.")
+            break
+        except Exception:
+            print(f"Esperando a que la interfaz {IFACE} sea creada por el Orquestador OVS...")
+            time.sleep(3)
         
     print(f"Escuchando descubrimientos en interfaz maestra {IFACE}... ")
     sniff(iface=IFACE, filter="udp and (port 67 or port 68)", prn=handle_dhcp, store=0)
