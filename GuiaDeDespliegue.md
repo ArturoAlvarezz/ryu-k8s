@@ -223,6 +223,9 @@ kubectl rollout restart deployment redis -n sdn-controller
 
 # Seguir los logs en tiempo real
 kubectl logs -f -l app=ryu -n sdn-controller --prefix
+
+kubectl rollout restart ds sdn-dhcp-server -n sdn-controller
+
 ```
 
 ---

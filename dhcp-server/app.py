@@ -129,11 +129,20 @@ if __name__ == "__main__":
     while True:
         try:
             get_if_hwaddr(IFACE)
-            print(f"Interfaz {IFACE} detectada correctamente.")
+            os.system(f"ip link set {IFACE} up")
+            print(f"Interfaz {IFACE} detectada correctamente. Estado forzado a UP.")
             break
         except Exception:
             print(f"Esperando a que la interfaz {IFACE} sea creada por el Orquestador OVS...")
             time.sleep(3)
         
     print(f"Escuchando descubrimientos en interfaz maestra {IFACE}... ")
-    sniff(iface=IFACE, filter="udp and (port 67 or port 68)", prn=handle_dhcp, store=0)
+    while True:
+        try:
+            sniff(iface=IFACE, filter="udp and (port 67 or port 68)", prn=handle_dhcp, store=0)
+        except OSError as e:
+            print(f"Error de Socket (La red saltó temporalmente): {e}. Reintentando...")
+            time.sleep(3)
+        except Exception as e:
+            print(f"Excepción general en Sniffer: {e}. Reintentando...")
+            time.sleep(3)
