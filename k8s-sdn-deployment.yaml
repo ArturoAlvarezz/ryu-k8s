@@ -265,3 +265,37 @@ spec:
     protocol: TCP
   selector:
     app: ryu-topology
+
+---
+# ==========================
+# Servidor DHCP Distribuido sobre Red VXLAN L2 
+# ==========================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sdn-dhcp-server
+  namespace: sdn-controller
+  labels:
+    app: sdn-dhcp
+spec:
+  selector:
+    matchLabels:
+      app: sdn-dhcp
+  template:
+    metadata:
+      labels:
+        app: sdn-dhcp
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: dhcp
+        image: arturoalvarez/ryu-dhcp:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        env:
+        - name: REDIS_HOST
+          value: "redis.sdn-controller.svc.cluster.local"
+        - name: REDIS_PORT
+          value: "6379"

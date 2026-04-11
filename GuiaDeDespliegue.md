@@ -261,12 +261,3 @@ ip addr add 10.0.0.5/24 dev eth0
 ```
 
 ---
-
-## Referencia rápida de IPs
-
-| Componente       | IP                    | Puerto |
-|------------------|-----------------------|--------|
-| K3s API Server   | `192.168.122.100`     | 6443   |
-| RYU Controller   | `192.168.122.100`     | 6653   |
-| Nodo maestro     | `192.168.122.103`     | —      |
-| Nodo OVS         | `192.168.122.53`      | —      |
