@@ -1,6 +1,7 @@
 import os
 import time
 import redis
+import threading
 from scapy.all import *
 
 REDIS_HOST = os.environ.get('REDIS_HOST', 'redis.sdn-controller.svc.cluster.local')
@@ -119,6 +120,24 @@ def handle_dhcp(pkt):
     sendp(response, iface=IFACE, verbose=False)
     print(f"[{mac_str}] Enviada respuesta tipo {reply_type} asignando IP {client_ip}")
 
+def healthcheck_loop():
+    print("Iniciando Radar de Healthcheck Activo L2 en hilo paralelo...")
+    while True:
+        try:
+            guest_ips = r.hgetall('topology:guest_ips')
+            for guest_mac, ip in guest_ips.items():
+                if not ip.startswith("10."): 
+                    continue
+                # Enviar ARP Request dirigido a la MAC y simulando ser el Gateway 10.0.0.1
+                ans, unans = srp(Ether(dst=guest_mac)/ARP(op=1, pdst=ip, psrc="10.0.0.1"), iface=IFACE, timeout=1, verbose=False)
+                if ans:
+                    # Si respondió el ARP, inyectar el pulso de vida (TTL 30s)
+                    r.set(f"health:{guest_mac}", "1", ex=30)
+        except Exception as e:
+            print(f"Aviso en hilo de Healthcheck L2: {e}")
+        time.sleep(10)
+
+
 if __name__ == "__main__":
     print("Iniciando SDN DHCP Server Distribuido sobre nodo local...")
     
@@ -135,7 +154,9 @@ if __name__ == "__main__":
         except Exception:
             print(f"Esperando a que la interfaz {IFACE} sea creada por el Orquestador OVS...")
             time.sleep(3)
-        
+            
+    threading.Thread(target=healthcheck_loop, daemon=True).start()
+
     print(f"Escuchando descubrimientos en interfaz maestra {IFACE}... ")
     while True:
         try:

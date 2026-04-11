@@ -83,16 +83,17 @@ def get_topology():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
                     
-                # MAC Ageing: Si el temporal de 25s cayó, la máquina está offfline.
-                if not r.exists(f"active_mac:{dpid}:{mac}"):
+                # Healthcheck L2: Si el Ping ARP falló durante 30s, declaramos Muerte Sistemática.
+                if not r.exists(f"health:{mac}"):
                     r.hdel(f"mac_to_port:{dpid}", mac)
+                    r.hdel('topology:guest_ips', mac)
                     continue
 
-                # Filtro algorítmico de Anillo (Ring):
+                # Filtro algorítmico de Anillo (Ring) y limpieza de Fantasmas OVS Locales (port 65534)
                 # Cada nodo tiene ahora exactamente 2 túneles VXLAN configurados en su script inicial (Left/Right).
                 # Es decir, los puertos OVS virtuales 1 y 2 son las salidas del anillo al resto del clúster K3s.
                 # Cualquier MAC aprendida en un puerto > 2 pertenece obligadamente a un cable físico enchufado localmente (Guest).
-                if port > 2:
+                if port > 2 and port < 60000:
                     guest_id = mac
                     if guest_id not in [g['id'] for g in guests]:
                         ip_text = guest_ips.get(guest_id, "Desconocida / DHCP Pendiente")

@@ -323,7 +323,7 @@
                     swGuests.forEach(g => {
                         const gDiv = document.createElement('div');
                         gDiv.className = 'guest-item';
-                        gDiv.innerText = g.id;
+                        gDiv.innerText = g.label.replace('\n', '  |  ');
                         swBlock.appendChild(gDiv);
                         
                         // Add to dropdowns
