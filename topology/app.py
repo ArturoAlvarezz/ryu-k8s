@@ -80,6 +80,11 @@ def get_topology():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
                     
+                # MAC Ageing: Si el temporal de 25s cayó, la máquina está offfline.
+                if not r.exists(f"active_mac:{dpid}:{mac}"):
+                    r.hdel(f"mac_to_port:{dpid}", mac)
+                    continue
+
                 # Filtro algorítmico de Anillo (Ring):
                 # Cada nodo tiene ahora exactamente 2 túneles VXLAN configurados en su script inicial (Left/Right).
                 # Es decir, los puertos OVS virtuales 1 y 2 son las salidas del anillo al resto del clúster K3s.

@@ -236,6 +236,10 @@ kubectl rollout restart ds sdn-dhcp-server -n sdn-controller
 
 ```bash
 kubectl exec -it deployment/redis -n sdn-controller -- redis-cli
+# Detectamos el pod de base de datos y le consultamos la tabla completa:
+POD_REDIS=$(kubectl get pods -l app=redis -n sdn-controller -o name | head -n 1)
+kubectl exec -it $POD_REDIS -n sdn-controller -- redis-cli HGETALL topology:guest_ips
+
 ```
 
 Comandos útiles dentro de `redis-cli`:

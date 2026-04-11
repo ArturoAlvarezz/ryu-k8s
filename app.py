@@ -87,6 +87,9 @@ class DistributedL2Switch(app_manager.RyuApp):
         # Store the mac_to_port table for this dpid in Redis natively (Hash)
         mac_table_key = f"mac_to_port:{dpid}"
         self.redis.hset(mac_table_key, src, in_port)
+        
+        # MAC Ageing (Auto Limpieza): Marcamos la MAC con un temporizador de vida (TTL) de 25 segundos
+        self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=25)
 
         # Retrieve destination port from Redis
         out_port_str = self.redis.hget(mac_table_key, dst)

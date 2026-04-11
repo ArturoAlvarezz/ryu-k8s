@@ -98,7 +98,7 @@ def handle_dhcp(pkt):
         op=2, # BOOTREPLY
         yiaddr=client_ip,
         siaddr=server_ip,
-        hwtype=1,
+        htype=1,
         hlen=6,
         xid=xid,
         flags=0x8000, # Broadcast flag
