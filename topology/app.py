@@ -72,6 +72,9 @@ def get_topology():
                 "title": f"DPID Numérico: {dpid}"
             })
             
+            # Obtener el mapa global de IPs asignadas por el DHCP
+            guest_ips = r.hgetall('topology:guest_ips')
+            
             # Escanear tabla de direcciones MAC aprendidas para encontrar a los Guests locales
             mac_table = r.hgetall(f"mac_to_port:{dpid}")
             for mac, port_str in mac_table.items():
@@ -92,9 +95,10 @@ def get_topology():
                 if port > 2:
                     guest_id = mac
                     if guest_id not in [g['id'] for g in guests]:
+                        ip_text = guest_ips.get(guest_id, "Desconocida / DHCP Pendiente")
                         guests.append({
                             "id": guest_id,
-                            "label": f"{guest_id}",
+                            "label": f"{guest_id}\nIP: {ip_text}",
                             "group": "guest",
                             "switch": dpid
                         })
