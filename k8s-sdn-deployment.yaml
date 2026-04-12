@@ -79,7 +79,7 @@ spec:
       containers:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
-        command: ["ryu-manager", "--observe-links", "ryu.topology.switches", "app.py"]
+        command: ["ryu-manager", "--observe-links", "app.py"]
         env:
         - name: REDIS_HOST
           value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
