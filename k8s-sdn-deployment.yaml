@@ -156,17 +156,26 @@ spec:
           echo "Activando Protocolo RSTP (Anti-Bucles)..."
           ovs-vsctl set bridge br-sdn rstp_enable=true
           
-          echo "Buscando cables físicos inter-nodo en las interfaces reservadas (ens3, ens4, ens5)..."
-          MAIN_GW=$(ip route show default | awk '{print $5}' | head -n 1)
+          echo "Migrando red K3s nativa hacia núcleo SDN L2..."
+          
+          # 1. Crear puente umbilical para que K3s no pierda conectividad
+          if ! ip link show veth-ovs > /dev/null 2>&1; then
+              ip link add veth-ovs type veth peer name veth-br0
+              ip link set veth-br0 master br0
+              ovs-vsctl --may-exist add-port br-sdn veth-ovs
+              ip link set veth-ovs up
+              ip link set veth-br0 up
+          fi
+
+          echo "Secuestrando cables físicos de br0 para inyectarlos en br-sdn..."
           for intf in $(ls /sys/class/net | grep -E "^ens[3-5]$"); do
-             # Proteger la interfaz dominante de K3s para evitar que el host pierda conectividad IP
-             if [ "$intf" != "$MAIN_GW" ]; then
-                 echo "Cable físico L2 detectado en $intf. Integrando a la Infraestructura Core SDN..."
-                 ip link set $intf up > /dev/null 2>&1 || true
-                 ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
-             else
-                 echo "Protegiendo interfaz nativa K3s: $intf (Señal de control/Default gateway)"
-             fi
+              if ip link show $intf | grep -q 'master br0'; then
+                  echo "Liberando $intf de br0..."
+                  ip link set dev $intf nomaster
+              fi
+              echo "Inyectando $intf a br-sdn..."
+              ip link set $intf up > /dev/null 2>&1 || true
+              ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
           done
           
           echo "Entrando en modo Plug&Play blindado para Guests y Sonda Analítica BFD/RSTP..."
