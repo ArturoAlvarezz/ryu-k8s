@@ -76,6 +76,8 @@ spec:
       labels:
         app: ryu
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
@@ -148,7 +150,7 @@ spec:
           
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
-          ovs-vsctl set-controller br-sdn tcp:192.168.122.100:6653
+          ovs-vsctl set-controller br-sdn tcp:127.0.0.1:6653
           
           echo "Registrando nodo en base de datos global (Redis)..."
           MY_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || ip addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
