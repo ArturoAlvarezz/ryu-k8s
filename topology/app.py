@@ -104,34 +104,34 @@ def get_topology():
                             "switch": dpid
                         })
                         
-        # Enlazar la red OVS centralizada según la estructura topológica de Pentágono/Anillo Físico
-        ring_links = [
-            ("maestro", "w1"),
-            ("w1", "w2"),
-            ("w2", "w3"),
-            ("w3", "w4"),
-            ("w4", "maestro")
-        ]
-        
-        for src_role, dst_role in ring_links:
-            src_dpid = role_to_dpid.get(src_role)
-            dst_dpid = role_to_dpid.get(dst_role)
-            if src_dpid and dst_dpid:
+        # Dibujar la red OVS nativa consultando la topología L2 LLDP auto-descubierta
+        db_links = r.smembers("topology:links")
+        for link in db_links:
+            # link format: "dpid1:portno1-dpid2:portno2"
+            try:
+                src_str, dst_str = link.split('-')
+                src_dpid, src_port = src_str.split(':')
+                dst_dpid, dst_port = dst_str.split(':')
+                
                 edges.append({
-                    "from": src_dpid,
-                    "to": dst_dpid,
+                    "from": str(src_dpid),
+                    "to": str(dst_dpid),
                     "color": "#00ffcc",
                     "width": 3,
-                    "smooth": {"type": "curvedCW"}
+                    "smooth": {"type": "curvedCW"},
+                    "title": f"LLDP Enlace Físico L2 (P{src_port} ↔ P{dst_port})"
                 })
-                
+            except Exception:
+                continue
+
         # Extraer Telemetría de Protección de Bucles (RSTP Analytics)
         blocked_ports = r.hgetall('topology:blocked_ports')
         blocked_edges = []
         for key in blocked_ports.keys():
+            # key format: "dpid:ofport" -> e.g. "1234567890:1"
             if ":" not in key:
                 continue
-            src_raw_dpid, port_name = key.split(":")
+            src_raw_dpid, port_no = key.split(":")
             
             # Encontrar el DPID numérico original del source
             src_dpid = None
@@ -143,19 +143,28 @@ def get_topology():
             if not src_dpid:
                 continue
                 
-            # Determinar el nodo destino inspeccionando el nombre físico del puerto (ej: vx-m -> maestro)
-            dst_role = None
-            if port_name == "vx-m": dst_role = "maestro"
-            elif port_name == "vx-w1": dst_role = "w1"
-            elif port_name == "vx-w2": dst_role = "w2"
-            elif port_name == "vx-w3": dst_role = "w3"
-            elif port_name == "vx-w4": dst_role = "w4"
+            # Determinar el nodo destino inspeccionando los túneles LLDP reales en vez de adivinar nombres
+            dst_dpid = None
+            for link in db_links:
+                try:
+                    s_str, d_str = link.split('-')
+                    s_dp, s_po = s_str.split(':')
+                    d_dp, d_po = d_str.split(':')
+                    
+                    if str(s_dp) == str(src_dpid) and str(s_po) == str(port_no):
+                        dst_dpid = d_dp
+                        break
+                    # Enlaces bidireccionales, verificar el inverso
+                    elif str(d_dp) == str(src_dpid) and str(d_po) == str(port_no):
+                        dst_dpid = s_dp
+                        break
+                except Exception:
+                    continue
             
-            dst_dpid = role_to_dpid.get(dst_role)
             if src_dpid and dst_dpid:
                 blocked_edges.append({
-                    "from": src_dpid,
-                    "to": dst_dpid
+                    "from": str(src_dpid),
+                    "to": str(dst_dpid)
                 })
 
         # Agregar los guests al gráfico y dibujar sus conexiones a sus switches padre

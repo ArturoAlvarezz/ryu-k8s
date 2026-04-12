@@ -5,6 +5,7 @@ from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
+from ryu.topology import event
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
@@ -57,6 +58,23 @@ class DistributedL2Switch(app_manager.RyuApp):
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
                                     match=match, instructions=inst)
         datapath.send_msg(mod)
+
+    @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
+    def link_add_handler(self, ev):
+        src = ev.link.src
+        dst = ev.link.dst
+        # Registrar link bidireccional L2 detectado por LLDP
+        link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
+        self.redis.sadd("topology:links", link_str)
+        self.logger.info("LLDP Auto-Discovery: Enlace Agregado %s", link_str)
+
+    @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
+    def link_delete_handler(self, ev):
+        src = ev.link.src
+        dst = ev.link.dst
+        link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
+        self.redis.srem("topology:links", link_str)
+        self.logger.info("LLDP Auto-Discovery: Enlace Removido %s", link_str)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):

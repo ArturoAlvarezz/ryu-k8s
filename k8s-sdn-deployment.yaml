@@ -77,10 +77,11 @@ spec:
         app: ryu
     spec:
       containers:
-      - name: ryu
-        image: arturoalvarez/ryu-controller:latest
-        imagePullPolicy: Always
-        env:
+        - name: ryu
+          image: arturoalvarez/ryu-controller:latest
+          imagePullPolicy: Always
+          command: ["ryu-manager", "--observe-links", "ryu.topology.switches", "app.py"]
+          env:
         - name: REDIS_HOST
           value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
         - name: REDIS_PORT
@@ -156,40 +157,28 @@ spec:
           echo "Activando Protocolo RSTP (Anti-Bucles)..."
           ovs-vsctl set bridge br-sdn rstp_enable=true
           
-          echo "Auto-Configurando Túneles VXLAN en Modo Anillo (Ring Topology)..."
-          # El anillo lógico será: Maestro -> W1 -> W2 -> W3 -> W4 -> Maestro
-          case "$NODE_NAME" in
-             "nodo-k3s-maestro")
-                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ;;
-             "nodo-k3s-worker1")
-                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ;;
-             "nodo-k3s-worker2")
-                ovs-vsctl --may-exist add-port br-sdn vx-w1 -- set interface vx-w1 type=vxlan options:remote_ip=192.168.122.101 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ;;
-             "nodo-k3s-worker3")
-                ovs-vsctl --may-exist add-port br-sdn vx-w2 -- set interface vx-w2 type=vxlan options:remote_ip=192.168.122.102 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ovs-vsctl --may-exist add-port br-sdn vx-w4 -- set interface vx-w4 type=vxlan options:remote_ip=192.168.122.104 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ;;
-             "nodo-k3s-worker4")
-                ovs-vsctl --may-exist add-port br-sdn vx-w3 -- set interface vx-w3 type=vxlan options:remote_ip=192.168.122.103 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ovs-vsctl --may-exist add-port br-sdn vx-m -- set interface vx-m type=vxlan options:remote_ip=192.168.122.100 options:csum=true bfd:enable=true bfd:min_rx=200 bfd:min_tx=200
-                ;;
-          esac
+          echo "Buscando cables físicos inter-nodo en las interfaces reservadas (ens3, ens4, ens5)..."
+          for intf in $(ls /sys/class/net | grep -E "^ens[3-5]$"); do
+             # Proteger la interfaz dominante de K3s (aquella con la ruta default) para evitar que el nodo pierda IP/Internet
+             if ! ip route | grep default | grep -q $intf; then
+                 echo "Cable físico L2 detectado en $intf. Integrando a la Infraestructura Core SDN..."
+                 ip link set $intf up > /dev/null 2>&1 || true
+                 ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
+             else
+                 echo "Protegiendo interfaz nativa K3s: $intf (Señal de control/Default gateway)"
+             fi
+          done
           
           echo "Entrando en modo Plug&Play blindado para Guests y Sonda Analítica BFD/RSTP..."
           while true; do
-            # 1. Telemetría a Redis de túneles descartados/bloqueados por Spanning Tree
-            for port in $(ovs-vsctl list-ports br-sdn | grep vx-); do
+            # 1. Telemetría a Redis de conexiones descartadas/bloqueadas por Spanning Tree
+            for port in $(ovs-vsctl list-ports br-sdn | grep -E "^ens[3-5]$"); do
                  state=$(ovs-vsctl get port $port rstp_status:rstp_port_state 2>/dev/null | tr -d '"')
-                 if [ "$state" = "Discarding" ]; then
-                     redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:blocked_ports "$DPID:$port" 1 > /dev/null 2>&1 || true
-                 else
-                     redis-cli -h redis.sdn-controller.svc.cluster.local HDEL topology:blocked_ports "$DPID:$port" > /dev/null 2>&1 || true
+                 ofport=$(ovs-vsctl get interface $port ofport 2>/dev/null)
+                 if [ "$state" = "Discarding" ] && [ -n "$ofport" ]; then
+                     redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:blocked_ports "$DPID:$ofport" 1 > /dev/null 2>&1 || true
+                 elif [ -n "$ofport" ]; then
+                     redis-cli -h redis.sdn-controller.svc.cluster.local HDEL topology:blocked_ports "$DPID:$ofport" > /dev/null 2>&1 || true
                  fi
             done
             

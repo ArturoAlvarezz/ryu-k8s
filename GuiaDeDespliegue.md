@@ -25,8 +25,8 @@ Antes de comenzar, ajusta los recursos de cada VM desde el hipervisor (virt-mana
 
 | Nodo               | RAM recomendada | CPU (hilos) | Almacenamiento | Adaptadores de red |
 |--------------------|-----------------|-------------|----------------|--------------------|
-| `nodo-k3s-maestro` | ≥ 2 GB          | ≥ 2         | ≥ 20 GB        | **5**              |
-| `nodo-k3s-worker1` | ≥ 1 GB          | ≥ 1         | ≥ 10 GB        | **5**              |
+| `nodo-k3s-maestro` | ≥ 2 GB          | ≥ 2         | ≥ 20 GB        | **7**              |
+| `nodo-k3s-worker1` | ≥ 1 GB          | ≥ 1         | ≥ 10 GB        | **6**              |
 
 > ℹ️ Los 5 adaptadores son necesarios para que el bridge `br0` tenga interfaces físicas suficientes. `ens3`–`ens5` se asignan al bridge; las restantes quedan disponibles para tráfico de gestión y K3s.
 
@@ -63,7 +63,7 @@ network:
       parameters:
         stp: true
       addresses:
-        - 192.168.122.103/24       # ← Ajusta la IP según el nodo
+        - 192.168.122.104/24       # ← Ajusta la IP según el nodo
       routes:
         - to: default
           via: 192.168.122.1
@@ -191,7 +191,7 @@ Reemplaza `<TOKEN>` con el token obtenido en el paso anterior:
 ```bash
 curl -sfL https://get.k3s.io | \
   K3S_URL=https://192.168.122.100:6443 \
-  K3S_TOKEN=<TOKEN> \
+  K3S_TOKEN=K1001663fe573cc145f25d326dcb92f5f0f718e4a116e3719ca9cffc2167e2d95c6::server:ecce388f9096c175ca554b5cd38de3f9 \
   sh -
 ```
 
