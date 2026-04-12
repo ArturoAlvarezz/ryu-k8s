@@ -168,6 +168,9 @@ spec:
           fi
 
           echo "Secuestrando cables físicos de br0 para inyectarlos en br-sdn..."
+          # PRESERVACIÓN CRÍTICA: Guardar la MAC original de br0 para que K3s no pierda su IP DHCP al quitarle puertos.
+          ORIGINAL_MAC=$(ip link show br0 | awk '/ether/ {print $2}')
+          
           for intf in $(ls /sys/class/net | grep -E "^ens[3-5]$"); do
               if ip link show $intf | grep -q 'master br0'; then
                   echo "Liberando $intf de br0..."
@@ -177,6 +180,9 @@ spec:
               ip link set $intf up > /dev/null 2>&1 || true
               ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
           done
+          
+          # Forzar a br0 a mantener su identidad original en la red
+          ip link set br0 address $ORIGINAL_MAC || true
           
           echo "Entrando en modo Plug&Play blindado para Guests y Sonda Analítica BFD/RSTP..."
           while true; do
