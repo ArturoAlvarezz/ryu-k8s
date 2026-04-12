@@ -79,8 +79,7 @@ spec:
       containers:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
-        imagePullPolicy: Always
-        command: ["ryu-manager", "--observe-links", "ryu.topology.switches", "app.py"]
+        command: ["ryu-manager", "--observe-links", "app.py"]
         env:
         - name: REDIS_HOST
           value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
@@ -158,9 +157,10 @@ spec:
           ovs-vsctl set bridge br-sdn rstp_enable=true
           
           echo "Buscando cables físicos inter-nodo en las interfaces reservadas (ens3, ens4, ens5)..."
+          MAIN_GW=$(ip route show default | awk '{print $5}' | head -n 1)
           for intf in $(ls /sys/class/net | grep -E "^ens[3-5]$"); do
-             # Proteger la interfaz dominante de K3s (aquella con la ruta default) para evitar que el nodo pierda IP/Internet
-             if ! ip route | grep default | grep -q $intf; then
+             # Proteger la interfaz dominante de K3s para evitar que el host pierda conectividad IP
+             if [ "$intf" != "$MAIN_GW" ]; then
                  echo "Cable físico L2 detectado en $intf. Integrando a la Infraestructura Core SDN..."
                  ip link set $intf up > /dev/null 2>&1 || true
                  ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true

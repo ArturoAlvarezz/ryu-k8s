@@ -11,11 +11,14 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 
+from ryu.topology import event, switches
+
 # Patch eventlet heavily used by Ryu to work properly with Redis and other sockets
 eventlet.monkey_patch()
 
 class DistributedL2Switch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'switches': switches.Switches}
 
     def __init__(self, *args, **kwargs):
         super(DistributedL2Switch, self).__init__(*args, **kwargs)
@@ -92,9 +95,10 @@ class DistributedL2Switch(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
+        # Dejar cruzar los paquetes LLDP hacia el kernel de Topology/Switches
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            # ignore lldp packet
             return
+            
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
