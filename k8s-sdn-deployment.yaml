@@ -79,7 +79,7 @@ spec:
       containers:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
-        command: ["ryu-manager", "--observe-links", "app.py"]
+        command: ["ryu-manager", "--observe-links", "ryu.topology.switches", "app.py"]
         env:
         - name: REDIS_HOST
           value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
@@ -174,10 +174,11 @@ spec:
           for intf in $(ls /sys/class/net | grep -E "^ens[3-5]$"); do
               echo "Secuestrando implacablemente $intf de br0..."
               retries=0
-              while ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; do
+              while ! ip link show $intf | grep -q "master ovs-system"; do
                   if [ $retries -gt 30 ]; then echo "Timeout secuestrando $intf"; break; fi
                   ip link set dev $intf nomaster >/dev/null 2>&1 || true
-                  ovs-vsctl --may-exist add-port br-sdn $intf >/dev/null 2>&1 || true
+                  ovs-vsctl --if-exists del-port br-sdn $intf >/dev/null 2>&1 || true
+                  ovs-vsctl add-port br-sdn $intf >/dev/null 2>&1 || true
                   retries=$((retries+1))
                   sleep 0.2
               done
