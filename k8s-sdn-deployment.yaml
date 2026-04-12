@@ -158,18 +158,20 @@ spec:
           echo "Activando RSTP (Anti-Bucles)..."
           ovs-vsctl set bridge br-sdn rstp_enable=true
 
-          echo "Creando tunel VXLAN hacia vecinos conocidos en Redis..."
+          echo "Esperando 15 segundos para que todos los nodos se registren en Redis..."
+          sleep 15
+
+          echo "Creando tuneles VXLAN hacia vecinos conocidos en Redis..."
           while true; do
             # Leer todos los nodos registrados en Redis
             ALL_IPS=$(redis-cli -h redis.sdn-controller.svc.cluster.local HGETALL topology:node_ips 2>/dev/null)
             echo "$ALL_IPS" | paste - - | while read dpid remote_ip; do
-              # Saltar si somos nosotros mismos
-              if [ "$remote_ip" = "$MY_IP" ] || [ -z "$remote_ip" ]; then continue; fi
-              
-              # Nombre de puerto unico basado en los ultimos octetos de la IP remota
-              SUFFIX=$(echo $remote_ip | awk -F. '{printf "%d%d", $3, $4}')
-              PORT_NAME="vxlan${SUFFIX}"
-              
+              # Saltar IPs vacias o la nuestra propia (comparacion exacta de IP completa)
+              if [ -z "$remote_ip" ] || [ "$remote_ip" = "$MY_IP" ]; then continue; fi
+
+              # Nombre de puerto unico: vxlan + los 4 octetos sin puntos
+              PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
+
               # Crear el tunel VXLAN si no existe aun
               if ! ovs-vsctl list-ports br-sdn | grep -q "^${PORT_NAME}$"; then
                 echo "Creando tunel VXLAN a $remote_ip (puerto $PORT_NAME)..."
