@@ -77,11 +77,11 @@ spec:
         app: ryu
     spec:
       containers:
-        - name: ryu
-          image: arturoalvarez/ryu-controller:latest
-          imagePullPolicy: Always
-          command: ["ryu-manager", "--observe-links", "ryu.topology.switches", "app.py"]
-          env:
+      - name: ryu
+        image: arturoalvarez/ryu-controller:latest
+        imagePullPolicy: Always
+        command: ["ryu-manager", "--observe-links", "ryu.topology.switches", "app.py"]
+        env:
         - name: REDIS_HOST
           value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
         - name: REDIS_PORT
