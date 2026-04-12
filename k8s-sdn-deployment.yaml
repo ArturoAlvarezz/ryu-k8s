@@ -84,12 +84,9 @@ spec:
         command: ["ryu-manager", "--observe-links", "app.py"]
         env:
         - name: REDIS_HOST
-          value: "redis.sdn-controller.svc.cluster.local" # FQDN inside K8s pointing to the Redis service
+          value: "redis.sdn-controller.svc.cluster.local"
         - name: REDIS_PORT
           value: "6379"
-        ports:
-        - containerPort: 6653
-        - containerPort: 6633
 
 ---
 # ==========================
