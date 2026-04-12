@@ -104,22 +104,29 @@ def get_topology():
                             "switch": dpid
                         })
                         
-        # Dibujar la red OVS nativa consultando la topología L2 LLDP auto-descubierta
+        # Dibujar la red OVS nativa consultando la topología L2 auto-descubierta
         db_links = r.smembers("topology:links")
+        seen_pairs = set()
         for link in db_links:
             # link format: "dpid1:portno1-dpid2:portno2"
             try:
                 src_str, dst_str = link.split('-')
                 src_dpid, src_port = src_str.split(':')
                 dst_dpid, dst_port = dst_str.split(':')
-                
+
+                # Normalizar par para evitar duplicados bidireccionales
+                pair = tuple(sorted([str(src_dpid), str(dst_dpid)]))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+
                 edges.append({
                     "from": str(src_dpid),
                     "to": str(dst_dpid),
                     "color": "#00ffcc",
                     "width": 3,
                     "smooth": {"type": "curvedCW"},
-                    "title": f"LLDP Enlace Físico L2 (P{src_port} ↔ P{dst_port})"
+                    "title": f"Enlace Físico L2 (P{src_port} ↔ P{dst_port})"
                 })
             except Exception:
                 continue
