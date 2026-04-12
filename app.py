@@ -79,6 +79,20 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.redis.srem("topology:links", link_str)
         self.logger.info("LLDP Auto-Discovery: Enlace Removido %s", link_str)
 
+    def _get_switch_mac_map(self):
+        """Devuelve un dict {mac_hex: dpid} de todos los switches registrados."""
+        switches = self.redis.smembers('topology:switches')
+        mac_map = {}
+        for dpid in switches:
+            try:
+                # El DPID numérico -> MAC hex del bridge (ej: e65c876d5837)
+                mac_hex = hex(int(dpid))[2:].zfill(12)
+                mac_fmt = ':'.join(mac_hex[i:i+2] for i in range(0, 12, 2))
+                mac_map[mac_fmt] = dpid
+            except Exception:
+                pass
+        return mac_map
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         # If you hit this you might want to increase
@@ -112,6 +126,19 @@ class DistributedL2Switch(app_manager.RyuApp):
         
         # MAC Ageing (Auto Limpieza): Marcamos la MAC con un temporizador de vida (TTL) de 25 segundos
         self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=25)
+
+        # ─── TOPOLOGY INFERENCE ───────────────────────────────────────────────
+        # Si el src MAC pertenece a otro switch conocido y llega por un puerto
+        # inter-nodo (1-10), deducimos que hay un enlace físico y lo guardamos.
+        if 1 <= in_port <= 10:
+            switch_mac_map = self._get_switch_mac_map()
+            if src in switch_mac_map:
+                neighbor_dpid = switch_mac_map[src]
+                if str(neighbor_dpid) != str(dpid):
+                    link_str = f"{dpid}:{in_port}-{neighbor_dpid}:0"
+                    self.redis.sadd("topology:links", link_str)
+                    self.redis.expire("topology:links", 300)  # TTL 5min para frescura
+        # ─────────────────────────────────────────────────────────────────────
 
         # Retrieve destination port from Redis
         out_port_str = self.redis.hget(mac_table_key, dst)
