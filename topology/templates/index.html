@@ -395,46 +395,6 @@
             })[0];
         }
 
-        function extractPath(srcGuestId, dstGuestId) {
-            if(!currentData) return [];
-            
-            const srcGuest = currentData.guests.find(g => g.id === srcGuestId);
-            const dstGuest = currentData.guests.find(g => g.id === dstGuestId);
-
-            if(!srcGuest || !dstGuest) return [];
-
-            // Algoritmo BFS (Breadth-First Search) para encontrar el camino más corto en el Anillo
-            let queue = [[srcGuest.id]];
-            let visited = new Set();
-            visited.add(srcGuest.id);
-
-            while(queue.length > 0) {
-                let path = queue.shift();
-                let lastNode = path[path.length - 1];
-
-                if(lastNode === dstGuest.id) {
-                    return path;
-                }
-
-                // Encontrar vecinos a través del Dataset de Enlaces Vis.js
-                // IMPORTANTE: El BFS ahora tiene PROHIBIDO usar túneles apagados por RSTP.
-                // Replicando así el viaje matemático exacto de los paquetes en la vida real.
-                let connectedEdges = edgesDataset.get({
-                    filter: item => (item.from === lastNode || item.to === lastNode) && item.is_blocked !== true
-                });
-
-                for(let edge of connectedEdges) {
-                    let neighbor = (edge.from === lastNode) ? edge.to : edge.from;
-                    if(!visited.has(neighbor)) {
-                        visited.add(neighbor);
-                        queue.push([...path, neighbor]);
-                    }
-                }
-            }
-
-            return [];
-        }
-
         function tracePath() {
             resetColors();
             
@@ -446,25 +406,41 @@
                 return;
             }
 
-            const path = extractPath(srcId, dstId);
-            let edgeIdsToHighlight = [];
+            fetch(`/api/trace/${srcId}/${dstId}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        alert("Error trazando ruta: " + data.error);
+                        return;
+                    }
+                    
+                    const switchPath = data.path; // e.g: [dpid1, dpid2, dpid3]
+                    // El full path incluye a los guests en los extremos
+                    const fullPath = [srcId, ...switchPath, dstId];
+                    
+                    let edgeIdsToHighlight = [];
 
-            for(let i=0; i < path.length - 1; i++) {
-                const edge = getEdge(path[i], path[i+1]);
-                if(edge) edgeIdsToHighlight.push(edge.id);
-            }
+                    for(let i=0; i < fullPath.length - 1; i++) {
+                        const edge = getEdge(fullPath[i], fullPath[i+1]);
+                        if(edge) edgeIdsToHighlight.push(edge.id);
+                    }
 
-            // Apply Neon Highlight
-            const updates = edgeIdsToHighlight.map(id => {
-                return {
-                    id: id,
-                    color: { color: '#facc15', highlight: '#facc15' }, // cyber-yellow
-                    width: 5,
-                    shadow: { enabled: true, color: '#facc15', size: 20 }
-                };
-            });
-            
-            edgesDataset.update(updates);
+                    // Apply Neon Highlight
+                    const updates = edgeIdsToHighlight.map(id => {
+                        return {
+                            id: id,
+                            color: { color: '#facc15', highlight: '#facc15' }, // cyber-yellow
+                            width: 5,
+                            shadow: { enabled: true, color: '#facc15', size: 20 }
+                        };
+                    });
+                    
+                    edgesDataset.update(updates);
+                })
+                .catch(err => {
+                    console.error(err);
+                    alert("Error contactando al controlador para trazar la ruta.");
+                });
         }
 
         // Auto-refresh topology structurally every 10 seconds silently

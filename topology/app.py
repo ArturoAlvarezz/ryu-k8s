@@ -104,32 +104,47 @@ def get_topology():
                             "switch": dpid
                         })
                         
-        # Dibujar la red OVS nativa consultando la topología L2 auto-descubierta
-        db_links = r.smembers("topology:links")
+        # Topología Determinista usando Port Names de Ryu
+        # En lugar de depender del tráfico, leemos la estructura exacta del switch!
         seen_pairs = set()
-        for link in db_links:
-            # link format: "dpid1:portno1-dpid2:portno2"
-            try:
-                src_str, dst_str = link.split('-')
-                src_dpid, src_port = src_str.split(':')
-                dst_dpid, dst_port = dst_str.split(':')
+        ip_to_dpid = {ip: dp for dp, ip in r.hgetall('topology:node_ips').items()}
+        
+        # Mapeo universal de {DPID_ORIGEN: {PORT_NO: DPID_DESTINO}}
+        # Servirá para construir los links y detectar puertos bloqueados
+        dst_by_port = {}
 
-                # Normalizar par para evitar duplicados bidireccionales
-                pair = tuple(sorted([str(src_dpid), str(dst_dpid)]))
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-
-                edges.append({
-                    "from": str(src_dpid),
-                    "to": str(dst_dpid),
-                    "color": "#00ffcc",
-                    "width": 3,
-                    "smooth": {"type": "curvedCW"},
-                    "title": f"Enlace Físico L2 (P{src_port} ↔ P{dst_port})"
-                })
-            except Exception:
-                continue
+        for dpid in switches:
+            dst_by_port[dpid] = {}
+            ports = r.hgetall(f"switch_ports:{dpid}")
+            for port_no_str, port_name in ports.items():
+                port_no = int(port_no_str)
+                # Si el puerto es un tunel VXLAN, su nombre es "vx" + IP remota sin puntos
+                if port_name.startswith("vx"):
+                    # Extraer la IP remota: convertimos "vx192168122101" -> "192.168.122.101"
+                    raw_ip = port_name[2:]
+                    # Restituir puntos (sabemos que es una IP clase C tipica de K3s o similar)
+                    # En nuestro script: PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
+                    # Para encontrar al vecino real sin adivinar sufijos, buscamos en la DB de IPs que la version sin puntos coincida
+                    target_dpid = None
+                    for ip, dp in ip_to_dpid.items():
+                         if ip.replace('.', '') == raw_ip:
+                             target_dpid = dp
+                             break
+                    
+                    if target_dpid:
+                        dst_by_port[dpid][port_no_str] = target_dpid
+                        # Normalizar par para evitar duplicados bidireccionales en el dibujo visual
+                        pair = tuple(sorted([str(dpid), str(target_dpid)]))
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            edges.append({
+                                "from": str(dpid),
+                                "to": str(target_dpid),
+                                "color": "#00ffcc",
+                                "width": 3,
+                                "smooth": {"type": "curvedCW"},
+                                "title": f"Enlace VXLAN (P{port_no} ↔ Host: {ip})"
+                            })
 
         # Extraer Telemetría de Protección de Bucles (RSTP Analytics)
         blocked_ports = r.hgetall('topology:blocked_ports')
@@ -138,7 +153,7 @@ def get_topology():
             # key format: "dpid:ofport" -> e.g. "1234567890:1"
             if ":" not in key:
                 continue
-            src_raw_dpid, port_no = key.split(":")
+            src_raw_dpid, port_no_str = key.split(":")
             
             # Encontrar el DPID numérico original del source
             src_dpid = None
@@ -150,23 +165,8 @@ def get_topology():
             if not src_dpid:
                 continue
                 
-            # Determinar el nodo destino inspeccionando los túneles LLDP reales en vez de adivinar nombres
-            dst_dpid = None
-            for link in db_links:
-                try:
-                    s_str, d_str = link.split('-')
-                    s_dp, s_po = s_str.split(':')
-                    d_dp, d_po = d_str.split(':')
-                    
-                    if str(s_dp) == str(src_dpid) and str(s_po) == str(port_no):
-                        dst_dpid = d_dp
-                        break
-                    # Enlaces bidireccionales, verificar el inverso
-                    elif str(d_dp) == str(src_dpid) and str(d_po) == str(port_no):
-                        dst_dpid = s_dp
-                        break
-                except Exception:
-                    continue
+            # Buscar el destino usando nuestro mapa determinista!
+            dst_dpid = dst_by_port.get(str(src_dpid), {}).get(str(port_no_str))
             
             if src_dpid and dst_dpid:
                 blocked_edges.append({
@@ -197,6 +197,66 @@ def get_topology():
             "blocked_edges": blocked_edges,
             "maestro_dpid": maestro_dpid
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/trace/<src_guest>/<dst_guest>')
+def trace_path(src_guest, dst_guest):
+    try:
+        # Encontrar los switches origen y destino
+        switches = r.smembers('topology:switches')
+        src_switch = None
+        dst_switch = None
+        
+        for dpid in switches:
+            mac_table = r.hgetall(f"mac_to_port:{dpid}")
+            # Si el switch conoce localmente al origen (puerto no es de tunnel)
+            port_src_str = mac_table.get(src_guest)
+            if port_src_str:
+                port_name = r.hget(f"switch_ports:{dpid}", port_src_str) or ""
+                if not port_name.startswith("vx"):
+                    src_switch = dpid
+
+            port_dst_str = mac_table.get(dst_guest)
+            if port_dst_str:
+                port_name = r.hget(f"switch_ports:{dpid}", port_dst_str) or ""
+                if not port_name.startswith("vx"):
+                    dst_switch = dpid
+
+        if not src_switch or not dst_switch:
+            return jsonify({"error": "Guests no localizados (o no tienen tráfico reciente)"}), 404
+
+        # Realizar Tracing usando las tablas reales decididas por Ryu
+        path = [src_switch]
+        curr_switch = src_switch
+        ip_to_dpid = {ip.replace('.',''): dp for dp, ip in r.hgetall('topology:node_ips').items()}
+        visited = set()
+
+        while curr_switch != dst_switch:
+            if curr_switch in visited:
+                break # Evitar bucles infinitos en caso de inconsistencia
+            visited.add(curr_switch)
+
+            # Ryu dice que para llegar a dst_guest, debe salir por este puerto:
+            out_port_str = r.hget(f"mac_to_port:{curr_switch}", dst_guest)
+            if not out_port_str:
+                break # Faltan tablas
+                
+            port_name = r.hget(f"switch_ports:{curr_switch}", out_port_str)
+            if not port_name or not port_name.startswith("vx"):
+                break # Puerto invalido o no es tunel
+
+            raw_ip = port_name[2:]
+            next_switch = ip_to_dpid.get(raw_ip)
+            
+            if next_switch:
+                path.append(next_switch)
+                curr_switch = next_switch
+            else:
+                break
+
+        return jsonify({"path": path})
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
