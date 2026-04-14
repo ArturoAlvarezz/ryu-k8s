@@ -75,6 +75,9 @@ def get_topology():
             # Obtener el mapa global de IPs asignadas por el DHCP
             guest_ips = r.hgetall('topology:guest_ips')
             
+            # Extraer mapeo de puertos de este switch
+            switch_ports_map = r.hgetall(f"switch_ports:{dpid}")
+
             # Escanear tabla de direcciones MAC aprendidas para encontrar a los Guests locales
             mac_table = r.hgetall(f"mac_to_port:{dpid}")
             for mac, port_str in mac_table.items():
@@ -89,11 +92,9 @@ def get_topology():
                     r.hdel('topology:guest_ips', mac)
                     continue
 
-                # Filtro algorítmico de Anillo (Ring) y limpieza de Fantasmas OVS Locales (port 65534)
-                # Cada nodo tiene ahora exactamente 2 túneles VXLAN configurados en su script inicial (Left/Right).
-                # Es decir, los puertos OVS virtuales 1 y 2 son las salidas del anillo al resto del clúster K3s.
-                # Cualquier MAC aprendida en un puerto > 2 pertenece obligadamente a un cable físico enchufado localmente (Guest).
-                if port > 2 and port < 60000:
+                # Identificación determinista: Solo las MACs en los puertos con nombre 'ens' son Guests locales!
+                port_name = switch_ports_map.get(port_str, "")
+                if port_name.startswith("ens"):
                     guest_id = mac
                     if guest_id not in [g['id'] for g in guests]:
                         ip_text = guest_ips.get(guest_id, "Desconocida / DHCP Pendiente")
@@ -107,29 +108,33 @@ def get_topology():
         # Topología Determinista usando Port Names de Ryu
         # En lugar de depender del tráfico, leemos la estructura exacta del switch!
         seen_pairs = set()
-        ip_to_dpid = {ip: dp for dp, ip in r.hgetall('topology:node_ips').items()}
         
+        # Necesitamos cruzar el DPID numérico (decimal) usado por los Nodos visuales 
+        # con la IP, pasando por la MAC en crudo.
+        node_ips = r.hgetall('topology:node_ips')
+        ip_to_dpid = {}
+        for dp_dec in switches:
+             raw = get_raw_dpid(dp_dec)
+             ip = node_ips.get(raw)
+             if ip:
+                 # Mapa de IP sin puntos directamente al DPID numérico del backend
+                 ip_to_dpid[ip.replace('.', '')] = str(dp_dec)
+
         # Mapeo universal de {DPID_ORIGEN: {PORT_NO: DPID_DESTINO}}
         # Servirá para construir los links y detectar puertos bloqueados
         dst_by_port = {}
 
         for dpid in switches:
-            dst_by_port[dpid] = {}
+            dst_by_port[str(dpid)] = {}
             ports = r.hgetall(f"switch_ports:{dpid}")
             for port_no_str, port_name in ports.items():
                 port_no = int(port_no_str)
                 # Si el puerto es un tunel VXLAN, su nombre es "vx" + IP remota sin puntos
                 if port_name.startswith("vx"):
-                    # Extraer la IP remota: convertimos "vx192168122101" -> "192.168.122.101"
+                    # Extraer la IP remota sin puntos: "vx192168122101" -> "192168122101"
                     raw_ip = port_name[2:]
-                    # Restituir puntos (sabemos que es una IP clase C tipica de K3s o similar)
-                    # En nuestro script: PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
-                    # Para encontrar al vecino real sin adivinar sufijos, buscamos en la DB de IPs que la version sin puntos coincida
-                    target_dpid = None
-                    for ip, dp in ip_to_dpid.items():
-                         if ip.replace('.', '') == raw_ip:
-                             target_dpid = dp
-                             break
+                    
+                    target_dpid = ip_to_dpid.get(raw_ip)
                     
                     if target_dpid:
                         dst_by_port[dpid][port_no_str] = target_dpid
@@ -229,7 +234,14 @@ def trace_path(src_guest, dst_guest):
         # Realizar Tracing usando las tablas reales decididas por Ryu
         path = [src_switch]
         curr_switch = src_switch
-        ip_to_dpid = {ip.replace('.',''): dp for dp, ip in r.hgetall('topology:node_ips').items()}
+        # Construir mapa de IP a DPID Decimal
+        node_ips = r.hgetall('topology:node_ips')
+        ip_to_dpid = {}
+        for dp_dec in switches:
+             raw = "0000" + hex(int(dp_dec))[2:].zfill(12)
+             ip = node_ips.get(raw)
+             if ip:
+                 ip_to_dpid[ip.replace('.', '')] = str(dp_dec)
         visited = set()
 
         while curr_switch != dst_switch:
