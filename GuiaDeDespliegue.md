@@ -267,3 +267,8 @@ kubectl logs -f -l app=ryu -n sdn-controller --prefix
 kubectl logs sdn-dhcp-server-qwqkb -n sdn-controller
 ```
 ---
+
+
+ovs-appctl ofproto/trace br-sdn in_port=2,dl_src=02:42:cd:61:a9:00,dl_dst=02:42:91:dd:eb:00
+
+kubectl exec -it ovs-sdn-initializer-2744p -n sdn-controller -- /bin/sh

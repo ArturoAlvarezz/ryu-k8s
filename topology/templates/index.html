@@ -295,6 +295,10 @@
             const srcSelect = document.getElementById('srcGuest');
             const dstSelect = document.getElementById('dstGuest');
             
+            // PRESERVAR la selección del usaurio antes del innerHTML
+            const prevSrc = srcSelect.value;
+            const prevDst = dstSelect.value;
+            
             listDiv.innerHTML = '';
             srcSelect.innerHTML = '';
             dstSelect.innerHTML = '';
@@ -334,6 +338,14 @@
                 }
                 listDiv.appendChild(swBlock);
             });
+            
+            // RE-APLICAR la selección original si los guests aún existen
+            if (prevSrc && srcSelect.querySelector(`option[value="${prevSrc}"]`)) {
+                srcSelect.value = prevSrc;
+            }
+            if (prevDst && dstSelect.querySelector(`option[value="${prevDst}"]`)) {
+                dstSelect.value = prevDst;
+            }
         }
 
         function updateNetwork(data) {

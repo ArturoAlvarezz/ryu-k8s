@@ -23,11 +23,13 @@ class DistributedL2Switch(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(DistributedL2Switch, self).__init__(*args, **kwargs)
         
-        # Redis connection setup
-        redis_host = os.environ.get('REDIS_HOST', 'redis')
-        redis_port = int(os.environ.get('REDIS_PORT', 6379))
-        self.redis = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
-        self.logger.info("Connected to Redis at %s:%d", redis_host, redis_port)
+        # Redis connection setup (Sentinel HA)
+        from redis.sentinel import Sentinel
+        sentinel_host = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
+        sentinel_port = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
+        self.sentinel = Sentinel([(sentinel_host, sentinel_port)], socket_timeout=0.5)
+        self.redis = self.sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
+        self.logger.info("Connected to Redis Sentinel at %s:%d", sentinel_host, sentinel_port)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -46,6 +48,35 @@ class DistributedL2Switch(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+
+        # Solicitar la lista de puertos físicos y virtuales al switch para la topología determinista
+        req = parser.OFPPortDescStatsRequest(datapath, 0)
+        datapath.send_msg(req)
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        for p in ev.msg.body:
+            port_no = p.port_no
+            name = p.name.decode('utf-8')
+            self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+            self.logger.info("Port registered: DPID %s, Port %s, Name %s", dpid, port_no, name)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        reason = msg.reason
+        port_no = msg.desc.port_no
+        name = msg.desc.name.decode('utf-8')
+        dpid = msg.datapath.id
+        ofproto = msg.datapath.ofproto
+
+        if reason == ofproto.OFPPR_ADD or reason == ofproto.OFPPR_MODIFY:
+            self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+            self.logger.info("Port status UPDATE: DPID %s, Port %s, Name %s", dpid, port_no, name)
+        elif reason == ofproto.OFPPR_DELETE:
+            self.redis.hdel(f"switch_ports:{dpid}", port_no)
+            self.logger.info("Port status DELETE: DPID %s, Port %s", dpid, port_no)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto

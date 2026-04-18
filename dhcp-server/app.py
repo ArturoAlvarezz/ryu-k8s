@@ -4,20 +4,22 @@ import redis
 import threading
 from scapy.all import *
 
-REDIS_HOST = os.environ.get('REDIS_HOST', 'redis.sdn-controller.svc.cluster.local')
-REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
+SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
+SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
 IFACE = "br-sdn"
 
 print("Inicializando entorno de red...")
+from redis.sentinel import Sentinel
 r = None
 while True:
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        sentinel = Sentinel([(SENTINEL_HOST, SENTINEL_PORT)], socket_timeout=0.5)
+        r = sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
         r.ping()
-        print("Conexión a Redis SDN exitosa.")
+        print("Conexión a Redis Sentinel SDN exitosa.")
         break
     except Exception as e:
-        print(f"Esperando a Redis en {REDIS_HOST}:{REDIS_PORT}... ({e})")
+        print(f"Esperando a Redis Sentinel en {SENTINEL_HOST}:{SENTINEL_PORT}... ({e})")
         time.sleep(3)
 
 def get_ip_for_mac(mac):

@@ -5,10 +5,12 @@ from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
-# Configuración de Redis
-REDIS_HOST = os.environ.get('REDIS_HOST', 'redis.sdn-controller.svc.cluster.local')
-REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+# Configuración de Redis Sentinel
+from redis.sentinel import Sentinel
+SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
+SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
+sentinel = Sentinel([(SENTINEL_HOST, SENTINEL_PORT)], socket_timeout=0.5)
+r = sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
 
 @app.route('/')
 def index():
@@ -24,18 +26,13 @@ def get_topology():
         edges = []
         guests = []
         
-        def get_raw_dpid(dpid_decimal):
-            try:
-                return "0000" + hex(int(dpid_decimal))[2:].zfill(12)
-            except Exception:
-                return dpid_decimal
-        
+
         maestro_dpid = None
         role_to_dpid = {}
 
         # Mapear roles lógicos a sus respectivos DPID dinámicos
         for dpid in switches:
-            raw_dpid = get_raw_dpid(dpid)
+            raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else dpid
             name = node_names.get(raw_dpid, "").lower()
             if "maestro" in name:
                 maestro_dpid = dpid
@@ -51,7 +48,7 @@ def get_topology():
 
         # Construir nodos físicos de switches (K3s Nodes)
         for dpid in switches:
-            raw_dpid = get_raw_dpid(dpid)
+            raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else dpid
             # Convertir el identificador decimal de vuelta a la MAC hexadecimal original para la UI
             try:
                 hex_dpid = hex(int(dpid))[2:].zfill(12)
@@ -113,12 +110,11 @@ def get_topology():
         # con la IP, pasando por la MAC en crudo.
         node_ips = r.hgetall('topology:node_ips')
         ip_to_dpid = {}
-        for dp_dec in switches:
-             raw = get_raw_dpid(dp_dec)
-             ip = node_ips.get(raw)
-             if ip:
-                 # Mapa de IP sin puntos directamente al DPID numérico del backend
-                 ip_to_dpid[ip.replace('.', '')] = str(dp_dec)
+        for raw, ip in node_ips.items():
+            try:
+                ip_to_dpid[ip.replace('.', '')] = str(int(raw, 16))
+            except Exception:
+                pass
 
         # Mapeo universal de {DPID_ORIGEN: {PORT_NO: DPID_DESTINO}}
         # Servirá para construir los links y detectar puertos bloqueados
@@ -163,7 +159,8 @@ def get_topology():
             # Encontrar el DPID numérico original del source
             src_dpid = None
             for d in switches:
-                if get_raw_dpid(d) == src_raw_dpid:
+                raw_dp = "0000" + hex(int(d))[2:].zfill(12) if str(d).isdigit() else d
+                if raw_dp == src_raw_dpid:
                     src_dpid = d
                     break
                     
@@ -237,11 +234,11 @@ def trace_path(src_guest, dst_guest):
         # Construir mapa de IP a DPID Decimal
         node_ips = r.hgetall('topology:node_ips')
         ip_to_dpid = {}
-        for dp_dec in switches:
-             raw = "0000" + hex(int(dp_dec))[2:].zfill(12)
-             ip = node_ips.get(raw)
-             if ip:
-                 ip_to_dpid[ip.replace('.', '')] = str(dp_dec)
+        for raw, ip in node_ips.items():
+            try:
+                ip_to_dpid[ip.replace('.', '')] = str(int(raw, 16))
+            except Exception:
+                pass
         visited = set()
 
         while curr_switch != dst_switch:

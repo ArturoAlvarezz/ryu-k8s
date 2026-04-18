@@ -10,22 +10,39 @@ metadata:
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis
+  name: redis-headless
+  namespace: sdn-controller
+spec:
+  clusterIP: None
+  ports:
+  - name: redis
+    port: 6379
+  - name: sentinel
+    port: 26379
+  selector:
+    app: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
   namespace: sdn-controller
 spec:
   ports:
-  - port: 6379
-    targetPort: 6379
+  - name: sentinel
+    port: 26379
+    targetPort: 26379
   selector:
     app: redis
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: redis
   namespace: sdn-controller
 spec:
-  replicas: 1 # For production, consider using a Redis cluster or Sentinel
+  serviceName: redis-headless
+  replicas: 3
   selector:
     matchLabels:
       app: redis
@@ -34,11 +51,57 @@ spec:
       labels:
         app: redis
     spec:
+      initContainers:
+      - name: setup-ha
+        image: redis:7-alpine
+        command:
+        - sh
+        - -c
+        - |
+          # Solo crear configuración si el Pod es nuevo (volumen nuevo)
+          if [ ! -f /data/sentinel.conf ]; then
+            echo "bind 0.0.0.0" > /data/redis.conf
+            if [ "$HOSTNAME" != "redis-0" ]; then
+              echo "replicaof redis-0.redis-headless.sdn-controller.svc.cluster.local 6379" >> /data/redis.conf
+            fi
+            
+            echo "bind 0.0.0.0" > /data/sentinel.conf
+            echo "sentinel monitor mymaster redis-0.redis-headless.sdn-controller.svc.cluster.local 6379 2" >> /data/sentinel.conf
+            echo "sentinel down-after-milliseconds mymaster 2000" >> /data/sentinel.conf
+            echo "sentinel failover-timeout mymaster 5000" >> /data/sentinel.conf
+            echo "sentinel parallel-syncs mymaster 1" >> /data/sentinel.conf
+            echo "sentinel resolve-hostnames yes" >> /data/sentinel.conf
+            echo "sentinel announce-hostnames yes" >> /data/sentinel.conf
+            chmod 666 /data/sentinel.conf
+          fi
+        volumeMounts:
+        - name: data
+          mountPath: /data
       containers:
       - name: redis
         image: redis:7-alpine
+        command: ["redis-server", "/data/redis.conf"]
         ports:
         - containerPort: 6379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      - name: sentinel
+        image: redis:7-alpine
+        command: ["redis-server", "/data/sentinel.conf", "--sentinel"]
+        ports:
+        - containerPort: 26379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 50Mi
 ---
 # ==========================
 # Distributed Ryu Controller Components
@@ -83,10 +146,18 @@ spec:
         image: arturoalvarez/ryu-controller:latest
         command: ["ryu-manager", "--observe-links", "app.py"]
         env:
-        - name: REDIS_HOST
-          value: "redis.sdn-controller.svc.cluster.local"
-        - name: REDIS_PORT
-          value: "6379"
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+      volumes:
+      - name: code-volume
+        configMap:
+          name: ryu-code
 
 ---
 # ==========================
@@ -123,15 +194,17 @@ spec:
         - /bin/bash
         - -c
         - |
-          echo "Instalando Open vSwitch..."
+          echo "Instalando dependencias y demonios de red nativa L2..."
           apt-get update > /dev/null
-          apt-get install -y openvswitch-switch kmod iproute2 redis-tools > /dev/null
+          apt-get install -y openvswitch-switch kmod iproute2 redis-tools lldpd jq > /dev/null
           
           echo "Cargando módulo del kernel..."
           modprobe openvswitch || true
           
-          echo "Iniciando servicio OVS..."
+          echo "Iniciando servicio OVS y LLDPD..."
           service openvswitch-switch start
+          mkdir -p /run/lldpd
+          lldpd -d &
           sleep 2
           
           echo "Limpiando estado anterior para evitar fantasmas..."
@@ -144,37 +217,44 @@ spec:
           echo "Creando br-sdn con DPID físico estático: $DPID..."
           ovs-vsctl --may-exist add-br br-sdn
           ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
+          ip link set br-sdn up
           
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
           ovs-vsctl set-controller br-sdn tcp:127.0.0.1:6653
           
-          echo "Registrando nodo en base de datos global (Redis)..."
+          echo "Obteniendo IP del Redis Master vía Sentinel..."
           MY_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || ip addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
-          redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:node_names $DPID $NODE_NAME || true
-          redis-cli -h redis.sdn-controller.svc.cluster.local HSET topology:node_ips $DPID $MY_IP || true
-          echo "Nodo registrado: $NODE_NAME ($MY_IP)"
+          MASTER_IP=$(redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster | head -n 1)
+          if [ -n "$MASTER_IP" ]; then
+            redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME || true
+            redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP || true
+            echo "Nodo registrado en Master $MASTER_IP: $NODE_NAME ($MY_IP)"
+          else
+            echo "Error: No se pudo obtener el Redis Master de Sentinel."
+          fi
 
           echo "Activando RSTP (Anti-Bucles)..."
           ovs-vsctl set bridge br-sdn rstp_enable=true
 
-          echo "Esperando 15 segundos para que todos los nodos se registren en Redis..."
+          echo "Esperando 15 segundos para dar tiempo a convergencia topologica de lldpd..."
           sleep 15
 
-          echo "Creando tuneles VXLAN hacia vecinos conocidos en Redis..."
+          echo "Evaluando mapa físico mediante LLDP Point-to-Point asíncrono..."
           while true; do
-            # Leer todos los nodos registrados en Redis
-            ALL_IPS=$(redis-cli -h redis.sdn-controller.svc.cluster.local HGETALL topology:node_ips 2>/dev/null)
-            echo "$ALL_IPS" | paste - - | while read dpid remote_ip; do
-              # Saltar IPs vacias o la nuestra propia (comparacion exacta de IP completa)
+            # Identificar MgmtIP capturadas por LLDP en interfaces físicas puras (ej. lldp.ens4.chassis.mgmt-ip=192.168.122.101)
+            PHYSICAL_NEIGHBORS=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "\.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | sort -u || true)
+
+            for remote_ip in $PHYSICAL_NEIGHBORS; do
+              # Validar IP
               if [ -z "$remote_ip" ] || [ "$remote_ip" = "$MY_IP" ]; then continue; fi
 
-              # Nombre de puerto unico: vxlan + los 4 octetos sin puntos
+              # Nombre de puerto unico: vx + los 4 octetos sin puntos
               PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
-
-              # Crear el tunel VXLAN si no existe aun
+              
+              # Crear el tunel VXLAN SDN hacia lo que físicamente existe
               if ! ovs-vsctl list-ports br-sdn | grep -q "^${PORT_NAME}$"; then
-                echo "Creando tunel VXLAN a $remote_ip (puerto $PORT_NAME)..."
+                echo "Auto-detectado vecino L2 físico: $remote_ip. Instanciando encapsulación SDN..."
                 ovs-vsctl --may-exist add-port br-sdn $PORT_NAME \
                   -- set interface $PORT_NAME type=vxlan \
                      options:remote_ip=$remote_ip \
@@ -232,12 +312,23 @@ spec:
         image: arturoalvarez/ryu-topology:latest
         imagePullPolicy: Always
         env:
-        - name: REDIS_HOST
-          value: "redis.sdn-controller.svc.cluster.local"
-        - name: REDIS_PORT
-          value: "6379"
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
         ports:
         - containerPort: 5000
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+        - name: code-volume
+          mountPath: /app/templates/index.html
+          subPath: index.html
+      volumes:
+      - name: code-volume
+        configMap:
+          name: ryu-topology-code
 
 ---
 apiVersion: v1
@@ -285,7 +376,15 @@ spec:
         securityContext:
           privileged: true
         env:
-        - name: REDIS_HOST
-          value: "redis.sdn-controller.svc.cluster.local"
-        - name: REDIS_PORT
-          value: "6379"
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+      volumes:
+      - name: code-volume
+        configMap:
+          name: dhcp-code
