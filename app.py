@@ -3,7 +3,7 @@ import redis
 import eventlet
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.topology import event
 from ryu.ofproto import ofproto_v1_3
@@ -52,6 +52,32 @@ class DistributedL2Switch(app_manager.RyuApp):
         # Solicitar la lista de puertos físicos y virtuales al switch para la topología determinista
         req = parser.OFPPortDescStatsRequest(datapath, 0)
         datapath.send_msg(req)
+
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _state_change_handler(self, ev):
+        datapath = ev.datapath
+        if ev.state == DEAD_DISPATCHER:
+            if datapath.id is None:
+                return
+            dpid = datapath.id
+            self.logger.info("Switch disconnected, removing from Redis: dpid=%s", dpid)
+            
+            # Borrar de la lista global de switches
+            self.redis.srem('topology:switches', dpid)
+            
+            # Formatear el dpid a hexadecimal de 16 caracteres (formato raw_dpid de k8s)
+            try:
+                raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12)
+                self.redis.hdel('topology:node_names', raw_dpid)
+                self.redis.hdel('topology:node_ips', raw_dpid)
+            except Exception as e:
+                self.logger.error("Error formatting dpid for deletion: %s", e)
+                
+            # Borrar tablas de puertos asociadas al switch fantasma
+            self.redis.delete(f"mac_to_port:{dpid}")
+            self.redis.delete(f"switch_ports:{dpid}")
+
+
 
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
@@ -176,10 +202,15 @@ class DistributedL2Switch(app_manager.RyuApp):
         
         if out_port_str:
             out_port = int(out_port_str)
+            actions = [parser.OFPActionOutput(out_port)]
         else:
             out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
+            # Inyectar una copia del tráfico Broadcast al stack Linux local (br-sdn)
+            # para que los DaemonSets hostNetwork como sdn-dhcp-server puedan leerlo.
+            actions = [
+                parser.OFPActionOutput(out_port),
+                parser.OFPActionOutput(ofproto.OFPP_LOCAL)
+            ]
 
         # Install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:

@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SDN Meter Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e1a; --surface: #111827; --surface2: #1a2235;
+    --border: #1e2d45; --accent: #3b82f6; --accent2: #06b6d4;
+    --green: #10b981; --yellow: #f59e0b; --red: #ef4444;
+    --text: #e2e8f0; --muted: #64748b; --font: 'Inter', sans-serif; --mono: 'JetBrains Mono', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
+
+  /* Header */
+  header { background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; align-items: center; justify-content: space-between; }
+  .logo { display: flex; align-items: center; gap: 0.75rem; }
+  .logo-icon { width: 40px; height: 40px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.25rem; }
+  h1 { font-size: 1.25rem; font-weight: 600; letter-spacing: -0.02em; }
+  .subtitle { font-size: 0.75rem; color: var(--muted); }
+  .status-bar { display: flex; align-items: center; gap: 1.5rem; font-size: 0.8rem; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+
+  /* Layout */
+  main { padding: 1.5rem 2rem; max-width: 1400px; margin: 0 auto; }
+
+  /* KPI Cards */
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem; position: relative; overflow: hidden; transition: border-color .2s; }
+  .kpi:hover { border-color: var(--accent); }
+  .kpi::before { content:''; position:absolute; top:0; left:0; right:0; height:3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+  .kpi-label { font-size: 0.7rem; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: .5rem; }
+  .kpi-value { font-family: var(--mono); font-size: 1.8rem; font-weight: 600; color: var(--text); line-height: 1; }
+  .kpi-unit { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; }
+
+  /* Grid content */
+  .content-grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+  @media(max-width:900px){ .content-grid{grid-template-columns:1fr;} }
+
+  /* Panels */
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .panel-header { padding: .875rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+  .panel-title { font-size: .85rem; font-weight: 600; display: flex; align-items: center; gap: .5rem; }
+  .panel-body { padding: 1.25rem; }
+
+  /* Device list */
+  .device-list { display: flex; flex-direction: column; gap: .75rem; }
+  .device-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; cursor: pointer; transition: all .2s; }
+  .device-card:hover, .device-card.active { border-color: var(--accent); background: #1a2d4a; }
+  .device-card.active { box-shadow: 0 0 0 1px var(--accent); }
+  .device-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: .75rem; }
+  .device-id { font-family: var(--mono); font-size: .8rem; font-weight: 500; color: var(--accent2); }
+  .badge { font-size: .65rem; padding: .2rem .5rem; border-radius: 999px; font-weight: 600; }
+  .badge-ok { background: rgba(16,185,129,.15); color: var(--green); }
+  .badge-warn { background: rgba(245,158,11,.15); color: var(--yellow); }
+  .device-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+  .metric { }
+  .metric-label { font-size: .65rem; color: var(--muted); text-transform: uppercase; letter-spacing:.05em; }
+  .metric-val { font-family: var(--mono); font-size: .9rem; font-weight: 500; }
+
+  /* Chart */
+  .chart-container { position: relative; height: 260px; }
+  .chart-tabs { display: flex; gap: .5rem; }
+  .tab { font-size: .75rem; padding: .3rem .75rem; border-radius: 6px; border: 1px solid var(--border); cursor: pointer; transition: all .15s; color: var(--muted); background: transparent; }
+  .tab.active, .tab:hover { border-color: var(--accent); color: var(--accent); background: rgba(59,130,246,.1); }
+
+  /* Table */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  th { padding: .6rem 1rem; text-align: left; font-size: .7rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; border-bottom: 1px solid var(--border); }
+  td { padding: .65rem 1rem; border-bottom: 1px solid rgba(30,45,69,.6); font-family: var(--mono); }
+  tr:hover td { background: var(--surface2); }
+  .no-data { text-align: center; color: var(--muted); padding: 3rem; font-size: .85rem; }
+
+  /* Refresh */
+  .refresh-badge { font-size: .7rem; color: var(--muted); display: flex; align-items: center; gap: .3rem; }
+  #last-update { color: var(--accent2); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    <div>
+      <h1>SDN Meter Dashboard</h1>
+      <div class="subtitle">Telemetría de Medidores IoT en tiempo real</div>
+    </div>
+  </div>
+  <div class="status-bar">
+    <div style="display:flex;align-items:center;gap:.4rem"><div class="dot" id="conn-dot"></div><span id="conn-label">Conectando...</span></div>
+    <div class="refresh-badge">Actualizado: <span id="last-update">—</span></div>
+  </div>
+</header>
+
+<main>
+  <!-- KPIs -->
+  <div class="kpi-grid">
+    <div class="kpi">
+      <div class="kpi-label">Medidores Activos</div>
+      <div class="kpi-value" id="kpi-devices">—</div>
+      <div class="kpi-unit">dispositivos en línea</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Potencia Total</div>
+      <div class="kpi-value" id="kpi-power">—</div>
+      <div class="kpi-unit">kW activos</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Energía Acumulada</div>
+      <div class="kpi-value" id="kpi-energy">—</div>
+      <div class="kpi-unit">kWh totales</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Lecturas Recibidas</div>
+      <div class="kpi-value" id="kpi-readings">0</div>
+      <div class="kpi-unit">en esta sesión</div>
+    </div>
+  </div>
+
+  <!-- Content grid -->
+  <div class="content-grid">
+    <!-- Device list -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">⚡ Medidores</div>
+        <span id="device-count" style="font-size:.75rem;color:var(--muted)">0 dispositivos</span>
+      </div>
+      <div class="panel-body">
+        <div class="device-list" id="device-list">
+          <div class="no-data">Esperando medidores...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chart -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">📈 Historial — <span id="chart-device-label" style="color:var(--accent2)">Seleccionar medidor</span></div>
+        <div class="chart-tabs">
+          <button class="tab active" onclick="setMetric('active_power_kw','Potencia (kW)')">Potencia</button>
+          <button class="tab" onclick="setMetric('voltage_v','Voltaje (V)')">Voltaje</button>
+          <button class="tab" onclick="setMetric('current_a','Corriente (A)')">Corriente</button>
+          <button class="tab" onclick="setMetric('energy_kwh','Energía (kWh)')">Energía</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="chart-container"><canvas id="history-chart"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Raw readings table -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">📋 Últimas Lecturas</div>
+      <span style="font-size:.75rem;color:var(--muted)" id="table-subtitle">Todos los medidores</span>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <div class="table-wrap">
+        <table id="readings-table">
+          <thead><tr>
+            <th>Device ID</th><th>Timestamp</th><th>Voltaje (V)</th>
+            <th>Corriente (A)</th><th>Potencia (kW)</th><th>FP</th>
+            <th>Energía (kWh)</th><th>Seq</th>
+          </tr></thead>
+          <tbody id="readings-body"><tr><td colspan="8" class="no-data">Esperando datos...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ---- State ----
+let selectedDevice = null;
+let currentMetric = 'active_power_kw';
+let currentMetricLabel = 'Potencia (kW)';
+let sessionReadings = 0;
+let chart = null;
+const PALETTE = ['#3b82f6','#06b6d4','#10b981','#f59e0b','#a855f7','#f43f5e'];
+let deviceColors = {};
+
+// ---- Chart init ----
+function initChart() {
+  const ctx = document.getElementById('history-chart').getContext('2d');
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: '', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)', borderWidth: 2, pointRadius: 2, tension: 0.4, fill: true }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#64748b', font: { size: 10 }, maxTicksLimit: 8 }, grid: { color: '#1e2d45' } },
+        y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#1e2d45' } }
+      }
+    }
+  });
+}
+
+function setMetric(metric, label) {
+  currentMetric = metric; currentMetricLabel = label;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  if (selectedDevice) loadHistory(selectedDevice);
+}
+
+async function loadHistory(deviceId) {
+  try {
+    const resp = await fetch(`/api/meters/${deviceId}/history?limit=50`);
+    const data = await resp.json();
+    const readings = data.readings.reverse();
+    const labels = readings.map(r => new Date(r.timestamp).toLocaleTimeString('es',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+    const values = readings.map(r => parseFloat(r[currentMetric] || 0));
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = values;
+    chart.data.datasets[0].label = currentMetricLabel;
+    chart.data.datasets[0].borderColor = deviceColors[deviceId] || '#3b82f6';
+    chart.data.datasets[0].backgroundColor = (deviceColors[deviceId] || '#3b82f6') + '14';
+    document.getElementById('chart-device-label').textContent = deviceId;
+    chart.update('none');
+  } catch(e) { console.error('History error:', e); }
+}
+
+// ---- Fetch stats ----
+async function fetchStats() {
+  try {
+    const resp = await fetch('/api/stats');
+    if (!resp.ok) throw new Error(resp.status);
+    const data = await resp.json();
+    updateKPIs(data);
+    updateDeviceList(data.devices);
+    setConnected(true);
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString('es');
+  } catch(e) { setConnected(false); }
+}
+
+async function fetchLatest() {
+  try {
+    const resp = await fetch('/api/meters');
+    const data = await resp.json();
+    sessionReadings += data.meters.length;
+    document.getElementById('kpi-readings').textContent = sessionReadings.toLocaleString();
+    updateTable(data.meters);
+  } catch(e) {}
+}
+
+function setConnected(ok) {
+  document.getElementById('conn-dot').style.background = ok ? 'var(--green)' : 'var(--red)';
+  document.getElementById('conn-label').textContent = ok ? 'Conectado' : 'Sin conexión';
+}
+
+function updateKPIs(data) {
+  document.getElementById('kpi-devices').textContent = data.online_devices ?? '—';
+  document.getElementById('kpi-power').textContent = data.total_power_kw?.toFixed(2) ?? '—';
+  document.getElementById('kpi-energy').textContent = data.total_energy_kwh?.toFixed(3) ?? '—';
+}
+
+function updateDeviceList(devices) {
+  const el = document.getElementById('device-list');
+  document.getElementById('device-count').textContent = `${devices.length} dispositivo${devices.length!==1?'s':''}`;
+  if (!devices.length) { el.innerHTML = '<div class="no-data">Esperando medidores...</div>'; return; }
+
+  // Asignar colores
+  devices.forEach((d,i) => { if (!deviceColors[d.device_id]) deviceColors[d.device_id] = PALETTE[i % PALETTE.length]; });
+
+  el.innerHTML = devices.map(d => {
+    const color = deviceColors[d.device_id];
+    const isActive = selectedDevice === d.device_id;
+    const lastSeen = d.last_seen ? new Date(d.last_seen) : null;
+    const age = lastSeen ? (Date.now() - lastSeen.getTime()) / 1000 : 999;
+    const badge = age < 30 ? '<span class="badge badge-ok">EN LÍNEA</span>' : '<span class="badge badge-warn">INACTIVO</span>';
+    return `<div class="device-card${isActive?' active':''}" onclick="selectDevice('${d.device_id}')" style="border-left:3px solid ${color}">
+      <div class="device-header">
+        <span class="device-id">${d.device_id}</span>${badge}
+      </div>
+      <div class="device-metrics">
+        <div class="metric"><div class="metric-label">Potencia</div><div class="metric-val" style="color:${color}">${parseFloat(d.active_power_kw||0).toFixed(3)} kW</div></div>
+        <div class="metric"><div class="metric-label">Energía</div><div class="metric-val">${parseFloat(d.energy_kwh||0).toFixed(3)} kWh</div></div>
+        <div class="metric"><div class="metric-label">Lecturas</div><div class="metric-val">#${d.seq||0}</div></div>
+        <div class="metric"><div class="metric-label">Última</div><div class="metric-val" style="font-size:.75rem">${lastSeen?lastSeen.toLocaleTimeString('es'):'—'}</div></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function updateTable(meters) {
+  const tbody = document.getElementById('readings-body');
+  if (!meters.length) { tbody.innerHTML = '<tr><td colspan="8" class="no-data">Sin datos aún...</td></tr>'; return; }
+  const rows = meters.slice(0,20).map(m => {
+    const ts = m.timestamp ? new Date(m.timestamp).toLocaleString('es') : '—';
+    const color = deviceColors[m.device_id] || '#64748b';
+    return `<tr>
+      <td style="color:${color};font-weight:500">${m.device_id||'—'}</td>
+      <td style="color:var(--muted);font-size:.75rem">${ts}</td>
+      <td>${parseFloat(m.voltage_v||0).toFixed(1)}</td>
+      <td>${parseFloat(m.current_a||0).toFixed(2)}</td>
+      <td style="color:var(--green)">${parseFloat(m.active_power_kw||0).toFixed(3)}</td>
+      <td>${parseFloat(m.power_factor||0).toFixed(2)}</td>
+      <td style="color:var(--accent2)">${parseFloat(m.energy_kwh||0).toFixed(4)}</td>
+      <td style="color:var(--muted)">#${m.seq||0}</td>
+    </tr>`;
+  }).join('');
+  tbody.innerHTML = rows;
+}
+
+function selectDevice(deviceId) {
+  selectedDevice = deviceId;
+  document.querySelectorAll('.device-card').forEach(c => {
+    c.classList.toggle('active', c.querySelector('.device-id')?.textContent === deviceId);
+  });
+  loadHistory(deviceId);
+}
+
+// ---- Init ----
+initChart();
+fetchStats();
+fetchLatest();
+setInterval(fetchStats, 5000);
+setInterval(fetchLatest, 5000);
+setInterval(() => { if (selectedDevice) loadHistory(selectedDevice); }, 10000);
+</script>
+</body>
+</html>

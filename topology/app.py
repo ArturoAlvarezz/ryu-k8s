@@ -30,8 +30,21 @@ def get_topology():
         maestro_dpid = None
         role_to_dpid = {}
 
-        # Mapear roles lógicos a sus respectivos DPID dinámicos
+        # Mapear roles lógicos a sus respectivos DPID dinámicos y filtrar desconectados
+        valid_switches = set()
         for dpid in switches:
+            raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else dpid
+            # Validar Heartbeat L2 (si el switch lleva más de 30s sin reportarse, es un nodo fantasma)
+            if not r.exists(f"switch:alive:{raw_dpid}"):
+                # Limpieza sistemática del nodo fantasma
+                r.srem('topology:switches', dpid)
+                r.hdel('topology:node_names', raw_dpid)
+                r.hdel('topology:node_ips', raw_dpid)
+                r.delete(f"mac_to_port:{dpid}")
+                r.delete(f"switch_ports:{dpid}")
+                continue
+                
+            valid_switches.add(dpid)
             raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else dpid
             name = node_names.get(raw_dpid, "").lower()
             if "maestro" in name:
@@ -45,6 +58,8 @@ def get_topology():
                 role_to_dpid["w3"] = dpid
             elif "worker4" in name:
                 role_to_dpid["w4"] = dpid
+
+        switches = valid_switches
 
         # Construir nodos físicos de switches (K3s Nodes)
         for dpid in switches:

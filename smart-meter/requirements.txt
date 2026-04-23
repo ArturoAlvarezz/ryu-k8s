@@ -1,0 +1,2 @@
+# Sin dependencias externas — solo stdlib Python
+# socket, json, time, math, uuid, logging, os, sys

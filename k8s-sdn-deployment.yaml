@@ -264,14 +264,20 @@ spec:
               fi
             done
 
-            # Añadir Guests en ens6+ automaticamente
-            for intf in $(ls /sys/class/net | grep -E "^ens[6-9]$|^ens[1-9][0-9]$"); do
+            # Añadir Guests en cualquier interfaz ensX que NO pertenezca a br0 (topología física)
+            for intf in $(ls /sys/class/net | grep -E "^ens[4-9]$|^ens[1-9][0-9]$"); do
+              if ip link show $intf | grep -q "master br0"; then continue; fi
+              
               if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then
                 echo "Auto-detectado nuevo Guest en $intf. Añadiendo a la red SDN..."
                 ip link set $intf up > /dev/null 2>&1 || true
                 ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
               fi
             done
+            # Heartbeat (Latido L2): Avisar al Controlador global que este nodo físico sigue vivo. (TTL 30s)
+            if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
+              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true
+            fi
             sleep 10
           done
         volumeMounts:
@@ -388,3 +394,80 @@ spec:
       - name: code-volume
         configMap:
           name: dhcp-code
+
+---
+# ==========================
+# Colector de Telemetría IoT (Smart Meter Collector)
+# ==========================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meter-collector
+  namespace: sdn-controller
+  labels:
+    app: meter-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meter-collector
+  template:
+    metadata:
+      labels:
+        app: meter-collector
+    spec:
+      containers:
+      - name: collector
+        image: arturoalvarez/sdn-meter-collector:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+          name: http
+          protocol: TCP
+        - containerPort: 5555
+          name: udp-telemetry
+          protocol: UDP
+        env:
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        - name: UDP_PORT
+          value: "5555"
+        - name: FLASK_PORT
+          value: "5000"
+        - name: MAX_READINGS_PER_DEVICE
+          value: "100"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meter-collector
+  namespace: sdn-controller
+  labels:
+    app: meter-collector
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http-dashboard
+    port: 8081
+    targetPort: 5000
+    protocol: TCP
+  - name: udp-telemetry
+    port: 5555
+    targetPort: 5555
+    protocol: UDP
+  selector:
+    app: meter-collector
