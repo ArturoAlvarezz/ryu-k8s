@@ -760,11 +760,28 @@ metadata:
 data:
   sdn-observability.json: |
     {
+      "uid": "sdn-observability",
       "title": "SDN Observabilidad",
       "schemaVersion": 39,
       "version": 1,
       "refresh": "10s",
       "timezone": "browser",
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "grafana",
+              "uid": "-- Grafana --"
+            },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
       "panels": [
         {
           "type": "timeseries",
