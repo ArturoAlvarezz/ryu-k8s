@@ -868,13 +868,13 @@ data:
           "targets": [
             {
               "refId": "nodes",
-              "expr": "ryu_topology_node_info",
+              "expr": "max by (id, title, subtitle, mainstat, color, icon, type) (ryu_topology_node_info)",
               "format": "table",
               "instant": true
             },
             {
               "refId": "edges",
-              "expr": "ryu_topology_edge_info or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\"}",
+              "expr": "max by (id, source, target, mainstat, color, type) (ryu_topology_edge_info or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\"})",
               "format": "table",
               "instant": true
             }
