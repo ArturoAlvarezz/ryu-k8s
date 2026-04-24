@@ -348,6 +348,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         node_names = self.redis.hgetall("topology:node_names") or {}
         node_ips = self.redis.hgetall("topology:node_ips") or {}
         guest_ips = self.redis.hgetall("topology:guest_ips") or {}
+        rstp_ports = self.redis.hgetall("topology:rstp_ports") or {}
 
         nodes = []
         edges = []
@@ -378,14 +379,20 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if str(port_name).startswith("vx"):
                     target = ip_to_dpid.get(str(port_name)[2:])
                     if target and target in dpids:
+                        rstp_status = rstp_ports.get("%s:%s" % (raw_dpid, port_name), "")
+                        rstp_state, _, rstp_role = rstp_status.partition(":")
+                        is_blocked = rstp_state == "Discarding" and rstp_role != "Disabled"
                         edge_id = "vx:%s:%s:%s" % (dpid, target, port_no)
                         edges.append({
                             "id": edge_id,
                             "source": dpid,
                             "target": target,
-                            "mainstat": "VXLAN",
-                            "color": "#64748b",
-                            "type": "vxlan",
+                            "mainstat": "RSTP blocked" if is_blocked else "VXLAN",
+                            "secondarystat": rstp_status or "RSTP unknown",
+                            "color": "#ef4444" if is_blocked else "#64748b",
+                            "strokeDasharray": "8 5" if is_blocked else "",
+                            "thickness": "4" if is_blocked else "1",
+                            "type": "rstp_blocked" if is_blocked else "vxlan",
                         })
 
             for mac, port_no in mac_table.items():
@@ -415,7 +422,10 @@ class DistributedL2Switch(app_manager.RyuApp):
                     "source": dpid,
                     "target": mac,
                     "mainstat": "local",
+                    "secondarystat": "guest",
                     "color": "#ff00ee",
+                    "strokeDasharray": "3 3",
+                    "thickness": "1",
                     "type": "guest",
                 })
 
@@ -499,13 +509,16 @@ class DistributedL2Switch(app_manager.RyuApp):
         ])
         for edge in edges:
             labels = (
-                'id="%s",source="%s",target="%s",mainstat="%s",color="%s",type="%s"'
+                'id="%s",source="%s",target="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
                 % (
                     _escape_label(edge["id"]),
                     _escape_label(edge["source"]),
                     _escape_label(edge["target"]),
                     _escape_label(edge["mainstat"]),
+                    _escape_label(edge.get("secondarystat", "")),
                     _escape_label(edge["color"]),
+                    _escape_label(edge.get("strokeDasharray", "")),
+                    _escape_label(edge.get("thickness", "1")),
                     _escape_label(edge["type"]),
                 )
             )
@@ -522,7 +535,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     continue
                 for edge_id, source, target in self._trace_guest_path(src_guest, dst_guest, dpids, ip_to_dpid):
                     labels = (
-                        'src_guest="%s",dst_guest="%s",id="%s",source="%s",target="%s",mainstat="%s",color="%s",type="%s"'
+                        'src_guest="%s",dst_guest="%s",id="%s",source="%s",target="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
                         % (
                             _escape_label(src_guest),
                             _escape_label(dst_guest),
@@ -530,7 +543,10 @@ class DistributedL2Switch(app_manager.RyuApp):
                             _escape_label(source),
                             _escape_label(target),
                             "path",
+                            "",
                             "#facc15",
+                            "",
+                            "5",
                             "path",
                         )
                     )

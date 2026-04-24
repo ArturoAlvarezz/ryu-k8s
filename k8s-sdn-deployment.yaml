@@ -284,6 +284,18 @@ spec:
             if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
               redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
               redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP > /dev/null 2>&1 || true
+              OLD_RSTP_KEYS=$(redis-cli -h $MASTER_IP HKEYS topology:rstp_ports 2>/dev/null | grep "^${DPID}:" || true)
+              for rstp_key in $OLD_RSTP_KEYS; do
+                redis-cli -h $MASTER_IP HDEL topology:rstp_ports "$rstp_key" > /dev/null 2>&1 || true
+              done
+              for rstp_port in $(ovs-vsctl list-ports br-sdn | grep "^vx" || true); do
+                RSTP_STATUS=$(ovs-vsctl get port "$rstp_port" rstp_status 2>/dev/null || true)
+                RSTP_STATE=$(echo "$RSTP_STATUS" | sed -n 's/.*rstp_port_state=\([^,}]*\).*/\1/p' | tr -d '"')
+                RSTP_ROLE=$(echo "$RSTP_STATUS" | sed -n 's/.*rstp_port_role=\([^,}]*\).*/\1/p' | tr -d '"')
+                if [ -n "$RSTP_STATE" ]; then
+                  redis-cli -h $MASTER_IP HSET topology:rstp_ports "$DPID:$rstp_port" "$RSTP_STATE:$RSTP_ROLE" > /dev/null 2>&1 || true
+                fi
+              done
               redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true
             fi
             sleep 10
@@ -826,7 +838,7 @@ data:
             },
             {
               "refId": "edges",
-              "expr": "max by (id, source, target, mainstat, color, type) (ryu_topology_edge_info or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\"})",
+              "expr": "max by (id, source, target, mainstat, secondarystat, color, strokeDasharray, thickness, type) (ryu_topology_edge_info or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\"})",
               "format": "table",
               "instant": true
             }
