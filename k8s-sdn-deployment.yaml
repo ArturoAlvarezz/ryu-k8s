@@ -282,6 +282,8 @@ spec:
             done
             # Heartbeat (Latido L2): Avisar al Controlador global que este nodo físico sigue vivo. (TTL 30s)
             if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
+              redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
+              redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP > /dev/null 2>&1 || true
               redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true
             fi
             sleep 10

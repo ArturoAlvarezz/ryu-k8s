@@ -315,7 +315,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         try:
             switches = self.redis.smembers("topology:switches") or set()
             counts["active_switches"] = len(switches)
-            counts["active_nodes"] = len(self.redis.hgetall("topology:node_names") or {})
+            counts["active_nodes"] = len(self.redis.keys("switch:alive:*") or [])
             for dpid in switches:
                 counts["learned_macs"][dpid] = self.redis.hlen(f"mac_to_port:{dpid}")
         except Exception as e:
