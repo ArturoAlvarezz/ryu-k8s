@@ -739,6 +739,7 @@ data:
     datasources:
     - name: Prometheus
       type: prometheus
+      uid: prometheus
       access: proxy
       url: http://prometheus.sdn-controller.svc.cluster.local:9090
       isDefault: true
@@ -768,6 +769,32 @@ data:
       "version": 1,
       "refresh": "10s",
       "timezone": "browser",
+      "templating": {
+        "list": [
+          {
+            "name": "src_guest",
+            "label": "Guest origen",
+            "type": "query",
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "query": "label_values(ryu_topology_node_info{type=\"guest\"}, id)",
+            "refresh": 1,
+            "sort": 1,
+            "includeAll": false,
+            "multi": false
+          },
+          {
+            "name": "dst_guest",
+            "label": "Guest destino",
+            "type": "query",
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "query": "label_values(ryu_topology_node_info{type=\"guest\"}, id)",
+            "refresh": 1,
+            "sort": 1,
+            "includeAll": false,
+            "multi": false
+          }
+        ]
+      },
       "annotations": {
         "list": [
           {
@@ -832,6 +859,36 @@ data:
           "title": "Trafico SDN por puerto OpenFlow",
           "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
           "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
+        },
+        {
+          "type": "nodeGraph",
+          "title": "Mapa SDN y camino entre guests",
+          "gridPos": {"x": 0, "y": 24, "w": 24, "h": 16},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "refId": "nodes",
+              "expr": "ryu_topology_node_info",
+              "format": "table",
+              "instant": true
+            },
+            {
+              "refId": "edges",
+              "expr": "ryu_topology_edge_info or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\"}",
+              "format": "table",
+              "instant": true
+            }
+          ],
+          "options": {
+            "nodes": {
+              "mainStatUnit": "short",
+              "secondaryStatUnit": "short"
+            },
+            "edges": {
+              "mainStatUnit": "short",
+              "secondaryStatUnit": "short"
+            }
+          }
         }
       ]
     }

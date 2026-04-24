@@ -323,6 +323,219 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.logger.warning("Error reading Redis metrics: %s", e)
         return counts
 
+    def _raw_dpid_to_decimal(self, raw_dpid):
+        try:
+            return str(int(str(raw_dpid), 16))
+        except Exception:
+            return str(raw_dpid)
+
+    def _decimal_dpid_to_raw(self, dpid):
+        try:
+            return "0000" + hex(int(dpid))[2:].zfill(12)
+        except Exception:
+            return str(dpid)
+
+    def _get_alive_switch_dpids(self):
+        alive_keys = self.redis.keys("switch:alive:*") or []
+        dpids = set()
+        for key in alive_keys:
+            raw_dpid = str(key).split("switch:alive:", 1)[-1]
+            dpids.add(self._raw_dpid_to_decimal(raw_dpid))
+        return dpids
+
+    def _build_topology_snapshot(self):
+        dpids = self._get_alive_switch_dpids()
+        node_names = self.redis.hgetall("topology:node_names") or {}
+        node_ips = self.redis.hgetall("topology:node_ips") or {}
+        guest_ips = self.redis.hgetall("topology:guest_ips") or {}
+
+        nodes = []
+        edges = []
+        guests = {}
+
+        ip_to_dpid = {}
+        for raw_dpid, ip in node_ips.items():
+            ip_to_dpid[str(ip).replace(".", "")] = self._raw_dpid_to_decimal(raw_dpid)
+
+        for dpid in sorted(dpids):
+            raw_dpid = self._decimal_dpid_to_raw(dpid)
+            name = node_names.get(raw_dpid, "Nodo SDN")
+            ip = node_ips.get(raw_dpid, "")
+            nodes.append({
+                "id": dpid,
+                "title": name,
+                "subtitle": ip or raw_dpid,
+                "mainstat": "switch",
+                "color": "#00ffcc" if name == "master" else "#7dd3fc",
+                "icon": "server",
+                "type": "switch",
+            })
+
+            ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+            mac_table = self.redis.hgetall(f"mac_to_port:{dpid}") or {}
+
+            for port_no, port_name in ports.items():
+                if str(port_name).startswith("vx"):
+                    target = ip_to_dpid.get(str(port_name)[2:])
+                    if target and target in dpids:
+                        edge_id = "vx:%s:%s:%s" % (dpid, target, port_no)
+                        edges.append({
+                            "id": edge_id,
+                            "source": dpid,
+                            "target": target,
+                            "mainstat": "VXLAN",
+                            "color": "#64748b",
+                            "type": "vxlan",
+                        })
+
+            for mac, port_no in mac_table.items():
+                if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
+                    continue
+                if not self.redis.exists(f"health:{mac}"):
+                    continue
+
+                port_name = ports.get(str(port_no), "")
+                if not str(port_name).startswith("ens"):
+                    continue
+
+                ip = guest_ips.get(mac, "sin IP")
+                if mac not in guests:
+                    guests[mac] = {
+                        "id": mac,
+                        "title": mac,
+                        "subtitle": ip,
+                        "mainstat": "guest",
+                        "color": "#ff00ee",
+                        "icon": "desktop",
+                        "type": "guest",
+                        "switch": dpid,
+                    }
+                edges.append({
+                    "id": "guest:%s:%s" % (dpid, mac),
+                    "source": dpid,
+                    "target": mac,
+                    "mainstat": "local",
+                    "color": "#ff00ee",
+                    "type": "guest",
+                })
+
+        nodes.extend(guests.values())
+        return nodes, edges, guests, ip_to_dpid
+
+    def _trace_guest_path(self, src_guest, dst_guest, dpids, ip_to_dpid):
+        src_switch = None
+        dst_switch = None
+
+        for dpid in dpids:
+            mac_table = self.redis.hgetall(f"mac_to_port:{dpid}") or {}
+            ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+
+            src_port = mac_table.get(src_guest)
+            if src_port and not str(ports.get(str(src_port), "")).startswith("vx"):
+                src_switch = dpid
+
+            dst_port = mac_table.get(dst_guest)
+            if dst_port and not str(ports.get(str(dst_port), "")).startswith("vx"):
+                dst_switch = dpid
+
+        if not src_switch or not dst_switch:
+            return []
+
+        path_edges = [("guest:%s:%s" % (src_switch, src_guest), src_guest, src_switch)]
+        visited = set()
+        curr_switch = src_switch
+
+        while curr_switch != dst_switch:
+            if curr_switch in visited:
+                break
+            visited.add(curr_switch)
+
+            out_port = self.redis.hget(f"mac_to_port:{curr_switch}", dst_guest)
+            if not out_port:
+                break
+
+            port_name = self.redis.hget(f"switch_ports:{curr_switch}", out_port) or ""
+            if not str(port_name).startswith("vx"):
+                break
+
+            next_switch = ip_to_dpid.get(str(port_name)[2:])
+            if not next_switch:
+                break
+
+            path_edges.append(("path:%s:%s:%s" % (curr_switch, next_switch, out_port), curr_switch, next_switch))
+            curr_switch = next_switch
+
+        if curr_switch == dst_switch:
+            path_edges.append(("guest:%s:%s" % (dst_switch, dst_guest), dst_switch, dst_guest))
+            return path_edges
+        return []
+
+    def _append_topology_metrics(self, lines):
+        nodes, edges, guests, ip_to_dpid = self._build_topology_snapshot()
+        dpids = {node["id"] for node in nodes if node["type"] == "switch"}
+
+        lines.extend([
+            "# HELP ryu_topology_node_info SDN topology nodes for Grafana node graph.",
+            "# TYPE ryu_topology_node_info gauge",
+        ])
+        for node in nodes:
+            labels = (
+                'id="%s",title="%s",subtitle="%s",mainstat="%s",color="%s",icon="%s",type="%s"'
+                % (
+                    _escape_label(node["id"]),
+                    _escape_label(node["title"]),
+                    _escape_label(node["subtitle"]),
+                    _escape_label(node["mainstat"]),
+                    _escape_label(node["color"]),
+                    _escape_label(node["icon"]),
+                    _escape_label(node["type"]),
+                )
+            )
+            lines.append("ryu_topology_node_info{%s} 1" % labels)
+
+        lines.extend([
+            "# HELP ryu_topology_edge_info SDN topology edges for Grafana node graph.",
+            "# TYPE ryu_topology_edge_info gauge",
+        ])
+        for edge in edges:
+            labels = (
+                'id="%s",source="%s",target="%s",mainstat="%s",color="%s",type="%s"'
+                % (
+                    _escape_label(edge["id"]),
+                    _escape_label(edge["source"]),
+                    _escape_label(edge["target"]),
+                    _escape_label(edge["mainstat"]),
+                    _escape_label(edge["color"]),
+                    _escape_label(edge["type"]),
+                )
+            )
+            lines.append("ryu_topology_edge_info{%s} 1" % labels)
+
+        lines.extend([
+            "# HELP ryu_trace_path_edge_info Highlighted guest-to-guest path edges for Grafana node graph.",
+            "# TYPE ryu_trace_path_edge_info gauge",
+        ])
+        guest_ids = sorted(guests.keys())
+        for src_guest in guest_ids:
+            for dst_guest in guest_ids:
+                if src_guest == dst_guest:
+                    continue
+                for edge_id, source, target in self._trace_guest_path(src_guest, dst_guest, dpids, ip_to_dpid):
+                    labels = (
+                        'src_guest="%s",dst_guest="%s",id="%s",source="%s",target="%s",mainstat="%s",color="%s",type="%s"'
+                        % (
+                            _escape_label(src_guest),
+                            _escape_label(dst_guest),
+                            _escape_label(edge_id),
+                            _escape_label(source),
+                            _escape_label(target),
+                            "path",
+                            "#facc15",
+                            "path",
+                        )
+                    )
+                    lines.append("ryu_trace_path_edge_info{%s} 1" % labels)
+
     def _render_prometheus_metrics(self):
         redis_counts = self._redis_metric_counts()
         lines = [
@@ -382,6 +595,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             "# TYPE ryu_process_start_time_seconds gauge",
             "ryu_process_start_time_seconds %s" % self.metrics_started_at,
         ])
+        self._append_topology_metrics(lines)
         return ("\n".join(lines) + "\n").encode("utf-8")
 
     def _metrics_wsgi_app(self, env, start_response):
