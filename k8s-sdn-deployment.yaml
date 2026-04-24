@@ -151,13 +151,6 @@ spec:
           value: "26379"
         - name: METRICS_PORT
           value: "8000"
-        ports:
-        - containerPort: 6653
-          name: openflow
-          protocol: TCP
-        - containerPort: 8000
-          name: metrics
-          protocol: TCP
         volumeMounts:
         - name: code-volume
           mountPath: /app/app.py
