@@ -813,57 +813,9 @@ data:
       },
       "panels": [
         {
-          "type": "timeseries",
-          "title": "Packet-In por segundo",
-          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
-          "targets": [{"expr": "sum by (dpid) (rate(ryu_packet_in_total[1m]))", "legendFormat": "switch {{dpid}}"}]
-        },
-        {
-          "type": "stat",
-          "title": "Nodos activos",
-          "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
-          "targets": [{"expr": "max(ryu_active_nodes)", "legendFormat": "nodos"}]
-        },
-        {
-          "type": "stat",
-          "title": "Switches activos",
-          "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
-          "targets": [{"expr": "max(ryu_active_switches)", "legendFormat": "switches"}]
-        },
-        {
-          "type": "bargauge",
-          "title": "Flujos instalados por switch",
-          "gridPos": {"x": 12, "y": 4, "w": 12, "h": 4},
-          "targets": [{"expr": "max by (dpid) (ryu_installed_flows)", "legendFormat": "{{dpid}}"}]
-        },
-        {
-          "type": "timeseries",
-          "title": "Nodos con mas trafico",
-          "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
-          "targets": [{"expr": "topk(5, sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])))", "legendFormat": "{{node}}"}]
-        },
-        {
-          "type": "timeseries",
-          "title": "CPU por nodo",
-          "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
-          "targets": [{"expr": "100 - (avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "legendFormat": "{{node}}"}]
-        },
-        {
-          "type": "timeseries",
-          "title": "Memoria usada por nodo",
-          "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
-          "targets": [{"expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "{{node}}"}]
-        },
-        {
-          "type": "timeseries",
-          "title": "Trafico SDN por puerto OpenFlow",
-          "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
-          "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
-        },
-        {
           "type": "nodeGraph",
           "title": "Mapa SDN y camino entre guests",
-          "gridPos": {"x": 0, "y": 24, "w": 24, "h": 16},
+          "gridPos": {"x": 0, "y": 0, "w": 24, "h": 18},
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "targets": [
             {
@@ -880,6 +832,8 @@ data:
             }
           ],
           "options": {
+            "layout": "force",
+            "zoomMode": "greedy",
             "nodes": {
               "mainStatUnit": "short",
               "secondaryStatUnit": "short"
@@ -889,6 +843,54 @@ data:
               "secondaryStatUnit": "short"
             }
           }
+        },
+        {
+          "type": "timeseries",
+          "title": "Packet-In por segundo",
+          "gridPos": {"x": 0, "y": 18, "w": 12, "h": 8},
+          "targets": [{"expr": "sum by (dpid) (rate(ryu_packet_in_total[1m]))", "legendFormat": "switch {{dpid}}"}]
+        },
+        {
+          "type": "stat",
+          "title": "Nodos activos",
+          "gridPos": {"x": 12, "y": 18, "w": 6, "h": 4},
+          "targets": [{"expr": "max(ryu_active_nodes)", "legendFormat": "nodos"}]
+        },
+        {
+          "type": "stat",
+          "title": "Switches activos",
+          "gridPos": {"x": 18, "y": 18, "w": 6, "h": 4},
+          "targets": [{"expr": "max(ryu_active_switches)", "legendFormat": "switches"}]
+        },
+        {
+          "type": "bargauge",
+          "title": "Flujos instalados por switch",
+          "gridPos": {"x": 12, "y": 22, "w": 12, "h": 4},
+          "targets": [{"expr": "max by (dpid) (ryu_installed_flows)", "legendFormat": "{{dpid}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Nodos con mas trafico",
+          "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8},
+          "targets": [{"expr": "topk(5, sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])))", "legendFormat": "{{node}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU por nodo",
+          "gridPos": {"x": 12, "y": 26, "w": 12, "h": 8},
+          "targets": [{"expr": "100 - (avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "legendFormat": "{{node}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Memoria usada por nodo",
+          "gridPos": {"x": 0, "y": 34, "w": 12, "h": 8},
+          "targets": [{"expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "{{node}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Trafico SDN por puerto OpenFlow",
+          "gridPos": {"x": 12, "y": 34, "w": 12, "h": 8},
+          "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
         }
       ]
     }
