@@ -802,6 +802,8 @@ topk(5, sum by (node) (
 (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
 ```
 
+El dashboard `SDN Observabilidad` tambien incluye un panel `Mapa SDN y camino entre guests` basado en el panel nativo `Node graph` de Grafana. Usa las variables superiores `Guest origen` y `Guest destino` para seleccionar dos guests; los enlaces del camino calculado por Ryu aparecen como enlaces adicionales de tipo `path`.
+
 ### 14.8 Verificar camino Smart Meter → Collector
 
 Si el DHCP entrega IP pero no aparecen lecturas:

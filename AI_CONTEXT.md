@@ -89,6 +89,7 @@ El sistema rompe el paradigma del "Controlador Centralizado". Aquí, el "Cerebro
 - **node-exporter corre como DaemonSet:** hay un pod en cada nodo para CPU, memoria, filesystem y tráfico de interfaces del host.
 - **Prometheus corre con 2 réplicas:** scrapes duplicados e independientes con `emptyDir` y retención corta de 6h. Esto evita SPOF en el laboratorio sin requerir storage distribuido.
 - **Grafana corre con 2 réplicas:** dashboard y datasource provisionados por ConfigMap; si un pod cae, el Service balancea hacia el otro.
+- **Mapa nativo en Grafana:** Ryu exporta `ryu_topology_node_info`, `ryu_topology_edge_info` y `ryu_trace_path_edge_info` para alimentar un panel nativo `Node graph`. El dashboard usa variables `src_guest` y `dst_guest` para resaltar el camino entre dos guests sin usar iframe ni la UI anterior de topología.
 - **Servicios expuestos:**
   - Prometheus: `http://192.168.122.100:9090`
   - Grafana: `http://192.168.122.100:3000`
