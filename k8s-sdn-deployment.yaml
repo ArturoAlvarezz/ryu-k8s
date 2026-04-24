@@ -832,15 +832,6 @@ data:
           "title": "Trafico SDN por puerto OpenFlow",
           "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
           "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
-        },
-        {
-          "type": "text",
-          "title": "Mapa de red y trazado entre guests",
-          "gridPos": {"x": 0, "y": 24, "w": 24, "h": 18},
-          "options": {
-            "mode": "html",
-            "content": "<iframe src=\"http://192.168.122.100:8080\" style=\"width:100%;height:100%;min-height:720px;border:0;background:#040404;\"></iframe>"
-          }
         }
       ]
     }
@@ -888,8 +879,6 @@ spec:
           value: "true"
         - name: GF_AUTH_ANONYMOUS_ORG_ROLE
           value: Viewer
-        - name: GF_PANELS_DISABLE_SANITIZE_HTML
-          value: "true"
         volumeMounts:
         - name: provisioning
           mountPath: /etc/grafana/provisioning/datasources/datasource.yml
