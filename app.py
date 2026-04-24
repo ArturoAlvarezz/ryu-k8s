@@ -1,10 +1,12 @@
 import os
 import redis
 import eventlet
+from datetime import datetime
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
+from ryu.lib import hub
 from ryu.topology import event
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
@@ -15,6 +17,13 @@ from ryu.topology import event, switches
 
 # Patch eventlet heavily used by Ryu to work properly with Redis and other sockets
 eventlet.monkey_patch()
+
+METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
+
+
+def _escape_label(value):
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
 
 class DistributedL2Switch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -30,6 +39,14 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.sentinel = Sentinel([(sentinel_host, sentinel_port)], socket_timeout=0.5)
         self.redis = self.sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
         self.logger.info("Connected to Redis Sentinel at %s:%d", sentinel_host, sentinel_port)
+        self.datapaths = {}
+        self.packet_in_total = {}
+        self.flow_mod_total = {}
+        self.installed_flows = {}
+        self.port_stats = {}
+        self.metrics_started_at = datetime.utcnow().timestamp()
+        self.monitor_thread = hub.spawn(self._monitor_datapaths)
+        self.metrics_thread = hub.spawn(self._start_metrics_server)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -40,6 +57,8 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         # Externalize State: Register switch in the global Redis topology set
         self.redis.sadd('topology:switches', dpid)
+        self.datapaths[dpid] = datapath
+        self.installed_flows.setdefault(dpid, 0)
         self.logger.info("Switch connected and registered in Redis: dpid=%s", dpid)
 
         # Install table-miss flow entry
@@ -60,6 +79,12 @@ class DistributedL2Switch(app_manager.RyuApp):
             if datapath.id is None:
                 return
             dpid = datapath.id
+            self.datapaths.pop(dpid, None)
+            self.installed_flows.pop(dpid, None)
+            self.port_stats = {
+                key: value for key, value in self.port_stats.items()
+                if key[0] != dpid
+            }
             self.logger.info("Switch disconnected, removing from Redis: dpid=%s", dpid)
             
             # Borrar de la lista global de switches
@@ -118,6 +143,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
                                     match=match, instructions=inst)
         datapath.send_msg(mod)
+        dpid = datapath.id
+        self.flow_mod_total[dpid] = self.flow_mod_total.get(dpid, 0) + 1
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def link_add_handler(self, ev):
@@ -173,6 +200,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
+        self.packet_in_total[dpid] = self.packet_in_total.get(dpid, 0) + 1
 
         self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
 
@@ -242,3 +270,131 @@ class DistributedL2Switch(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
+
+    def _monitor_datapaths(self):
+        while True:
+            for datapath in list(self.datapaths.values()):
+                try:
+                    parser = datapath.ofproto_parser
+                    datapath.send_msg(parser.OFPFlowStatsRequest(datapath))
+                    datapath.send_msg(parser.OFPPortStatsRequest(datapath, 0, datapath.ofproto.OFPP_ANY))
+                except Exception as e:
+                    self.logger.warning("Error requesting OpenFlow stats: %s", e)
+            hub.sleep(10)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        # Exclude table-miss when reporting installed forwarding flows.
+        self.installed_flows[dpid] = sum(1 for stat in ev.msg.body if stat.priority > 0)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        for stat in ev.msg.body:
+            if stat.port_no > 0xffffff00:
+                continue
+            port_name = ports.get(str(stat.port_no), str(stat.port_no))
+            self.port_stats[(dpid, stat.port_no)] = {
+                "port_name": port_name,
+                "rx_packets": stat.rx_packets,
+                "tx_packets": stat.tx_packets,
+                "rx_bytes": stat.rx_bytes,
+                "tx_bytes": stat.tx_bytes,
+                "rx_errors": stat.rx_errors,
+                "tx_errors": stat.tx_errors,
+            }
+
+    def _redis_metric_counts(self):
+        counts = {
+            "active_switches": 0,
+            "active_nodes": 0,
+            "learned_macs": {},
+        }
+        try:
+            switches = self.redis.smembers("topology:switches") or set()
+            counts["active_switches"] = len(switches)
+            counts["active_nodes"] = len(self.redis.hgetall("topology:node_names") or {})
+            for dpid in switches:
+                counts["learned_macs"][dpid] = self.redis.hlen(f"mac_to_port:{dpid}")
+        except Exception as e:
+            self.logger.warning("Error reading Redis metrics: %s", e)
+        return counts
+
+    def _render_prometheus_metrics(self):
+        redis_counts = self._redis_metric_counts()
+        lines = [
+            "# HELP ryu_packet_in_total Total Packet-In messages processed by Ryu.",
+            "# TYPE ryu_packet_in_total counter",
+        ]
+        for dpid, value in sorted(self.packet_in_total.items()):
+            lines.append('ryu_packet_in_total{dpid="%s"} %s' % (_escape_label(dpid), value))
+
+        lines.extend([
+            "# HELP ryu_flow_mod_total Total FlowMod messages sent by Ryu.",
+            "# TYPE ryu_flow_mod_total counter",
+        ])
+        for dpid, value in sorted(self.flow_mod_total.items()):
+            lines.append('ryu_flow_mod_total{dpid="%s"} %s' % (_escape_label(dpid), value))
+
+        lines.extend([
+            "# HELP ryu_installed_flows Current installed forwarding flows per switch.",
+            "# TYPE ryu_installed_flows gauge",
+        ])
+        for dpid, value in sorted(self.installed_flows.items()):
+            lines.append('ryu_installed_flows{dpid="%s"} %s' % (_escape_label(dpid), value))
+
+        lines.extend([
+            "# HELP ryu_active_switches Switches currently registered in Redis topology.",
+            "# TYPE ryu_active_switches gauge",
+            "ryu_active_switches %s" % redis_counts["active_switches"],
+            "# HELP ryu_active_nodes Nodes currently registered in Redis topology.",
+            "# TYPE ryu_active_nodes gauge",
+            "ryu_active_nodes %s" % redis_counts["active_nodes"],
+            "# HELP ryu_learned_macs Current learned MAC addresses per switch.",
+            "# TYPE ryu_learned_macs gauge",
+        ])
+        for dpid, value in sorted(redis_counts["learned_macs"].items()):
+            lines.append('ryu_learned_macs{dpid="%s"} %s' % (_escape_label(dpid), value))
+
+        lines.extend([
+            "# HELP ryu_port_rx_bytes_total OpenFlow port received bytes.",
+            "# TYPE ryu_port_rx_bytes_total counter",
+        ])
+        for (dpid, port_no), stats in sorted(self.port_stats.items()):
+            labels = 'dpid="%s",port_no="%s",port_name="%s"' % (
+                _escape_label(dpid), _escape_label(port_no), _escape_label(stats["port_name"]))
+            lines.append("ryu_port_rx_bytes_total{%s} %s" % (labels, stats["rx_bytes"]))
+
+        lines.extend([
+            "# HELP ryu_port_tx_bytes_total OpenFlow port transmitted bytes.",
+            "# TYPE ryu_port_tx_bytes_total counter",
+        ])
+        for (dpid, port_no), stats in sorted(self.port_stats.items()):
+            labels = 'dpid="%s",port_no="%s",port_name="%s"' % (
+                _escape_label(dpid), _escape_label(port_no), _escape_label(stats["port_name"]))
+            lines.append("ryu_port_tx_bytes_total{%s} %s" % (labels, stats["tx_bytes"]))
+
+        lines.extend([
+            "# HELP ryu_process_start_time_seconds Unix timestamp when this Ryu process started.",
+            "# TYPE ryu_process_start_time_seconds gauge",
+            "ryu_process_start_time_seconds %s" % self.metrics_started_at,
+        ])
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    def _metrics_wsgi_app(self, env, start_response):
+        if env.get("PATH_INFO") != "/metrics":
+            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+            return [b"not found\n"]
+        body = self._render_prometheus_metrics()
+        start_response("200 OK", [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")])
+        return [body]
+
+    def _start_metrics_server(self):
+        try:
+            listener = eventlet.listen(("0.0.0.0", METRICS_PORT))
+            self.logger.info("Prometheus metrics endpoint listening on 0.0.0.0:%d/metrics", METRICS_PORT)
+            eventlet.wsgi.server(listener, self._metrics_wsgi_app, log_output=False)
+        except Exception as e:
+            self.logger.error("Unable to start metrics endpoint: %s", e)

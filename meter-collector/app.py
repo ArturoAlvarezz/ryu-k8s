@@ -16,6 +16,8 @@ Variables de entorno:
   MAX_READINGS_PER_DEVICE  Historial máximo por medidor en Redis (default: 100)
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json

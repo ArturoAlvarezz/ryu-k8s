@@ -8,10 +8,12 @@ y validar el ruteo de la topología.
 
 Variables de entorno:
   DEVICE_ID        Identificador único del medidor (default: hostname)
-  COLLECTOR_IP     IP del colector (default: broadcast 255.255.255.255)
+  COLLECTOR_IP     IP del colector (default: 10.0.0.1)
   COLLECTOR_PORT   Puerto UDP destino (default: 5555)
   REPORT_INTERVAL  Segundos entre reportes (default: 5)
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -35,7 +37,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DEVICE_ID       = os.environ.get("DEVICE_ID") or socket.gethostname()
-COLLECTOR_IP    = os.environ.get("COLLECTOR_IP", "255.255.255.255")
+COLLECTOR_IP    = os.environ.get("COLLECTOR_IP", "10.0.0.1")
 COLLECTOR_PORT  = int(os.environ.get("COLLECTOR_PORT", 5555))
 REPORT_INTERVAL = float(os.environ.get("REPORT_INTERVAL", 5))
 
@@ -100,21 +102,20 @@ class SmartMeter:
 # ---------------------------------------------------------------------------
 def get_local_ip() -> str | None:
     """
-    Obtiene la IP real de la interfaz de red activa usando el truco del socket UDP.
-    Conectar a 8.8.8.8 en UDP no envía ningún paquete — solo fuerza al kernel
-    a seleccionar la interfaz de salida correcta (eth0), revelando su IP.
+    Obtiene la IP real de eth0 sin depender de ruta a Internet.
+    La SDN de guests es L2 aislada, por lo que usar un socket hacia 8.8.8.8
+    puede fallar aunque DHCP ya haya entregado una IP válida.
     """
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(1)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        if ip and not ip.startswith("127."):
-            return ip
+        import fcntl
+        import struct
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ifreq = struct.pack("256s", b"eth0")
+        res = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+        return socket.inet_ntoa(res[20:24])
     except Exception:
-        pass
-    return None
+        return None
 
 
 def wait_for_network(timeout: int = 60) -> str:
@@ -157,12 +158,16 @@ def main():
     log.info("  interval       : %.1fs", REPORT_INTERVAL)
     log.info("=" * 60)
 
-    # Esperar IP de la red SDN
-    try:
-        my_ip = wait_for_network(timeout=120)
-    except TimeoutError as e:
-        log.error(str(e))
-        sys.exit(1)
+    # Esperar IP de la red SDN. En GNS3 es normal que el puerto tarde en
+    # estabilizarse si se recrean enlaces; no salimos para evitar que el nodo
+    # se cierre antes de que DHCP esté disponible.
+    while True:
+        try:
+            my_ip = wait_for_network(timeout=120)
+            break
+        except TimeoutError as e:
+            log.error("%s Reintentando en 10s sin cerrar el medidor.", e)
+            time.sleep(10)
 
     is_broadcast = (COLLECTOR_IP == "255.255.255.255")
     sock = create_udp_socket(broadcast=is_broadcast)

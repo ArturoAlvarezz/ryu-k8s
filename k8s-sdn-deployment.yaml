@@ -94,14 +94,9 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /data
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      resources:
-        requests:
-          storage: 50Mi
+      volumes:
+      - name: data
+        emptyDir: {}
 ---
 # ==========================
 # Distributed Ryu Controller Components
@@ -138,6 +133,10 @@ spec:
     metadata:
       labels:
         app: ryu
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -150,6 +149,15 @@ spec:
           value: "redis-sentinel.sdn-controller.svc.cluster.local"
         - name: REDIS_SENTINEL_PORT
           value: "26379"
+        - name: METRICS_PORT
+          value: "8000"
+        ports:
+        - containerPort: 6653
+          name: openflow
+          protocol: TCP
+        - containerPort: 8000
+          name: metrics
+          protocol: TCP
         volumeMounts:
         - name: code-volume
           mountPath: /app/app.py
@@ -218,6 +226,11 @@ spec:
           ovs-vsctl --may-exist add-br br-sdn
           ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
           ip link set br-sdn up
+
+          if [ "$NODE_NAME" = "master" ]; then
+            echo "Asignando gateway/collector SDN 10.0.0.1/24 al br-sdn del Maestro..."
+            ip addr show br-sdn | grep -q "10.0.0.1/24" || ip addr add 10.0.0.1/24 dev br-sdn || true
+          fi
           
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
@@ -386,6 +399,10 @@ spec:
           value: "redis-sentinel.sdn-controller.svc.cluster.local"
         - name: REDIS_SENTINEL_PORT
           value: "26379"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         volumeMounts:
         - name: code-volume
           mountPath: /app/app.py
@@ -416,6 +433,10 @@ spec:
       labels:
         app: meter-collector
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: master
       containers:
       - name: collector
         image: arturoalvarez/sdn-meter-collector:latest
@@ -438,6 +459,10 @@ spec:
           value: "5000"
         - name: MAX_READINGS_PER_DEVICE
           value: "100"
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
         livenessProbe:
           httpGet:
             path: /api/health
@@ -450,6 +475,10 @@ spec:
             port: 5000
           initialDelaySeconds: 5
           periodSeconds: 10
+      volumes:
+      - name: code-volume
+        configMap:
+          name: meter-collector-code
 ---
 apiVersion: v1
 kind: Service
@@ -465,9 +494,420 @@ spec:
     port: 8081
     targetPort: 5000
     protocol: TCP
-  - name: udp-telemetry
-    port: 5555
-    targetPort: 5555
-    protocol: UDP
   selector:
     app: meter-collector
+
+---
+# ==========================
+# Observabilidad: Prometheus + Grafana + Node Exporter
+# ==========================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: sdn-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sdn-prometheus
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sdn-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sdn-prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: sdn-controller
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: sdn-controller
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 10s
+      evaluation_interval: 10s
+
+    scrape_configs:
+    - job_name: prometheus
+      static_configs:
+      - targets:
+        - localhost:9090
+
+    - job_name: ryu
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - sdn-controller
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+);(\d+)
+        replacement: ${1}:${2}
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+    - job_name: node-exporter
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - sdn-controller
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_label_app]
+        action: keep
+        regex: node-exporter
+      - source_labels: [__meta_kubernetes_endpoint_node_name]
+        target_label: node
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: sdn-controller
+  labels:
+    app: prometheus
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: prometheus
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.53.3
+        args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --storage.tsdb.retention.time=6h
+        - --web.enable-lifecycle
+        ports:
+        - containerPort: 9090
+          name: http
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: data
+          mountPath: /prometheus
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 20
+          periodSeconds: 30
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: sdn-controller
+  labels:
+    app: prometheus
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 9090
+    targetPort: 9090
+  selector:
+    app: prometheus
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: sdn-controller
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.8.2
+        args:
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        - --path.rootfs=/host/root
+        - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+        ports:
+        - containerPort: 9100
+          name: metrics
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host/root
+          readOnly: true
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: sdn-controller
+  labels:
+    app: node-exporter
+spec:
+  clusterIP: None
+  ports:
+  - name: metrics
+    port: 9100
+    targetPort: 9100
+  selector:
+    app: node-exporter
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: sdn-controller
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus.sdn-controller.svc.cluster.local:9090
+      isDefault: true
+  dashboards.yml: |
+    apiVersion: 1
+    providers:
+    - name: SDN
+      orgId: 1
+      folder: SDN
+      type: file
+      disableDeletion: false
+      editable: true
+      options:
+        path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: sdn-controller
+data:
+  sdn-observability.json: |
+    {
+      "title": "SDN Observabilidad",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "timezone": "browser",
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Packet-In por segundo",
+          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+          "targets": [{"expr": "sum by (dpid) (rate(ryu_packet_in_total[1m]))", "legendFormat": "switch {{dpid}}"}]
+        },
+        {
+          "type": "stat",
+          "title": "Nodos activos",
+          "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+          "targets": [{"expr": "max(ryu_active_nodes)", "legendFormat": "nodos"}]
+        },
+        {
+          "type": "stat",
+          "title": "Switches activos",
+          "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+          "targets": [{"expr": "max(ryu_active_switches)", "legendFormat": "switches"}]
+        },
+        {
+          "type": "bargauge",
+          "title": "Flujos instalados por switch",
+          "gridPos": {"x": 12, "y": 4, "w": 12, "h": 4},
+          "targets": [{"expr": "max by (dpid) (ryu_installed_flows)", "legendFormat": "{{dpid}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Nodos con mas trafico",
+          "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+          "targets": [{"expr": "topk(5, sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])))", "legendFormat": "{{node}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU por nodo",
+          "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+          "targets": [{"expr": "100 - (avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "legendFormat": "{{node}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Memoria usada por nodo",
+          "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+          "targets": [{"expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "{{node}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Trafico SDN por puerto OpenFlow",
+          "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+          "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: sdn-controller
+  labels:
+    app: grafana
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: grafana
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: grafana
+        image: grafana/grafana:11.1.4
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: admin
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: admin
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
+        - name: GF_AUTH_ANONYMOUS_ENABLED
+          value: "true"
+        - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+          value: Viewer
+        volumeMounts:
+        - name: provisioning
+          mountPath: /etc/grafana/provisioning/datasources/datasource.yml
+          subPath: datasource.yml
+        - name: provisioning
+          mountPath: /etc/grafana/provisioning/dashboards/dashboards.yml
+          subPath: dashboards.yml
+        - name: dashboards
+          mountPath: /var/lib/grafana/dashboards
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: provisioning
+        configMap:
+          name: grafana-provisioning
+      - name: dashboards
+        configMap:
+          name: grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: sdn-controller
+  labels:
+    app: grafana
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+  selector:
+    app: grafana

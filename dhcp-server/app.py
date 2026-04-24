@@ -7,6 +7,11 @@ from scapy.all import *
 SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
 SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
 IFACE = "br-sdn"
+NODE_NAME = os.environ.get("NODE_NAME", "")
+HEALTHCHECK_SOURCE_IP = os.environ.get(
+    "HEALTHCHECK_SOURCE_IP",
+    "10.0.0.1" if NODE_NAME == "master" else "0.0.0.0"
+)
 
 print("Inicializando entorno de red...")
 from redis.sentinel import Sentinel
@@ -124,14 +129,22 @@ def handle_dhcp(pkt):
 
 def healthcheck_loop():
     print("Iniciando Radar de Healthcheck Activo L2 en hilo paralelo...")
+    print(f"Healthcheck ARP usando psrc={HEALTHCHECK_SOURCE_IP} en nodo={NODE_NAME or 'desconocido'}")
     while True:
         try:
             guest_ips = r.hgetall('topology:guest_ips')
             for guest_mac, ip in guest_ips.items():
                 if not ip.startswith("10."): 
                     continue
-                # Enviar ARP Request dirigido a la MAC y simulando ser el Gateway 10.0.0.1
-                ans, unans = srp(Ether(dst=guest_mac)/ARP(op=1, pdst=ip, psrc="10.0.0.1"), iface=IFACE, timeout=1, verbose=False)
+                # Solo el Maestro puede anunciar 10.0.0.1. Los workers usan
+                # 0.0.0.0 para evitar envenenar la caché ARP de los guests y
+                # desviar telemetría destinada al collector del Maestro.
+                ans, unans = srp(
+                    Ether(dst=guest_mac) / ARP(op=1, pdst=ip, psrc=HEALTHCHECK_SOURCE_IP),
+                    iface=IFACE,
+                    timeout=1,
+                    verbose=False
+                )
                 if ans:
                     # Si respondió el ARP, inyectar el pulso de vida (TTL 30s)
                     r.set(f"health:{guest_mac}", "1", ex=30)

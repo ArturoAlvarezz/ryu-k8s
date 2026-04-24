@@ -44,15 +44,15 @@ El sistema rompe el paradigma del "Controlador Centralizado". Aquí, el "Cerebro
 ### 4.1. DHCP Server Distribuido (`dhcp-server/app.py`)
 - Un DaemonSet que usa `scapy` para hacer *sniffing* en la interfaz `br-sdn` de cada host.
 - **Peculiaridad de OpenFlow (¡Importante!):** Para que `scapy` pueda leer los Broadcasts (DHCPDISCOVER), Ryu debe inyectar una regla de OpenFlow explícita que envíe el tráfico `FLOOD` + `LOCAL` (`OFPP_LOCAL`). De lo contrario, los paquetes viajan por cables físicos pero no entran al Stack TCP/IP de Linux local.
-- Asigna IPs en el rango `10.100.X.Y` mediante un contador atómico en Redis (`dhcp:next_ip`).
-- Realiza **Healthchecks L2** enviando paquetes ARP para validar que los Guests sigan vivos y elimina IPs obsoletas.
+- Asigna IPs en el rango `10.0.0.X` mediante un contador atómico en Redis (`dhcp:next_ip`).
+- Realiza **Healthchecks L2** enviando paquetes ARP para validar que los Guests sigan vivos y elimina IPs obsoletas. Anti-ARP-poisoning: solo el pod DHCP del Maestro puede usar `psrc=10.0.0.1`; los Workers usan `psrc=0.0.0.0` para no desviar la telemetría destinada al collector del Maestro.
 
 ### 4.2. Smart Meter IoT (`smart-meter/app.py`) — **IMAGEN GUEST GNS3**
 - Contenedor Alpine ligero (~80MB) que simula un Medidor Eléctrico Inteligente.
 - Al arrancar, `entrypoint.sh` ejecuta `udhcpc -i eth0` para obtener IP via DHCP de la SDN.
 - Genera telemetría sintética (voltaje, corriente, potencia activa/reactiva, energía acumulada) con ruido senoidal realista.
 - Publica paquetes JSON via **UDP** cada N segundos (configurable con `REPORT_INTERVAL`, default 5s).
-- Destino configurable: `COLLECTOR_IP` (default `255.255.255.255` broadcast) + `COLLECTOR_PORT` (default 5555).
+- Destino configurable: `COLLECTOR_IP` (default `10.0.0.1`, gateway/colector SDN en `br-sdn` del Maestro) + `COLLECTOR_PORT` (default 5555).
 - **Appliance GNS3:** `smart-meter/smart-meter.gns3a` — importable directamente con DHCP activado.
 - **Imagen Docker:** `arturoalvarez/sdn-smart-meter:latest`.
 
@@ -77,6 +77,22 @@ El sistema rompe el paradigma del "Controlador Centralizado". Aquí, el "Cerebro
 - Aplicación Flask montada en K3s, con Frontend en `Vis.js`.
 - Renderiza el grafo de la red leyendo de Redis.
 - **Filtro de Fantasmas:** Valida que el DPID (formateado en Hexadecimal) posea un `switch:alive:{raw_dpid}` en Redis. Si no, purga el switch asumiendo que el nodo fue destruido abruptamente.
+
+### 4.5. Observabilidad (`Prometheus`, `Grafana`, `node-exporter`)
+- **Ryu expone `/metrics` en `:8000`:** no depende de librerías externas; sirve formato Prometheus desde el propio proceso del controlador.
+- **Métricas SDN principales:**
+  - `ryu_packet_in_total{dpid}`: contador de eventos Packet-In por switch. Grafana usa `rate(...[1m])` para mostrar Packet-In por segundo.
+  - `ryu_active_nodes`: cantidad de nodos registrados en Redis (`topology:node_names`).
+  - `ryu_active_switches`: cantidad de switches registrados en Redis (`topology:switches`).
+  - `ryu_installed_flows{dpid}`: flujos OpenFlow instalados por switch, medidos con `OFPFlowStatsRequest`.
+  - `ryu_port_rx_bytes_total` / `ryu_port_tx_bytes_total`: tráfico SDN por puerto OpenFlow.
+- **node-exporter corre como DaemonSet:** hay un pod en cada nodo para CPU, memoria, filesystem y tráfico de interfaces del host.
+- **Prometheus corre con 2 réplicas:** scrapes duplicados e independientes con `emptyDir` y retención corta de 6h. Esto evita SPOF en el laboratorio sin requerir storage distribuido.
+- **Grafana corre con 2 réplicas:** dashboard y datasource provisionados por ConfigMap; si un pod cae, el Service balancea hacia el otro.
+- **Servicios expuestos:**
+  - Prometheus: `http://192.168.122.100:9090`
+  - Grafana: `http://192.168.122.100:3000`
+  - Dashboard preprovisionado: carpeta `SDN`, panel `SDN Observabilidad`.
 
 ## 5. Flujo de Trabajo y Operaciones (Comandos Útiles)
 
@@ -137,5 +153,5 @@ El siguiente listado de tareas representa las funcionalidades clave que restan p
 - [ ] **Integrar capa de seguridad en la SDN (Microsegmentación/Firewalling):**
   - *Contexto:* Aprovechar el paradigma SDN para inyectar reglas de seguridad en los switches OVS vía el Controlador Ryu. Esto puede incluir protección contra MAC Spoofing, prevención de ARP Poisoning, o la creación de listas de control de acceso (ACLs) que aíslen el tráfico de ciertos Guests (medidores) de nodos no autorizados.
 
-- [ ] **Integración de Prometheus y Grafana (Observabilidad):**
-  - *Contexto:* Desplegar el stack de monitoreo nativo en Kubernetes. Se debe modificar el código de Ryu y de los microservicios actuales para exponer endpoints `/metrics`. El objetivo es tener dashboards en Grafana que muestren la salud de la red L2: tasas de `Packet-In` por segundo, cantidad de nodos activos, flujos instalados por switch, y consumo de recursos.
+- [x] **Integración de Prometheus y Grafana (Observabilidad):**
+  - *Completado:* `app.py` expone `/metrics` en puerto 8000 con métricas de Packet-In, nodos activos, switches activos, flujos instalados por switch y tráfico por puerto OpenFlow. `k8s-sdn-deployment.yaml` despliega Prometheus con 2 réplicas, Grafana con 2 réplicas y `node-exporter` como DaemonSet en todos los nodos. Grafana incluye un dashboard provisionado para tasas de Packet-In por segundo, nodos activos, flujos por switch, nodos con más tráfico, CPU y memoria por nodo.
