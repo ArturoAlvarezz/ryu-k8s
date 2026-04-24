@@ -145,8 +145,8 @@ El siguiente listado de tareas representa las funcionalidades clave que restan p
 - [x] **Crear servicio para los Guests que simule un medidor IoT:**
   - *Completado:* `smart-meter/` — imagen Docker Alpine con DHCP (`udhcpc`) + publicador UDP de telemetría eléctrica sintética. Appliance GNS3 en `smart-meter/smart-meter.gns3a`. Colector K8s en `meter-collector/` con dashboard web en puerto 8081.
 
-- [ ] **Visualización del estado del Spanning Tree (RSTP) en el Dashboard:**
-  - *Contexto:* Actualmente OVS ejecuta RSTP (`rstp_enable=true`) para evitar bucles en la topología física/VXLAN. Se debe modificar la App Web de Topología (`topology/app.py` y Vis.js) y la captura de datos para identificar qué puertos/enlaces están "Bloqueados" (Discarding) y cuáles están "Activos" (Forwarding). Los enlaces bloqueados deben renderizarse de un color diferente (ej. rojo punteado) en la interfaz gráfica.
+- [x] **Visualización del estado del Spanning Tree (RSTP) en el Dashboard:**
+  - *Completado:* `ovs-sdn-initializer` lee `rstp_status` de OVS por puerto VXLAN y publica `topology:rstp_ports` en Redis. Ryu exporta esos estados en `ryu_topology_edge_info`; los enlaces con `Discarding:Alternate` aparecen en el panel nativo `Node graph` de Grafana como `RSTP blocked`, en rojo y punteado.
 
 - [ ] **Visualización animada del flujo correcto de los datos:**
   - *Contexto:* La topología actual es estática. Se requiere consumir estadísticas de puertos (OpenFlow PortStats) o capturar los flujos desde el Controlador Ryu para animar los enlaces en la interfaz web (Vis.js). Esto permitirá demostrar visualmente el camino exacto que toman los paquetes (por ejemplo, los del medidor simulado) al viajar desde el origen hasta el destino a través de los túneles VXLAN.
