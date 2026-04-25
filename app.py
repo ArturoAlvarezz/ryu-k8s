@@ -25,6 +25,10 @@ def _escape_label(value):
     return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
+def _edge_link_id(source, target):
+    return "%s--%s" % tuple(sorted([str(source), str(target)]))
+
+
 class DistributedL2Switch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS = {'switches': switches.Switches}
@@ -499,7 +503,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         if not src_switch or not dst_switch:
             return []
 
-        path_edges = [("guest:%s:%s" % (src_switch, src_guest), src_guest, src_switch)]
+        path_edges = [("path:%s" % _edge_link_id(src_guest, src_switch), src_guest, src_switch)]
         visited = set()
         curr_switch = src_switch
 
@@ -520,11 +524,11 @@ class DistributedL2Switch(app_manager.RyuApp):
             if not next_switch:
                 break
 
-            path_edges.append(("path:%s:%s:%s" % (curr_switch, next_switch, out_port), curr_switch, next_switch))
+            path_edges.append(("path:%s" % _edge_link_id(curr_switch, next_switch), curr_switch, next_switch))
             curr_switch = next_switch
 
         if curr_switch == dst_switch:
-            path_edges.append(("guest:%s:%s" % (dst_switch, dst_guest), dst_switch, dst_guest))
+            path_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
             return path_edges
         return []
 
@@ -557,11 +561,12 @@ class DistributedL2Switch(app_manager.RyuApp):
         ])
         for edge in edges:
             labels = (
-                'id="%s",source="%s",target="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
+                'id="%s",source="%s",target="%s",link="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
                 % (
                     _escape_label(edge["id"]),
                     _escape_label(edge["source"]),
                     _escape_label(edge["target"]),
+                    _escape_label(_edge_link_id(edge["source"], edge["target"])),
                     _escape_label(edge["mainstat"]),
                     _escape_label(edge.get("secondarystat", "")),
                     _escape_label(edge["color"]),
@@ -583,13 +588,14 @@ class DistributedL2Switch(app_manager.RyuApp):
                     continue
                 for edge_id, source, target in self._trace_guest_path(src_guest, dst_guest, dpids, ip_to_dpid):
                     labels = (
-                        'src_guest="%s",dst_guest="%s",id="%s",source="%s",target="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
+                        'src_guest="%s",dst_guest="%s",id="%s",source="%s",target="%s",link="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
                         % (
                             _escape_label(src_guest),
                             _escape_label(dst_guest),
                             _escape_label(edge_id),
                             _escape_label(source),
                             _escape_label(target),
+                            _escape_label(_edge_link_id(source, target)),
                             "path",
                             "",
                             "#facc15",
