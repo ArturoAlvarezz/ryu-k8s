@@ -2,7 +2,7 @@ import os
 import time
 import redis
 import threading
-import glob
+import glob as glob_module
 from scapy.all import *
 
 SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
@@ -84,7 +84,7 @@ def get_local_guest_iface(mac):
 
 def get_guest_interfaces():
     interfaces = []
-    for path in glob.glob("/sys/class/net/ens*"):
+    for path in glob_module.glob("/sys/class/net/ens*"):
         iface = os.path.basename(path)
         master_path = os.path.join(path, "master")
         if not os.path.exists(master_path):
