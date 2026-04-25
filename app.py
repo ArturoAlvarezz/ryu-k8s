@@ -436,7 +436,7 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         for edge in vxlan_edges.values():
             if edge["details"]:
-                edge["secondarystat"] = " | ".join(edge["details"])
+                edge["secondarystat"] = " | ".join(sorted(edge["details"]))
             edge.pop("details", None)
             edges.append(edge)
 
@@ -476,7 +476,7 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         for edge in br0_edges.values():
             if edge["details"]:
-                edge["secondarystat"] = " | ".join(edge["details"])
+                edge["secondarystat"] = " | ".join(sorted(edge["details"]))
             edge.pop("details", None)
             edges.append(edge)
 
