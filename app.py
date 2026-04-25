@@ -479,7 +479,12 @@ class DistributedL2Switch(app_manager.RyuApp):
             if edge["details"]:
                 edge["secondarystat"] = " | ".join(sorted(edge["details"]))
             edge.pop("details", None)
-            edges.append(edge)
+            link = _edge_link_id(edge["source"], edge["target"])
+            if edge["type"] == "br0_stp_blocked":
+                edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
+                edges.append(edge)
+            elif not any(_edge_link_id(existing["source"], existing["target"]) == link for existing in edges):
+                edges.append(edge)
 
         nodes.extend(guests.values())
         return nodes, edges, guests, ip_to_dpid

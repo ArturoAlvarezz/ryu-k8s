@@ -842,7 +842,7 @@ data:
             },
             {
               "refId": "edges",
-              "expr": "max by (id, source, target, mainstat, secondarystat, color, strokeDasharray, thickness, type) ((ryu_topology_edge_info{link!=\"\"} unless on (link) ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}) or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"})",
+              "expr": "max by (id, source, target, mainstat, secondarystat, color, strokeDasharray, thickness, type) (((((ryu_topology_edge_info{link!=\"\",type!=\"br0_stp\"} unless on (link) ryu_topology_edge_info{link!=\"\",type=\"br0_stp_blocked\"}) or ryu_topology_edge_info{link!=\"\",type=\"br0_stp_blocked\"}) unless on (link) ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}) or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}))",
               "format": "table",
               "instant": true
             }
