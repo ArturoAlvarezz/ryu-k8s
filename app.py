@@ -12,6 +12,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import arp
+from ryu.lib.packet import ipv4
 from ryu.lib.packet import ether_types
 
 from ryu.topology import event, switches
@@ -263,6 +264,10 @@ class DistributedL2Switch(app_manager.RyuApp):
             )
             datapath.send_msg(out)
             return
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        if ip_pkt and ip_pkt.dst == "10.0.0.1":
+            out_port = ofproto.OFPP_LOCAL
+            actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
         elif out_port_str:
             out_port = int(out_port_str)
             actions = [parser.OFPActionOutput(out_port)]
