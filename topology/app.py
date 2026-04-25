@@ -162,7 +162,7 @@ def get_topology():
                                 "title": f"Enlace VXLAN (P{port_no} ↔ Host: {ip})"
                             })
 
-        # Extraer Telemetría de Protección de Bucles (RSTP Analytics)
+        # Extraer telemetria de proteccion de bucles basada en Spanning Tree
         blocked_ports = r.hgetall('topology:blocked_ports')
         blocked_edges = []
         for key in blocked_ports.keys():

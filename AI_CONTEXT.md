@@ -12,7 +12,7 @@ Su objetivo es interceptar dinámicamente el tráfico de la red subyacente (fís
 - **Orquestación y Despliegue:** Kubernetes (K3s ligero).
 - **Almacenamiento de Estado (Base de Datos):** Redis + Redis Sentinel (Alta Disponibilidad).
 - **Microservicios Python:** Flask (Web UI de Topología), Scapy (Servidor DHCP Nativo).
-- **Protocolos Clave:** OpenFlow 1.3, VXLAN, LLDP, RSTP.
+- **Protocolos Clave:** OpenFlow 1.3, VXLAN, LLDP, STP físico en `br0`.
 
 ## 3. Arquitectura del Sistema
 El sistema rompe el paradigma del "Controlador Centralizado". Aquí, el "Cerebro" está dividido en múltiples réplicas que comparten memoria.
@@ -145,8 +145,8 @@ El siguiente listado de tareas representa las funcionalidades clave que restan p
 - [x] **Crear servicio para los Guests que simule un medidor IoT:**
   - *Completado:* `smart-meter/` — imagen Docker Alpine con DHCP (`udhcpc`) + publicador UDP de telemetría eléctrica sintética. Appliance GNS3 en `smart-meter/smart-meter.gns3a`. Colector K8s en `meter-collector/` con dashboard web en puerto 8081.
 
-- [x] **Visualización del estado del Spanning Tree (RSTP) en el Dashboard:**
-  - *Completado:* `ovs-sdn-initializer` lee `rstp_status` de OVS por puerto VXLAN y publica `topology:rstp_ports` en Redis. Ryu exporta esos estados en `ryu_topology_edge_info`; los enlaces con `Discarding:Alternate` aparecen en el panel nativo `Node graph` de Grafana como `RSTP blocked`, en rojo y punteado.
+- [x] **Visualización del estado del Spanning Tree físico en el Dashboard:**
+  - *Completado:* `ovs-sdn-initializer` lee el estado STP de los puertos físicos de `br0` desde Linux, cruza vecinos por LLDP y publica `topology:br0_stp_ports` en Redis. Ryu exporta esos estados en `ryu_topology_edge_info`; los enlaces en estado `blocking` aparecen en el panel nativo `Node graph` de Grafana como `br0 STP blocked`, en rojo y con mayor grosor.
 
 - [ ] **Visualización animada del flujo correcto de los datos:**
   - *Contexto:* La topología actual es estática. Se requiere consumir estadísticas de puertos (OpenFlow PortStats) o capturar los flujos desde el Controlador Ryu para animar los enlaces en la interfaz web (Vis.js). Esto permitirá demostrar visualmente el camino exacto que toman los paquetes (por ejemplo, los del medidor simulado) al viajar desde el origen hasta el destino a través de los túneles VXLAN.

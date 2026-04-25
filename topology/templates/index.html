@@ -363,7 +363,7 @@
                 }
             });
 
-            // Refrescar y colorear Enlaces basado en la realidad de Spanning Tree (RSTP Analytics)
+            // Refrescar y colorear enlaces basado en la realidad de Spanning Tree
             data.edges.forEach(e => {
                 let isBlocked = currentBlocked.find(b => 
                    (b.from === e.from && b.to === e.to) || (b.from === e.to && b.to === e.from)

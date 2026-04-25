@@ -240,9 +240,6 @@ spec:
             echo "Error: No se pudo obtener el Redis Master de Sentinel."
           fi
 
-          echo "Activando RSTP (Anti-Bucles)..."
-          ovs-vsctl set bridge br-sdn rstp_enable=true
-
           echo "Esperando 15 segundos para dar tiempo a convergencia topologica de lldpd..."
           sleep 15
 
@@ -284,10 +281,6 @@ spec:
             if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
               redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
               redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP > /dev/null 2>&1 || true
-              OLD_RSTP_KEYS=$(redis-cli -h $MASTER_IP HKEYS topology:rstp_ports 2>/dev/null | grep "^${DPID}:" || true)
-              for rstp_key in $OLD_RSTP_KEYS; do
-                redis-cli -h $MASTER_IP HDEL topology:rstp_ports "$rstp_key" > /dev/null 2>&1 || true
-              done
               OLD_BR0_STP_KEYS=$(redis-cli -h $MASTER_IP HKEYS topology:br0_stp_ports 2>/dev/null | grep "^${DPID}:" || true)
               for stp_key in $OLD_BR0_STP_KEYS; do
                 redis-cli -h $MASTER_IP HDEL topology:br0_stp_ports "$stp_key" > /dev/null 2>&1 || true
@@ -305,14 +298,6 @@ spec:
                 REMOTE_IP=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
                 if [ -n "$REMOTE_IP" ]; then
                   redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
-                fi
-              done
-              for rstp_port in $(ovs-vsctl list-ports br-sdn | grep "^vx" || true); do
-                RSTP_STATUS=$(ovs-vsctl get port "$rstp_port" rstp_status 2>/dev/null || true)
-                RSTP_STATE=$(echo "$RSTP_STATUS" | sed -n 's/.*rstp_port_state=\([^,}]*\).*/\1/p' | tr -d '"')
-                RSTP_ROLE=$(echo "$RSTP_STATUS" | sed -n 's/.*rstp_port_role=\([^,}]*\).*/\1/p' | tr -d '"')
-                if [ -n "$RSTP_STATE" ]; then
-                  redis-cli -h $MASTER_IP HSET topology:rstp_ports "$DPID:$rstp_port" "$RSTP_STATE:$RSTP_ROLE" > /dev/null 2>&1 || true
                 fi
               done
               redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true

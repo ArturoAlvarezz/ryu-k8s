@@ -348,7 +348,6 @@ class DistributedL2Switch(app_manager.RyuApp):
         node_names = self.redis.hgetall("topology:node_names") or {}
         node_ips = self.redis.hgetall("topology:node_ips") or {}
         guest_ips = self.redis.hgetall("topology:guest_ips") or {}
-        rstp_ports = self.redis.hgetall("topology:rstp_ports") or {}
         br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
 
         nodes = []
@@ -382,8 +381,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if str(port_name).startswith("vx"):
                     target = ip_to_dpid.get(str(port_name)[2:])
                     if target and target in dpids:
-                        rstp_status = rstp_ports.get("%s:%s" % (raw_dpid, port_name), "")
-                        rstp_state, _, rstp_role = rstp_status.partition(":")
                         source, dest = sorted([str(dpid), str(target)])
                         edge_id = "vx:%s:%s" % (source, dest)
                         edge = vxlan_edges.setdefault(edge_id, {
@@ -391,14 +388,14 @@ class DistributedL2Switch(app_manager.RyuApp):
                             "source": source,
                             "target": dest,
                             "mainstat": "VXLAN",
-                            "secondarystat": "RSTP forwarding",
+                            "secondarystat": "SDN tunnel",
                             "color": "#64748b",
                             "strokeDasharray": "",
                             "thickness": "1",
                             "type": "vxlan",
                             "details": [],
                         })
-                        edge["details"].append("%s:%s=%s" % (dpid, port_name, rstp_status or "unknown"))
+                        edge["details"].append("%s:%s=active" % (dpid, port_name))
 
             for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":

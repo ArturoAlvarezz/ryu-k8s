@@ -804,11 +804,11 @@ topk(5, sum by (node) (
 
 El dashboard `SDN Observabilidad` tambien incluye un panel `Mapa SDN y camino entre guests` basado en el panel nativo `Node graph` de Grafana. Usa las variables superiores `Guest origen` y `Guest destino` para seleccionar dos guests; los enlaces del camino calculado por Ryu aparecen como enlaces adicionales de tipo `path`.
 
-Los enlaces bloqueados por RSTP se destacan en el mismo mapa como `RSTP blocked`, en rojo y con linea punteada. Para verificar el estado desde Prometheus:
+Los enlaces bloqueados por STP físico en `br0` se destacan en el mismo mapa como `br0 STP blocked`, en rojo y con mayor grosor. Para verificar el estado desde Prometheus:
 
 ```promql
 count(max by (id, source, target, mainstat, secondarystat, color, strokeDasharray, thickness, type) (
-  ryu_topology_edge_info{type="rstp_blocked"}
+  ryu_topology_edge_info{type="br0_stp_blocked"}
 ))
 ```
 

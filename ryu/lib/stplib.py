@@ -524,7 +524,6 @@ class Bridge(object):
 
         elif bpdu.RstBPDUs in pkt:
             # Received Rst BPDU.
-            # TODO: RSTP
             pass
 
         else:
