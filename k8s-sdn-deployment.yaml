@@ -220,10 +220,8 @@ spec:
           ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
           ip link set br-sdn up
 
-          if [ "$NODE_NAME" = "master" ]; then
-            echo "Asignando gateway/collector SDN 10.0.0.1/24 al br-sdn del Maestro..."
-            ip addr show br-sdn | grep -q "10.0.0.1/24" || ip addr add 10.0.0.1/24 dev br-sdn || true
-          fi
+          echo "Asignando gateway/collector SDN local 10.0.0.1/24 al br-sdn..."
+          ip addr show br-sdn | grep -q "10.0.0.1/24" || ip addr add 10.0.0.1/24 dev br-sdn || true
           
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
@@ -428,14 +426,13 @@ spec:
 # Colector de Telemetría IoT (Smart Meter Collector)
 # ==========================
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: meter-collector
   namespace: sdn-controller
   labels:
     app: meter-collector
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: meter-collector
@@ -446,8 +443,6 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        kubernetes.io/hostname: master
       containers:
       - name: collector
         image: arturoalvarez/sdn-meter-collector:latest

@@ -11,6 +11,7 @@ from ryu.topology import event
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
+from ryu.lib.packet import arp
 from ryu.lib.packet import ether_types
 
 from ryu.topology import event, switches
@@ -235,7 +236,11 @@ class DistributedL2Switch(app_manager.RyuApp):
         ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
         in_port_name = str(ports.get(str(in_port), ""))
 
-        if out_port_str:
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
+            out_port = ofproto.OFPP_LOCAL
+            actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
+        elif out_port_str:
             out_port = int(out_port_str)
             actions = [parser.OFPActionOutput(out_port)]
         else:
@@ -418,14 +423,15 @@ class DistributedL2Switch(app_manager.RyuApp):
             for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
-                if not self.redis.exists(f"health:{mac}"):
-                    continue
 
                 port_name = ports.get(str(port_no), "")
                 if not str(port_name).startswith("ens"):
                     continue
 
                 ip = guest_ips.get(mac, "sin IP")
+                is_healthy = self.redis.exists(f"health:{mac}") or mac in guest_ips
+                if not is_healthy:
+                    continue
                 if mac not in guests:
                     guests[mac] = {
                         "id": mac,
