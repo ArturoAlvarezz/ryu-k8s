@@ -232,17 +232,31 @@ class DistributedL2Switch(app_manager.RyuApp):
         # Retrieve destination port from Redis
         out_port_str = self.redis.hget(mac_table_key, dst)
         
+        ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        in_port_name = str(ports.get(str(in_port), ""))
+
         if out_port_str:
             out_port = int(out_port_str)
             actions = [parser.OFPActionOutput(out_port)]
         else:
             out_port = ofproto.OFPP_FLOOD
-            # Inyectar una copia del tráfico Broadcast al stack Linux local (br-sdn)
-            # para que los DaemonSets hostNetwork como sdn-dhcp-server puedan leerlo.
-            actions = [
-                parser.OFPActionOutput(out_port),
-                parser.OFPActionOutput(ofproto.OFPP_LOCAL)
-            ]
+            actions = []
+            for port_no, port_name in ports.items():
+                try:
+                    port_no_int = int(port_no)
+                except Exception:
+                    continue
+                if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
+                    continue
+                port_name = str(port_name)
+                if in_port_name.startswith("vx") and port_name.startswith("vx"):
+                    continue
+                actions.append(parser.OFPActionOutput(port_no_int))
+
+            # Inyectar una copia del trafico broadcast al stack Linux local
+            # para que servicios hostNetwork como DHCP puedan leerlo.
+            if in_port != ofproto.OFPP_LOCAL:
+                actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
 
         # Install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:

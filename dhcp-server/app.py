@@ -2,6 +2,7 @@ import os
 import time
 import redis
 import threading
+import glob
 from scapy.all import *
 
 SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
@@ -81,6 +82,18 @@ def get_local_guest_iface(mac):
 
     return iface
 
+def get_guest_interfaces():
+    interfaces = []
+    for path in glob.glob("/sys/class/net/ens*"):
+        iface = os.path.basename(path)
+        master_path = os.path.join(path, "master")
+        if not os.path.exists(master_path):
+            continue
+        master = os.path.basename(os.path.realpath(master_path))
+        if master == "ovs-system":
+            interfaces.append(iface)
+    return sorted(interfaces)
+
 def handle_dhcp(pkt):
     if not (DHCP in pkt and BOOTP in pkt):
         return
@@ -101,6 +114,7 @@ def handle_dhcp(pkt):
 
     xid = pkt[BOOTP].xid
     mac_str = pkt[Ether].src
+    source_iface = getattr(pkt, "sniffed_on", IFACE)
     
     # -------------------------------------------------------------
     # GESTOR DE COLISIONES CAPA 2 (Distributed Redis Locks)
@@ -165,7 +179,7 @@ def handle_dhcp(pkt):
     unicast_response = Ether(src=server_mac, dst=mac_str) / ip / udp / bootp / dhcp
     sendp(unicast_response, iface=IFACE, verbose=False)
 
-    local_iface = get_local_guest_iface(mac_str)
+    local_iface = source_iface if source_iface.startswith("ens") else get_local_guest_iface(mac_str)
     if local_iface:
         local_mac = get_if_hwaddr(local_iface)
         direct_response = Ether(src=local_mac, dst=mac_str) / ip / udp / bootp / dhcp
@@ -219,10 +233,13 @@ if __name__ == "__main__":
             
     threading.Thread(target=healthcheck_loop, daemon=True).start()
 
-    print(f"Escuchando descubrimientos en interfaz maestra {IFACE}... ")
+    sniff_ifaces = get_guest_interfaces()
+    if not sniff_ifaces:
+        sniff_ifaces = [IFACE]
+    print(f"Escuchando descubrimientos DHCP en interfaces: {', '.join(sniff_ifaces)}")
     while True:
         try:
-            sniff(iface=IFACE, filter="udp and (port 67 or port 68)", prn=handle_dhcp, store=0)
+            sniff(iface=sniff_ifaces, filter="udp and (port 67 or port 68)", prn=handle_dhcp, store=0)
         except OSError as e:
             print(f"Error de Socket (La red saltó temporalmente): {e}. Reintentando...")
             time.sleep(3)
