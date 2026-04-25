@@ -98,7 +98,8 @@ def handle_dhcp(pkt):
     # Respuesta: DHCPOFFER (2) o DHCPACK (5)
     reply_type = 2 if msg_type == 1 else 5 
     
-    ether = Ether(src=get_if_hwaddr(IFACE), dst="ff:ff:ff:ff:ff:ff")
+    server_mac = get_if_hwaddr(IFACE)
+    ether = Ether(src=server_mac, dst="ff:ff:ff:ff:ff:ff")
     ip = IP(src=server_ip, dst="255.255.255.255")
     udp = UDP(sport=67, dport=68)
     
@@ -125,6 +126,14 @@ def handle_dhcp(pkt):
     
     response = ether / ip / udp / bootp / dhcp
     sendp(response, iface=IFACE, verbose=False)
+
+    # Algunos guests en GNS3 no procesan de forma consistente el OFFER/ACK
+    # cuando el retorno atraviesa OVS como broadcast. Enviar una copia L2
+    # unicast mantiene el paquete DHCP en broadcast IP, pero lo dirige al NIC
+    # exacto del cliente.
+    unicast_response = Ether(src=server_mac, dst=mac_str) / ip / udp / bootp / dhcp
+    sendp(unicast_response, iface=IFACE, verbose=False)
+
     print(f"[{mac_str}] Enviada respuesta tipo {reply_type} asignando IP {client_ip}")
 
 def healthcheck_loop():
