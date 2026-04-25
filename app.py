@@ -349,10 +349,12 @@ class DistributedL2Switch(app_manager.RyuApp):
         node_ips = self.redis.hgetall("topology:node_ips") or {}
         guest_ips = self.redis.hgetall("topology:guest_ips") or {}
         rstp_ports = self.redis.hgetall("topology:rstp_ports") or {}
+        br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
 
         nodes = []
         edges = []
         vxlan_edges = {}
+        br0_edges = {}
         guests = {}
 
         ip_to_dpid = {}
@@ -382,7 +384,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                     if target and target in dpids:
                         rstp_status = rstp_ports.get("%s:%s" % (raw_dpid, port_name), "")
                         rstp_state, _, rstp_role = rstp_status.partition(":")
-                        is_blocked = rstp_state == "Discarding" and rstp_role != "Disabled"
                         source, dest = sorted([str(dpid), str(target)])
                         edge_id = "vx:%s:%s" % (source, dest)
                         edge = vxlan_edges.setdefault(edge_id, {
@@ -398,14 +399,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                             "details": [],
                         })
                         edge["details"].append("%s:%s=%s" % (dpid, port_name, rstp_status or "unknown"))
-                        if is_blocked:
-                            edge.update({
-                                "mainstat": "RSTP blocked",
-                                "color": "#ef4444",
-                                "strokeDasharray": "",
-                                "thickness": "5",
-                                "type": "rstp_blocked",
-                            })
 
             for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
@@ -442,6 +435,46 @@ class DistributedL2Switch(app_manager.RyuApp):
                 })
 
         for edge in vxlan_edges.values():
+            if edge["details"]:
+                edge["secondarystat"] = " | ".join(edge["details"])
+            edge.pop("details", None)
+            edges.append(edge)
+
+        for key, status in br0_stp_ports.items():
+            if ":" not in key:
+                continue
+            raw_dpid, intf = key.split(":", 1)
+            local_dpid = self._raw_dpid_to_decimal(raw_dpid)
+            state, _, remote_ip = str(status).partition(":")
+            remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
+            if not remote_dpid or local_dpid not in dpids or remote_dpid not in dpids:
+                continue
+
+            source, dest = sorted([str(local_dpid), str(remote_dpid)])
+            edge_id = "br0:%s:%s" % (source, dest)
+            edge = br0_edges.setdefault(edge_id, {
+                "id": edge_id,
+                "source": source,
+                "target": dest,
+                "mainstat": "br0 STP",
+                "secondarystat": "physical forwarding",
+                "color": "#94a3b8",
+                "strokeDasharray": "",
+                "thickness": "1",
+                "type": "br0_stp",
+                "details": [],
+            })
+            edge["details"].append("%s:%s=%s" % (local_dpid, intf, state))
+            if state == "blocking":
+                edge.update({
+                    "mainstat": "br0 STP blocked",
+                    "color": "#ef4444",
+                    "strokeDasharray": "",
+                    "thickness": "6",
+                    "type": "br0_stp_blocked",
+                })
+
+        for edge in br0_edges.values():
             if edge["details"]:
                 edge["secondarystat"] = " | ".join(edge["details"])
             edge.pop("details", None)

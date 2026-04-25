@@ -288,6 +288,25 @@ spec:
               for rstp_key in $OLD_RSTP_KEYS; do
                 redis-cli -h $MASTER_IP HDEL topology:rstp_ports "$rstp_key" > /dev/null 2>&1 || true
               done
+              OLD_BR0_STP_KEYS=$(redis-cli -h $MASTER_IP HKEYS topology:br0_stp_ports 2>/dev/null | grep "^${DPID}:" || true)
+              for stp_key in $OLD_BR0_STP_KEYS; do
+                redis-cli -h $MASTER_IP HDEL topology:br0_stp_ports "$stp_key" > /dev/null 2>&1 || true
+              done
+              for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
+                STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null || echo "")
+                case "$STATE_NUM" in
+                  0) STP_STATE="disabled" ;;
+                  1) STP_STATE="listening" ;;
+                  2) STP_STATE="learning" ;;
+                  3) STP_STATE="forwarding" ;;
+                  4) STP_STATE="blocking" ;;
+                  *) STP_STATE="unknown" ;;
+                esac
+                REMOTE_IP=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
+                if [ -n "$REMOTE_IP" ]; then
+                  redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
+                fi
+              done
               for rstp_port in $(ovs-vsctl list-ports br-sdn | grep "^vx" || true); do
                 RSTP_STATUS=$(ovs-vsctl get port "$rstp_port" rstp_status 2>/dev/null || true)
                 RSTP_STATE=$(echo "$RSTP_STATUS" | sed -n 's/.*rstp_port_state=\([^,}]*\).*/\1/p' | tr -d '"')
