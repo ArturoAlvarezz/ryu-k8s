@@ -238,8 +238,31 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         arp_pkt = pkt.get_protocol(arp.arp)
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
-            out_port = ofproto.OFPP_LOCAL
-            actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
+            raw_dpid = self._decimal_dpid_to_raw(dpid)
+            gateway_mac = ":".join(raw_dpid[-12:][i:i + 2] for i in range(0, 12, 2))
+            reply = packet.Packet()
+            reply.add_protocol(ethernet.ethernet(
+                ethertype=ether_types.ETH_TYPE_ARP,
+                dst=src,
+                src=gateway_mac,
+            ))
+            reply.add_protocol(arp.arp(
+                opcode=arp.ARP_REPLY,
+                src_mac=gateway_mac,
+                src_ip="10.0.0.1",
+                dst_mac=src,
+                dst_ip=arp_pkt.src_ip,
+            ))
+            reply.serialize()
+            out = parser.OFPPacketOut(
+                datapath=datapath,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+                in_port=ofproto.OFPP_CONTROLLER,
+                actions=[parser.OFPActionOutput(in_port)],
+                data=reply.data,
+            )
+            datapath.send_msg(out)
+            return
         elif out_port_str:
             out_port = int(out_port_str)
             actions = [parser.OFPActionOutput(out_port)]
@@ -429,9 +452,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                     continue
 
                 ip = guest_ips.get(mac, "sin IP")
-                is_healthy = self.redis.exists(f"health:{mac}") or mac in guest_ips
-                if not is_healthy:
-                    continue
                 if mac not in guests:
                     guests[mac] = {
                         "id": mac,
