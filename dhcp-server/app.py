@@ -8,6 +8,7 @@ SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-contro
 SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
 IFACE = "br-sdn"
 NODE_NAME = os.environ.get("NODE_NAME", "")
+LOCAL_DPID = None
 HEALTHCHECK_SOURCE_IP = os.environ.get(
     "HEALTHCHECK_SOURCE_IP",
     "10.0.0.1" if NODE_NAME == "master" else "0.0.0.0"
@@ -50,6 +51,36 @@ def get_ip_for_mac(mac):
     
     return new_ip
 
+def get_local_dpid():
+    global LOCAL_DPID
+    if LOCAL_DPID:
+        return LOCAL_DPID
+    try:
+        br0_mac = get_if_hwaddr("br0").replace(":", "")
+        LOCAL_DPID = str(int("0000" + br0_mac, 16))
+        return LOCAL_DPID
+    except Exception as e:
+        print(f"No se pudo calcular DPID local desde br0: {e}")
+        return None
+
+def get_local_guest_iface(mac):
+    dpid = get_local_dpid()
+    if not dpid:
+        return None
+
+    port_no = r.hget(f"mac_to_port:{dpid}", mac)
+    if not port_no:
+        return None
+
+    iface = r.hget(f"switch_ports:{dpid}", port_no)
+    if not iface or not iface.startswith("ens"):
+        return None
+
+    if not os.path.exists(f"/sys/class/net/{iface}"):
+        return None
+
+    return iface
+
 def handle_dhcp(pkt):
     if not (DHCP in pkt and BOOTP in pkt):
         return
@@ -78,7 +109,7 @@ def handle_dhcp(pkt):
     # competirán para clavar este candado con expiración de 2 segundos.
     # El primero en ejecutar Nx=True ganará.
     # Además concatenamos el estado para que Discover y Request tengan llaves separadas.
-    lock_key = f"dhcp:lock:{xid}:{msg_type}"
+    lock_key = f"dhcp:lock:{mac_str}:{xid}:{msg_type}"
     acquired = r.set(lock_key, "1", ex=2, nx=True)
     
     if not acquired:
@@ -133,6 +164,13 @@ def handle_dhcp(pkt):
     # exacto del cliente.
     unicast_response = Ether(src=server_mac, dst=mac_str) / ip / udp / bootp / dhcp
     sendp(unicast_response, iface=IFACE, verbose=False)
+
+    local_iface = get_local_guest_iface(mac_str)
+    if local_iface:
+        local_mac = get_if_hwaddr(local_iface)
+        direct_response = Ether(src=local_mac, dst=mac_str) / ip / udp / bootp / dhcp
+        sendp(direct_response, iface=local_iface, verbose=False)
+        print(f"[{mac_str}] Copia directa enviada por {local_iface}")
 
     print(f"[{mac_str}] Enviada respuesta tipo {reply_type} asignando IP {client_ip}")
 
