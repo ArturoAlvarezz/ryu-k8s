@@ -633,9 +633,9 @@ kubectl -n sdn-controller get svc
 
 Los ConfigMaps son obligatorios porque el manifiesto monta el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente.
 
-> El `meter-collector` corre con `hostNetwork` en el Maestro y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en el Maestro; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
+> El `meter-collector` corre como DaemonSet con `hostNetwork` en todos los nodos y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en cada nodo; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
 >
-> Importante: `10.0.0.1` pertenece solo al Maestro. Los healthchecks ARP del DHCP usan `psrc=10.0.0.1` únicamente en el pod que corre sobre `master`; en Workers usan `psrc=0.0.0.0` para no envenenar la caché ARP de los Guests y desviar telemetría hacia otro nodo.
+> Importante: los healthchecks ARP del DHCP usan `psrc=0.0.0.0` para no envenenar la caché ARP de los Guests. Ryu responde localmente las solicitudes ARP por `10.0.0.1`, de modo que cada Guest use el collector de su propio nodo.
 
 ### 13.1 Operaciones de mantenimiento
 

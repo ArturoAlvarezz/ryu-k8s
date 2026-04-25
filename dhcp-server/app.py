@@ -12,7 +12,7 @@ NODE_NAME = os.environ.get("NODE_NAME", "")
 LOCAL_DPID = None
 HEALTHCHECK_SOURCE_IP = os.environ.get(
     "HEALTHCHECK_SOURCE_IP",
-    "10.0.0.1" if NODE_NAME == "master" else "0.0.0.0"
+    "0.0.0.0"
 )
 
 print("Inicializando entorno de red...")
@@ -81,6 +81,18 @@ def get_local_guest_iface(mac):
         return None
 
     return iface
+
+def register_local_guest(mac, iface):
+    dpid = get_local_dpid()
+    if not dpid or not iface:
+        return
+
+    ports = r.hgetall(f"switch_ports:{dpid}") or {}
+    for port_no, port_name in ports.items():
+        if port_name == iface:
+            r.hset(f"mac_to_port:{dpid}", mac, port_no)
+            r.set(f"active_mac:{dpid}:{mac}", "1", ex=120)
+            return
 
 def get_guest_interfaces():
     interfaces = []
@@ -181,6 +193,7 @@ def handle_dhcp(pkt):
 
     local_iface = source_iface if source_iface.startswith("ens") else get_local_guest_iface(mac_str)
     if local_iface:
+        register_local_guest(mac_str, local_iface)
         local_mac = get_if_hwaddr(local_iface)
         direct_response = Ether(src=local_mac, dst=mac_str) / ip / udp / bootp / dhcp
         sendp(direct_response, iface=local_iface, verbose=False)
@@ -197,9 +210,8 @@ def healthcheck_loop():
             for guest_mac, ip in guest_ips.items():
                 if not ip.startswith("10."): 
                     continue
-                # Solo el Maestro puede anunciar 10.0.0.1. Los workers usan
-                # 0.0.0.0 para evitar envenenar la caché ARP de los guests y
-                # desviar telemetría destinada al collector del Maestro.
+                # Los healthchecks no deben anunciar 10.0.0.1. Ryu responde
+                # esa IP localmente para que cada guest use el collector de su nodo.
                 ans, unans = srp(
                     Ether(dst=guest_mac) / ARP(op=1, pdst=ip, psrc=HEALTHCHECK_SOURCE_IP),
                     iface=IFACE,
