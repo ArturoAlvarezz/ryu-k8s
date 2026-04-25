@@ -352,6 +352,7 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         nodes = []
         edges = []
+        vxlan_edges = {}
         guests = {}
 
         ip_to_dpid = {}
@@ -382,18 +383,29 @@ class DistributedL2Switch(app_manager.RyuApp):
                         rstp_status = rstp_ports.get("%s:%s" % (raw_dpid, port_name), "")
                         rstp_state, _, rstp_role = rstp_status.partition(":")
                         is_blocked = rstp_state == "Discarding" and rstp_role != "Disabled"
-                        edge_id = "vx:%s:%s:%s" % (dpid, target, port_no)
-                        edges.append({
+                        source, dest = sorted([str(dpid), str(target)])
+                        edge_id = "vx:%s:%s" % (source, dest)
+                        edge = vxlan_edges.setdefault(edge_id, {
                             "id": edge_id,
-                            "source": dpid,
-                            "target": target,
-                            "mainstat": "RSTP blocked" if is_blocked else "VXLAN",
-                            "secondarystat": rstp_status or "RSTP unknown",
-                            "color": "#ef4444" if is_blocked else "#64748b",
-                            "strokeDasharray": "8 5" if is_blocked else "",
-                            "thickness": "4" if is_blocked else "1",
-                            "type": "rstp_blocked" if is_blocked else "vxlan",
+                            "source": source,
+                            "target": dest,
+                            "mainstat": "VXLAN",
+                            "secondarystat": "RSTP forwarding",
+                            "color": "#64748b",
+                            "strokeDasharray": "",
+                            "thickness": "1",
+                            "type": "vxlan",
+                            "details": [],
                         })
+                        edge["details"].append("%s:%s=%s" % (dpid, port_name, rstp_status or "unknown"))
+                        if is_blocked:
+                            edge.update({
+                                "mainstat": "RSTP blocked",
+                                "color": "#ef4444",
+                                "strokeDasharray": "",
+                                "thickness": "5",
+                                "type": "rstp_blocked",
+                            })
 
             for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
@@ -428,6 +440,12 @@ class DistributedL2Switch(app_manager.RyuApp):
                     "thickness": "1",
                     "type": "guest",
                 })
+
+        for edge in vxlan_edges.values():
+            if edge["details"]:
+                edge["secondarystat"] = " | ".join(edge["details"])
+            edge.pop("details", None)
+            edges.append(edge)
 
         nodes.extend(guests.values())
         return nodes, edges, guests, ip_to_dpid
