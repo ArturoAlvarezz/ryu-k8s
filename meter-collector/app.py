@@ -72,12 +72,22 @@ def connect_redis() -> redis_lib.Redis | None:
 
 
 r: redis_lib.Redis | None = None
+_last_redis_connect_attempt = 0.0
 
 def get_redis() -> redis_lib.Redis | None:
     """Retorna la conexión Redis (reconecta si perdió el enlace)."""
-    global r
+    global r, _last_redis_connect_attempt
     if r is None:
-        return None
+        now = time.time()
+        if now - _last_redis_connect_attempt < 5:
+            return None
+        _last_redis_connect_attempt = now
+        log.warning("Redis no está conectado. Intentando reconectar...")
+        try:
+            r = connect_redis()
+        except Exception:
+            r = None
+        return r
     try:
         r.ping()
         return r
@@ -88,6 +98,17 @@ def get_redis() -> redis_lib.Redis | None:
         except Exception:
             r = None
         return r
+
+
+def redis_is_ready() -> bool:
+    redis = get_redis()
+    if redis is None:
+        return False
+    try:
+        redis.ping()
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -303,18 +324,24 @@ def api_stats():
 
 @app.route("/api/health")
 def health():
-    redis_ok = False
-    try:
-        redis_inst = get_redis()
-        if redis_inst:
-            redis_inst.ping()
-            redis_ok = True
-    except Exception:
-        pass
+    redis_ok = redis_is_ready()
     return jsonify({
         "status": "ok",
         "redis": "connected" if redis_ok else "disconnected (memory mode)",
         "udp_port": UDP_PORT,
+    })
+
+
+@app.route("/api/ready")
+def ready():
+    if not redis_is_ready():
+        return jsonify({
+            "status": "not-ready",
+            "redis": "disconnected",
+        }), 503
+    return jsonify({
+        "status": "ready",
+        "redis": "connected",
     })
 
 

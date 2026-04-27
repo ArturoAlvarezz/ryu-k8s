@@ -51,6 +51,13 @@ spec:
       labels:
         app: redis
     spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: redis
+            topologyKey: kubernetes.io/hostname
       initContainers:
       - name: setup-ha
         image: redis:7-alpine
@@ -126,6 +133,10 @@ metadata:
   name: ryu
   namespace: sdn-controller
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
   selector:
     matchLabels:
       app: ryu
@@ -140,10 +151,22 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      # FIX: 60s grace period para que Ryu cierre conexiones OpenFlow con OVS limpiamente
+      terminationGracePeriodSeconds: 60
       containers:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
-        command: ["ryu-manager", "--observe-links", "app.py"]
+        # FIX: IfNotPresent evita intentos de pull fallidos en lab GNS3 aislado sin internet
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          until [ -e /sys/class/net/br0 ] && [ -e /sys/class/net/br-sdn ]; do
+            echo "Esperando br0 y br-sdn antes de iniciar Ryu..."
+            sleep 3
+          done
+          exec ryu-manager --observe-links app.py
         env:
         - name: REDIS_SENTINEL_HOST
           value: "redis-sentinel.sdn-controller.svc.cluster.local"
@@ -155,6 +178,26 @@ spec:
         - name: code-volume
           mountPath: /app/app.py
           subPath: app.py
+        readinessProbe:
+          tcpSocket:
+            port: 6653
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          # FIX: 100s de tolerancia para reconvergencia VXLAN tras reconexión de nodos
+          failureThreshold: 20
+        startupProbe:
+          tcpSocket:
+            port: 6653
+          periodSeconds: 5
+          failureThreshold: 60   # 300s máximo para startup — sin cambio
+        livenessProbe:
+          tcpSocket:
+            port: 6653
+          # FIX: period 30s + delay 30s + 6 fallos = 210s de tolerancia (antes: 60s)
+          # Evita SIGKILL (Exit 137) durante reconvergencias VXLAN transitorias
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 6
       volumes:
       - name: code-volume
         configMap:
@@ -170,6 +213,10 @@ metadata:
   name: ovs-sdn-initializer
   namespace: sdn-controller
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
   selector:
     matchLabels:
       app: ovs-init
@@ -196,8 +243,55 @@ spec:
         - -c
         - |
           echo "Instalando dependencias y demonios de red nativa L2..."
-          apt-get update > /dev/null
-          apt-get install -y openvswitch-switch kmod iproute2 redis-tools lldpd jq > /dev/null
+          until apt-get update > /dev/null && apt-get install -y openvswitch-switch kmod iproute2 iputils-ping redis-tools lldpd jq > /dev/null; do
+            echo "apt no disponible todavia; reintentando dependencias OVS..."
+            sleep 5
+          done
+
+          MASTER_NODE_IP="${MASTER_NODE_IP:-192.168.122.100}"
+
+          get_br0_ip() {
+            ip -4 addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1
+          }
+
+          wait_for_management_plane() {
+            while true; do
+              MY_IP=$(get_br0_ip)
+              if [ -z "$MY_IP" ]; then
+                echo "br0 aun no tiene IPv4 de gestion; esperando..."
+                sleep 3
+                continue
+              fi
+
+              if ! ip link show br0 2>/dev/null | grep -q "state UP"; then
+                echo "br0 existe pero no esta UP; intentando levantarlo..."
+                ip link set br0 up 2>/dev/null || true
+                sleep 3
+                continue
+              fi
+
+              if [ "$MY_IP" != "$MASTER_NODE_IP" ] && ! ping -c1 -W1 "$MASTER_NODE_IP" > /dev/null 2>&1; then
+                echo "Sin conectividad L3 hacia master $MASTER_NODE_IP desde $MY_IP; esperando red GNS3..."
+                sleep 3
+                continue
+              fi
+
+              if ! redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 PING > /dev/null 2>&1; then
+                echo "Redis Sentinel aun no esta alcanzable desde $MY_IP; esperando..."
+                sleep 3
+                continue
+              fi
+
+              echo "Plano de gestion listo en $MY_IP."
+              return 0
+            done
+          }
+
+          get_redis_master() {
+            redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1
+          }
+
+          wait_for_management_plane
           
           echo "Cargando módulo del kernel..."
           modprobe openvswitch || true
@@ -212,12 +306,15 @@ spec:
           ovs-vsctl --if-exists del-br br-sdn
           
           # Generar el DPID permanente usando la MAC principal de la máquina (br0) tal como los switches físicos
-          MAC_ADDR=$(ip link show br0 | awk '/ether/ {print $2}' | tr -d ':')
+          BR0_MAC=$(ip link show br0 | awk '/ether/ {print $2}')
+          MAC_ADDR=$(echo "$BR0_MAC" | tr -d ':')
           DPID="0000${MAC_ADDR}"
           
           echo "Creando br-sdn con DPID físico estático: $DPID..."
           ovs-vsctl --may-exist add-br br-sdn
           ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
+          ovs-vsctl set bridge br-sdn other-config:hwaddr=$BR0_MAC
+          ip link set br-sdn address $BR0_MAC
           ip link set br-sdn up
 
           echo "Asignando gateway/collector SDN local 10.0.0.1/24 al br-sdn..."
@@ -226,11 +323,16 @@ spec:
           echo "Conectando al controlador Ryu..."
           ovs-vsctl set bridge br-sdn protocols=OpenFlow13
           ovs-vsctl set-controller br-sdn tcp:127.0.0.1:6653
+
+          refresh_table_miss() {
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=0,actions=CONTROLLER:65535" > /dev/null 2>&1 || true
+          }
+          refresh_table_miss
           
           echo "Obteniendo IP del Redis Master vía Sentinel..."
-          MY_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || ip addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
-          MASTER_IP=$(redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster | head -n 1)
-          if [ -n "$MASTER_IP" ]; then
+          MY_IP=$(get_br0_ip)
+          MASTER_IP=$(get_redis_master)
+          if [ -n "$MASTER_IP" ] && redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
             redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME || true
             redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP || true
             echo "Nodo registrado en Master $MASTER_IP: $NODE_NAME ($MY_IP)"
@@ -242,8 +344,23 @@ spec:
           sleep 15
 
           echo "Evaluando mapa físico mediante LLDP Point-to-Point asíncrono..."
+          mkdir -p /run/ryu-vx-stale
           while true; do
             # Identificar MgmtIP capturadas por LLDP en interfaces físicas puras (ej. lldp.ens4.chassis.mgmt-ip=192.168.122.101)
+            MY_IP=$(get_br0_ip)
+            if [ -z "$MY_IP" ]; then
+              echo "br0 perdio IPv4 de gestion; pausando heartbeat SDN..."
+              sleep 3
+              continue
+            fi
+
+            MASTER_IP=$(get_redis_master)
+            if [ -z "$MASTER_IP" ] || ! redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
+              echo "Redis Master no alcanzable; pausando heartbeat SDN..."
+              sleep 3
+              continue
+            fi
+
             PHYSICAL_NEIGHBORS=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "\.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | sort -u || true)
 
             for remote_ip in $PHYSICAL_NEIGHBORS; do
@@ -262,6 +379,30 @@ spec:
                      options:key=100 \
                      options:dst_port=4789 \
                   > /dev/null 2>&1 || true
+                ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
+                refresh_table_miss
+              fi
+              rm -f "/run/ryu-vx-stale/${PORT_NAME}" 2>/dev/null || true
+            done
+
+            for vx_port in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep "^vx" || true); do
+              remote_ip=$(echo "$vx_port" | sed -E 's/^vx192168122([0-9]{1,3})$/192.168.122.\1/')
+              if echo "$PHYSICAL_NEIGHBORS" | grep -qx "$remote_ip"; then
+                rm -f "/run/ryu-vx-stale/${vx_port}" 2>/dev/null || true
+                continue
+              fi
+
+              miss_file="/run/ryu-vx-stale/${vx_port}"
+              misses=0
+              [ -f "$miss_file" ] && misses=$(cat "$miss_file" 2>/dev/null || echo 0)
+              misses=$((misses + 1))
+              echo "$misses" > "$miss_file"
+              if [ "$misses" -ge 4 ]; then
+                echo "Vecino LLDP perdido: $remote_ip ($vx_port). Eliminando túnel VXLAN obsoleto..."
+                ovs-vsctl --if-exists del-port br-sdn "$vx_port" > /dev/null 2>&1 || true
+                ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
+                refresh_table_miss
+                rm -f "$miss_file" 2>/dev/null || true
               fi
             done
 
@@ -275,6 +416,24 @@ spec:
                 ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
               fi
             done
+
+            # Persistir ubicación de guests conocidos usando la FDB local de OVS.
+            # Esto reconstruye el mapa aunque Ryu haya reiniciado y todavía no haya recibido Packet-In.
+            if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
+              DPID_DEC=$((16#$DPID))
+              KNOWN_GUESTS=$(redis-cli -h $MASTER_IP HKEYS topology:guest_ips 2>/dev/null || true)
+              for intf in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep -E "^ens" || true); do
+                OFPORT=$(ovs-vsctl get Interface "$intf" ofport 2>/dev/null || echo "")
+                [ -z "$OFPORT" ] && continue
+                for guest_mac in $(ovs-appctl fdb/show br-sdn 2>/dev/null | awk -v port="$OFPORT" '$1 == port {print $3}'); do
+                  if echo "$KNOWN_GUESTS" | grep -qx "$guest_mac"; then
+                    redis-cli -h $MASTER_IP HSET "mac_to_port:${DPID_DEC}" "$guest_mac" "$OFPORT" > /dev/null 2>&1 || true
+                    redis-cli -h $MASTER_IP HSET topology:guest_locations "$guest_mac" "${DPID_DEC}:${OFPORT}" > /dev/null 2>&1 || true
+                  fi
+                done
+              done
+            fi
+
             # Heartbeat (Latido L2): Avisar al Controlador global que este nodo físico sigue vivo. (TTL 30s)
             if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
               redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
@@ -298,9 +457,9 @@ spec:
                   redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
                 fi
               done
-              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true
+              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 15 > /dev/null 2>&1 || true
             fi
-            sleep 10
+            sleep 2
           done
         volumeMounts:
         - name: libmodules
@@ -308,6 +467,39 @@ spec:
           readOnly: true
         - name: run-openvswitch
           mountPath: /var/run/openvswitch
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              test -e /sys/class/net/br0 &&
+              test -e /sys/class/net/br-sdn &&
+              ovs-vsctl br-exists br-sdn &&
+              ovs-vsctl get-controller br-sdn | grep -q "tcp:127.0.0.1:6653"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12
+        startupProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              test -e /sys/class/net/br0 &&
+              ovs-vsctl br-exists br-sdn
+          periodSeconds: 5
+          failureThreshold: 90
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              test -e /sys/class/net/br0 &&
+              ovs-vsctl br-exists br-sdn
+          periodSeconds: 20
+          failureThreshold: 6
       volumes:
       - name: libmodules
         hostPath:
@@ -387,6 +579,10 @@ metadata:
   labels:
     app: sdn-dhcp
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
   selector:
     matchLabels:
       app: sdn-dhcp
@@ -416,6 +612,31 @@ spec:
         - name: code-volume
           mountPath: /app/app.py
           subPath: app.py
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -e /sys/class/net/br-sdn
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 12
+        startupProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -e /sys/class/net/br-sdn
+          periodSeconds: 5
+          failureThreshold: 90
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -e /sys/class/net/br-sdn
+          periodSeconds: 20
+          failureThreshold: 6
       volumes:
       - name: code-volume
         configMap:
@@ -433,6 +654,10 @@ metadata:
   labels:
     app: meter-collector
 spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
   selector:
     matchLabels:
       app: meter-collector
@@ -477,7 +702,7 @@ spec:
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /api/health
+            path: /api/ready
             port: 5000
           initialDelaySeconds: 5
           periodSeconds: 10
@@ -543,8 +768,8 @@ metadata:
 data:
   prometheus.yml: |
     global:
-      scrape_interval: 10s
-      evaluation_interval: 10s
+      scrape_interval: 5s
+      evaluation_interval: 5s
 
     scrape_configs:
     - job_name: prometheus
@@ -553,6 +778,7 @@ data:
         - localhost:9090
 
     - job_name: ryu
+      scrape_interval: 2s
       kubernetes_sd_configs:
       - role: pod
         namespaces:
@@ -742,6 +968,207 @@ spec:
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: loki-config
+  namespace: sdn-controller
+data:
+  loki.yml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    common:
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+    schema_config:
+      configs:
+      - from: 2020-10-24
+        store: boltdb-shipper
+        object_store: filesystem
+        schema: v11
+        index:
+          prefix: index_
+          period: 24h
+    limits_config:
+      reject_old_samples: true
+      reject_old_samples_max_age: 24h
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: sdn-controller
+  labels:
+    app: loki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+      - name: loki
+        image: grafana/loki:2.9.8
+        args:
+        - -config.file=/etc/loki/loki.yml
+        ports:
+        - containerPort: 3100
+          name: http
+        volumeMounts:
+        - name: config
+          mountPath: /etc/loki
+        - name: data
+          mountPath: /loki
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3100
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 3100
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: config
+        configMap:
+          name: loki-config
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: sdn-controller
+  labels:
+    app: loki
+spec:
+  ports:
+  - name: http
+    port: 3100
+    targetPort: 3100
+  selector:
+    app: loki
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: sdn-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sdn-promtail
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sdn-promtail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sdn-promtail
+subjects:
+- kind: ServiceAccount
+  name: promtail
+  namespace: sdn-controller
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: sdn-controller
+data:
+  promtail.yml: |
+    server:
+      http_listen_port: 3101
+    positions:
+      filename: /run/promtail/positions.yaml
+    clients:
+    - url: http://loki.sdn-controller.svc.cluster.local:3100/loki/api/v1/push
+    scrape_configs:
+    - job_name: ryu-container-logs
+      static_configs:
+      - targets:
+        - localhost
+        labels:
+          namespace: sdn-controller
+          app: ryu
+          __path__: /var/log/containers/ryu-*_sdn-controller_ryu-*.log
+      pipeline_stages:
+      - cri: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: sdn-controller
+  labels:
+    app: promtail
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+    spec:
+      serviceAccountName: promtail
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: promtail
+        image: grafana/promtail:2.9.8
+        args:
+        - -config.file=/etc/promtail/promtail.yml
+        ports:
+        - containerPort: 3101
+          name: http
+        volumeMounts:
+        - name: config
+          mountPath: /etc/promtail
+        - name: positions
+          mountPath: /run/promtail
+        - name: pods
+          mountPath: /var/log/pods
+          readOnly: true
+        - name: containers
+          mountPath: /var/log/containers
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: promtail-config
+      - name: positions
+        emptyDir: {}
+      - name: pods
+        hostPath:
+          path: /var/log/pods
+      - name: containers
+        hostPath:
+          path: /var/log/containers
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
   name: grafana-provisioning
   namespace: sdn-controller
 data:
@@ -754,6 +1181,11 @@ data:
       access: proxy
       url: http://prometheus.sdn-controller.svc.cluster.local:9090
       isDefault: true
+    - name: Loki
+      type: loki
+      uid: loki
+      access: proxy
+      url: http://loki.sdn-controller.svc.cluster.local:3100
   dashboards.yml: |
     apiVersion: 1
     providers:
@@ -778,7 +1210,7 @@ data:
       "title": "SDN Observabilidad",
       "schemaVersion": 39,
       "version": 1,
-      "refresh": "10s",
+      "refresh": "2s",
       "timezone": "browser",
       "templating": {
         "list": [
@@ -787,7 +1219,8 @@ data:
             "label": "Guest origen",
             "type": "query",
             "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "query": "label_values(ryu_topology_node_info{type=\"guest\"}, id)",
+            "query": "query_result(max by (id) (ryu_topology_node_info{type=\"guest\"}))",
+            "regex": "/id=\"([^\"]+)\"/",
             "refresh": 1,
             "sort": 1,
             "includeAll": false,
@@ -798,7 +1231,8 @@ data:
             "label": "Guest destino",
             "type": "query",
             "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "query": "label_values(ryu_topology_node_info{type=\"guest\"}, id)",
+            "query": "query_result(max by (id) (ryu_topology_node_info{type=\"guest\",id!=\"$src_guest\"}))",
+            "regex": "/id=\"([^\"]+)\"/",
             "refresh": 1,
             "sort": 1,
             "includeAll": false,
@@ -902,6 +1336,29 @@ data:
           "title": "Trafico SDN por puerto OpenFlow",
           "gridPos": {"x": 12, "y": 34, "w": 12, "h": 8},
           "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
+        },
+        {
+          "type": "logs",
+          "title": "Logs Ryu",
+          "gridPos": {"x": 0, "y": 42, "w": 24, "h": 10},
+          "datasource": {"type": "loki", "uid": "loki"},
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "{namespace=\"sdn-controller\", app=\"ryu\"}",
+              "queryType": "range"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": false,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none"
+          }
         }
       ]
     }

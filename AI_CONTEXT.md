@@ -148,9 +148,6 @@ El siguiente listado de tareas representa las funcionalidades clave que restan p
 - [x] **Visualización del estado del Spanning Tree físico en el Dashboard:**
   - *Completado:* `ovs-sdn-initializer` lee el estado STP de los puertos físicos de `br0` desde Linux, cruza vecinos por LLDP y publica `topology:br0_stp_ports` en Redis. Ryu exporta esos estados en `ryu_topology_edge_info`; los enlaces en estado `blocking` aparecen en el panel nativo `Node graph` de Grafana como `br0 STP blocked`, en rojo y con mayor grosor.
 
-- [ ] **Visualización animada del flujo correcto de los datos:**
-  - *Contexto:* La topología actual es estática. Se requiere consumir estadísticas de puertos (OpenFlow PortStats) o capturar los flujos desde el Controlador Ryu para animar los enlaces en la interfaz web (Vis.js). Esto permitirá demostrar visualmente el camino exacto que toman los paquetes (por ejemplo, los del medidor simulado) al viajar desde el origen hasta el destino a través de los túneles VXLAN.
-
 - [ ] **Integrar capa de seguridad en la SDN (Microsegmentación/Firewalling):**
   - *Contexto:* Aprovechar el paradigma SDN para inyectar reglas de seguridad en los switches OVS vía el Controlador Ryu. Esto puede incluir protección contra MAC Spoofing, prevención de ARP Poisoning, o la creación de listas de control de acceso (ACLs) que aíslen el tráfico de ciertos Guests (medidores) de nodos no autorizados.
 

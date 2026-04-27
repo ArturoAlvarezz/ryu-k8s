@@ -138,16 +138,19 @@ class DistributedL2Switch(app_manager.RyuApp):
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        timeouts = {}
+        if priority > 0:
+            timeouts = {"idle_timeout": 5, "hard_timeout": 15}
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                              actions)]
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
                                     priority=priority, match=match,
-                                    instructions=inst)
+                                    instructions=inst, **timeouts)
         else:
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
+                                    match=match, instructions=inst, **timeouts)
         datapath.send_msg(mod)
         dpid = datapath.id
         self.flow_mod_total[dpid] = self.flow_mod_total.get(dpid, 0) + 1
@@ -215,8 +218,8 @@ class DistributedL2Switch(app_manager.RyuApp):
         mac_table_key = f"mac_to_port:{dpid}"
         self.redis.hset(mac_table_key, src, in_port)
         
-        # MAC Ageing (Auto Limpieza): Marcamos la MAC con un temporizador de vida (TTL) de 25 segundos
-        self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=25)
+        # MAC Ageing (Auto Limpieza): mantener el mapa sensible a cambios STP.
+        self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=8)
 
         # ─── TOPOLOGY INFERENCE ───────────────────────────────────────────────
         # Si el src MAC pertenece a otro switch conocido y llega por un puerto
@@ -236,6 +239,9 @@ class DistributedL2Switch(app_manager.RyuApp):
         
         ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
         in_port_name = str(ports.get(str(in_port), ""))
+        if src in (self.redis.hgetall("topology:guest_ips") or {}):
+            if in_port != ofproto.OFPP_LOCAL and not in_port_name.startswith("vx") and in_port_name != "br-sdn":
+                self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
 
         arp_pkt = pkt.get_protocol(arp.arp)
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
@@ -327,11 +333,12 @@ class DistributedL2Switch(app_manager.RyuApp):
             for datapath in list(self.datapaths.values()):
                 try:
                     parser = datapath.ofproto_parser
+                    datapath.send_msg(parser.OFPPortDescStatsRequest(datapath, 0))
                     datapath.send_msg(parser.OFPFlowStatsRequest(datapath))
                     datapath.send_msg(parser.OFPPortStatsRequest(datapath, 0, datapath.ofproto.OFPP_ANY))
                 except Exception as e:
                     self.logger.warning("Error requesting OpenFlow stats: %s", e)
-            hub.sleep(10)
+            hub.sleep(5)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
@@ -399,6 +406,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         node_names = self.redis.hgetall("topology:node_names") or {}
         node_ips = self.redis.hgetall("topology:node_ips") or {}
         guest_ips = self.redis.hgetall("topology:guest_ips") or {}
+        guest_locations = self.redis.hgetall("topology:guest_locations") or {}
         br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
 
         nodes = []
@@ -453,7 +461,15 @@ class DistributedL2Switch(app_manager.RyuApp):
                     continue
 
                 port_name = ports.get(str(port_no), "")
-                if not str(port_name).startswith("ens"):
+                is_known_guest = mac in guest_ips
+                is_local_guest_port = str(port_name).startswith("ens")
+                is_non_tunnel_port = (
+                    is_known_guest and
+                    str(port_no) != "4294967294" and
+                    not str(port_name).startswith("vx") and
+                    str(port_name) != "br-sdn"
+                )
+                if not is_local_guest_port and not is_non_tunnel_port:
                     continue
 
                 ip = guest_ips.get(mac, "sin IP")
@@ -479,6 +495,38 @@ class DistributedL2Switch(app_manager.RyuApp):
                     "thickness": "1",
                     "type": "guest",
                 })
+
+        for mac, location in guest_locations.items():
+            if mac in guests or mac not in guest_ips:
+                continue
+            location_dpid, _, port_no = str(location).partition(":")
+            if not location_dpid or not port_no or location_dpid not in dpids:
+                continue
+            ports = self.redis.hgetall(f"switch_ports:{location_dpid}") or {}
+            port_name = ports.get(str(port_no), "")
+            if str(port_name).startswith("vx") or str(port_no) == "4294967294" or str(port_name) == "br-sdn":
+                continue
+            guests[mac] = {
+                "id": mac,
+                "title": mac,
+                "subtitle": guest_ips.get(mac, "sin IP"),
+                "mainstat": "guest",
+                "color": "#ff00ee",
+                "icon": "desktop",
+                "type": "guest",
+                "switch": location_dpid,
+            }
+            edges.append({
+                "id": "guest:%s:%s" % (location_dpid, mac),
+                "source": location_dpid,
+                "target": mac,
+                "mainstat": "local",
+                "secondarystat": "guest",
+                "color": "#ff00ee",
+                "strokeDasharray": "3 3",
+                "thickness": "1",
+                "type": "guest",
+            })
 
         for edge in vxlan_edges.values():
             if edge["details"]:
@@ -526,9 +574,12 @@ class DistributedL2Switch(app_manager.RyuApp):
             edge.pop("details", None)
             link = _edge_link_id(edge["source"], edge["target"])
             if edge["type"] == "br0_stp_blocked":
+                # Reemplazar VXLAN si existe para el mismo par — STP bloqueado tiene prioridad visual
                 edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
                 edges.append(edge)
-            elif not any(_edge_link_id(existing["source"], existing["target"]) == link for existing in edges):
+            else:
+                # FIX: siempre agregar STP forwarding aunque ya haya VXLAN para el mismo par.
+                # br0 (capa física) y VXLAN (overlay SDN) son capas distintas; deben coexistir en el grafo.
                 edges.append(edge)
 
         nodes.extend(guests.values())
@@ -537,10 +588,15 @@ class DistributedL2Switch(app_manager.RyuApp):
     def _trace_guest_path(self, src_guest, dst_guest, dpids, ip_to_dpid):
         src_switch = None
         dst_switch = None
+        switch_ports = {}
+        mac_tables = {}
+        guest_locations = self.redis.hgetall("topology:guest_locations") or {}
 
         for dpid in dpids:
             mac_table = self.redis.hgetall(f"mac_to_port:{dpid}") or {}
             ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+            mac_tables[dpid] = mac_table
+            switch_ports[dpid] = ports
 
             src_port = mac_table.get(src_guest)
             if src_port and not str(ports.get(str(src_port), "")).startswith("vx"):
@@ -549,6 +605,13 @@ class DistributedL2Switch(app_manager.RyuApp):
             dst_port = mac_table.get(dst_guest)
             if dst_port and not str(ports.get(str(dst_port), "")).startswith("vx"):
                 dst_switch = dpid
+
+        if not src_switch:
+            src_switch = str(guest_locations.get(src_guest, "")).split(":", 1)[0] or None
+        if not dst_switch:
+            dst_switch = str(guest_locations.get(dst_guest, "")).split(":", 1)[0] or None
+        if src_switch not in dpids or dst_switch not in dpids:
+            return []
 
         if not src_switch or not dst_switch:
             return []
@@ -562,11 +625,11 @@ class DistributedL2Switch(app_manager.RyuApp):
                 break
             visited.add(curr_switch)
 
-            out_port = self.redis.hget(f"mac_to_port:{curr_switch}", dst_guest)
+            out_port = mac_tables.get(curr_switch, {}).get(dst_guest)
             if not out_port:
                 break
 
-            port_name = self.redis.hget(f"switch_ports:{curr_switch}", out_port) or ""
+            port_name = switch_ports.get(curr_switch, {}).get(str(out_port), "")
             if not str(port_name).startswith("vx"):
                 break
 
@@ -580,6 +643,33 @@ class DistributedL2Switch(app_manager.RyuApp):
         if curr_switch == dst_switch:
             path_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
             return path_edges
+
+        adjacency = {str(dpid): set() for dpid in dpids}
+        for dpid, ports in switch_ports.items():
+            for port_name in ports.values():
+                if not str(port_name).startswith("vx"):
+                    continue
+                target = ip_to_dpid.get(str(port_name)[2:])
+                if target and target in dpids:
+                    adjacency[str(dpid)].add(str(target))
+                    adjacency[str(target)].add(str(dpid))
+
+        queue = [(str(src_switch), [str(src_switch)])]
+        visited = {str(src_switch)}
+        while queue:
+            curr_switch, path = queue.pop(0)
+            if curr_switch == str(dst_switch):
+                graph_edges = [("path:%s" % _edge_link_id(src_guest, src_switch), src_guest, src_switch)]
+                for source, target in zip(path, path[1:]):
+                    graph_edges.append(("path:%s" % _edge_link_id(source, target), source, target))
+                graph_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
+                return graph_edges
+
+            for next_switch in sorted(adjacency.get(curr_switch, [])):
+                if next_switch in visited:
+                    continue
+                visited.add(next_switch)
+                queue.append((next_switch, path + [next_switch]))
         return []
 
     def _append_topology_metrics(self, lines):

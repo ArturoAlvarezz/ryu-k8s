@@ -91,6 +91,7 @@ def register_local_guest(mac, iface):
     for port_no, port_name in ports.items():
         if port_name == iface:
             r.hset(f"mac_to_port:{dpid}", mac, port_no)
+            r.hset("topology:guest_locations", mac, f"{dpid}:{port_no}")
             r.set(f"active_mac:{dpid}:{mac}", "1", ex=120)
             return
 
@@ -245,13 +246,22 @@ if __name__ == "__main__":
             
     threading.Thread(target=healthcheck_loop, daemon=True).start()
 
-    sniff_ifaces = get_guest_interfaces()
-    if not sniff_ifaces:
-        sniff_ifaces = [IFACE]
-    print(f"Escuchando descubrimientos DHCP en interfaces: {', '.join(sniff_ifaces)}")
+    sniff_ifaces = None
     while True:
         try:
-            sniff(iface=sniff_ifaces, filter="udp and (port 67 or port 68)", prn=handle_dhcp, store=0)
+            current_ifaces = get_guest_interfaces()
+            if not current_ifaces:
+                current_ifaces = [IFACE]
+            if current_ifaces != sniff_ifaces:
+                sniff_ifaces = current_ifaces
+                print(f"Escuchando descubrimientos DHCP en interfaces: {', '.join(sniff_ifaces)}")
+            sniff(
+                iface=sniff_ifaces,
+                filter="udp and (port 67 or port 68)",
+                prn=handle_dhcp,
+                store=0,
+                timeout=5
+            )
         except OSError as e:
             print(f"Error de Socket (La red saltó temporalmente): {e}. Reintentando...")
             time.sleep(3)

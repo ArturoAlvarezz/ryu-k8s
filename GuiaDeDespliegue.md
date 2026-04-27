@@ -361,6 +361,7 @@ network:
     br0:
       interfaces: [ens3, ens4, ens5, ens6]
       dhcp4: true
+      dhcp-identifier: mac
       parameters:
         stp: true
 EOF'
@@ -372,6 +373,8 @@ ip -br addr
 ip route
 ping -c 3 1.1.1.1
 ```
+
+> **Importante:** `dhcp-identifier: mac` mantiene el flujo zero-touch sin hardcodear IPs. Cada worker sigue obteniendo una dirección automáticamente, pero el servidor DHCP identifica al clon por la MAC estable de su interfaz/bridge en vez de por un identificador DHCP generado por el sistema. Así, al reiniciar el proyecto en GNS3, el mismo worker vuelve a pedir la misma IP y K3s/Flannel no queda con `InternalIP` y `flannel public-ip` cruzadas.
 
 Si `br0` aparece sin IPv4 y `ping` muestra `Network is unreachable`, revisa que exista un camino L2 hacia el Maestro y que el Maestro tenga `br0` conectado al Cloud `virbr0`.
 
@@ -454,22 +457,35 @@ fi
 
 # 1. Esperar IP de gestión en br0 (192.168.122.x)
 echo "[autojoin] Esperando IP de gestión en br0..."
-for i in $(seq 1 30); do
+for i in $(seq 1 90); do
   MY_IP=$(ip addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
   [ -n "$MY_IP" ] && break
   sleep 2
 done
 
 if [ -z "$MY_IP" ]; then
-  echo "[autojoin] ERROR: No se obtuvo IP en br0 tras 60s. Abortando."
+  echo "[autojoin] ERROR: No se obtuvo IP en br0 tras 180s. Abortando."
   exit 1
 fi
 echo "[autojoin] IP obtenida: $MY_IP"
+
+# Si el agente ya fue instalado, no reinstalar K3s en cada arranque.
+# La IP debe mantenerse estable por DHCP con dhcp-identifier: mac.
+if systemctl list-unit-files k3s-agent.service 2>/dev/null | grep -q '^k3s-agent.service'; then
+  if grep -R -- "--node-ip=$MY_IP" /etc/systemd/system/k3s-agent.service* /etc/rancher/k3s 2>/dev/null | grep -q .; then
+    echo "[autojoin] k3s-agent ya instalado con la IP actual ($MY_IP)."
+    exit 0
+  fi
+  echo "[autojoin] ERROR: k3s-agent ya existe, pero no coincide con la IP actual ($MY_IP)."
+  echo "[autojoin] Esto indica que el DHCP cambió la IP del worker. Corrige dhcp-identifier: mac y reune el nodo al cluster."
+  exit 1
+fi
 
 # 2. Generar hostname único basado en la MAC de br0
 MAC_ADDR=$(ip link show br0 | awk '/ether/ {print $2}' | awk -F: '{print $4$5$6}')
 NEW_HOSTNAME="worker-${MAC_ADDR}"
 hostnamectl set-hostname "$NEW_HOSTNAME"
+sed -i '/127.0.1.1/d' /etc/hosts
 echo "127.0.1.1 $NEW_HOSTNAME" >> /etc/hosts
 echo "[autojoin] Hostname asignado: $NEW_HOSTNAME"
 
@@ -487,8 +503,8 @@ curl -sfL https://get.k3s.io | \
   K3S_TOKEN="$K3S_NODE_TOKEN" \
   sh -
 
-# 5. Deshabilitar este servicio (solo corre una vez)
-systemctl disable k3s-autojoin.service
+# 5. Mantener este servicio habilitado. En futuros arranques valida que la IP DHCP
+#    siga siendo la misma y sale sin reinstalar K3s.
 echo "[autojoin] ¡Nodo $NEW_HOSTNAME unido exitosamente al cluster!"
 SCRIPT
 
@@ -508,6 +524,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/k3s-autojoin.sh
+Restart=on-failure
+RestartSec=15
 StandardOutput=journal
 StandardError=journal
 
@@ -636,6 +654,8 @@ Los ConfigMaps son obligatorios porque el manifiesto monta el código de Ryu, To
 > El `meter-collector` corre como DaemonSet con `hostNetwork` en todos los nodos y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en cada nodo; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
 >
 > Importante: los healthchecks ARP del DHCP usan `psrc=0.0.0.0` para no envenenar la caché ARP de los Guests. Ryu responde localmente las solicitudes ARP por `10.0.0.1`, de modo que cada Guest use el collector de su propio nodo.
+>
+> `br-sdn` debe usar la misma MAC que `br0`. Ryu deriva la MAC gateway de `10.0.0.1` desde el DPID físico del nodo; si `br-sdn` usa otra MAC, los paquetes UDP destinados al collector local pueden llegar al puerto local de OVS con una MAC que el kernel no acepta.
 
 ### 13.1 Operaciones de mantenimiento
 
@@ -667,6 +687,39 @@ kubectl rollout restart deploy/prometheus deploy/grafana -n sdn-controller
 ```bash
 kubectl get nodes -o wide
 ```
+
+Comprueba que la IP interna de Kubernetes y la IP pública de Flannel coincidan en todos los nodos:
+
+```bash
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" internal="}{.status.addresses[?(@.type=="InternalIP")].address}{" flannel="}{.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}{"\n"}{end}'
+```
+
+La salida correcta debe tener la misma IP en `internal=` y `flannel=` para cada nodo. Si un worker muestra valores distintos después de reiniciar GNS3, ese nodo fue registrado con una IP DHCP anterior y debe reunirse al cluster.
+
+### 14.1.1 Recuperar workers con IP de Flannel cruzada
+
+Si ya existen pods en `Unknown` por un reinicio anterior, primero corrige la Golden Image o cada worker con `dhcp-identifier: mac`. Luego recrea los workers afectados para que K3s y Flannel tomen la IP estable:
+
+```bash
+# En el Maestro: identificar workers con IP cruzada
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" internal="}{.status.addresses[?(@.type=="InternalIP")].address}{" flannel="}{.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}{"\n"}{end}'
+
+# Por cada worker afectado, borrar el objeto Node.
+# El worker se volverá a registrar al arrancar con DHCP estable.
+kubectl delete node <worker-afectado>
+
+# Limpiar pods huérfanos que quedaron en estado Unknown
+kubectl delete pod -A --field-selector=status.phase=Unknown
+```
+
+En el worker afectado, si `k3s-agent` quedó instalado con una IP antigua, reinstala el agent después de corregir Netplan:
+
+```bash
+sudo /usr/local/bin/k3s-agent-uninstall.sh
+sudo systemctl enable --now k3s-autojoin.service
+```
+
+No borres ni cambies el `node-token` del Maestro para esta recuperación. El punto crítico es que el worker vuelva a pedir la misma IP por DHCP en cada arranque.
 
 ### 14.2 Consultar Redis (Sentinel HA)
 
