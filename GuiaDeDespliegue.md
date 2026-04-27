@@ -269,7 +269,7 @@ kubectl get nodes -o wide
 
 # Parte II — Workers (Golden Image)
 
-> ℹ️ **La Golden Image es una única VM base** que se clonará en GNS3 para crear infinitos Workers con un solo clic. Configura esta VM una sola vez, sélala y expórtala como `.qcow2`.
+> ℹ️ **La Golden Image es una única VM base** que se clonará en GNS3 para crear infinitos Workers con un solo clic. Configura esta VM una sola vez y expórtala como `.qcow2`.
 
 ---
 
@@ -431,7 +431,7 @@ sudo systemctl daemon-reload
 
 ## 10. Instalación de K3s Agent (Auto-Join)
 
-### 10.1 Script de autoconfiguración
+### 10.1 Script de auto-configuración
 
 Al arrancar un clon, este script: obtiene IP DHCP, genera hostname único, espera al Maestro y se une al cluster automáticamente.
 
@@ -447,7 +447,7 @@ Luego reemplaza `<TOKEN_REAL_DEL_MAESTRO>` en el script por ese valor. No reutil
 ```bash
 sudo tee /usr/local/bin/k3s-autojoin.sh > /dev/null << 'SCRIPT'
 #!/bin/bash
-# k3s-autojoin.sh — Autoconfiguración de Worker K3s
+# k3s-autojoin.sh — Auto-configuración de Worker K3s
 
 K3S_NODE_TOKEN="K1008fc21ab5b1e9fb8b276fc97d9538b61b971389b23008986dc37c27efc1847bc::server:36d6a324fc1204f78e50a90cb295c193"
 if [ -z "$K3S_NODE_TOKEN" ] || echo "$K3S_NODE_TOKEN" | grep -q '^<'; then
@@ -578,11 +578,11 @@ sudo poweroff
 
 ### 12.2 Flujo de trabajo One-Click
 
-```
+```bash
 ┌─────────────────────────────────────────────────────────┐
 │  GNS3 Canvas                                            │
 │                                                         │
-│  [SDN-Worker] ──── [SDN-Worker] ──── [SDN-Maestro]     │
+│  [SDN-Worker] ──── [SDN-Worker] ──── [SDN-Maestro]      │
 │       ↑                  ↑                ↑             │
 │  Arrastra y conecta cables (GNS3)    IP Fija            │
 │                                  192.168.122.100        │
@@ -855,7 +855,7 @@ topk(5, sum by (node) (
 (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
 ```
 
-El dashboard `SDN Observabilidad` tambien incluye un panel `Mapa SDN y camino entre guests` basado en el panel nativo `Node graph` de Grafana. Usa las variables superiores `Guest origen` y `Guest destino` para seleccionar dos guests; los enlaces del camino calculado por Ryu aparecen como enlaces adicionales de tipo `path`.
+El dashboard `SDN Observabilidad` también incluye un panel `Mapa SDN y camino entre guests` basado en el panel nativo `Node graph` de Grafana. Usa las variables superiores `Guest origen` y `Guest destino` para seleccionar dos guests; los enlaces del camino calculado por Ryu aparecen como enlaces adicionales de tipo `path`.
 
 Los enlaces bloqueados por STP físico en `br0` se destacan en el mismo mapa como `br0 STP blocked`, en rojo y con mayor grosor. Para verificar el estado desde Prometheus:
 
