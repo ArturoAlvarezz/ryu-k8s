@@ -472,6 +472,12 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
 
+                if mac in guest_ips and not (
+                    self.redis.exists(f"active_mac:{dpid}:{mac}") or
+                    self.redis.exists(f"health:{mac}")
+                ):
+                    continue
+
                 port_name = ports.get(str(port_no), "")
                 is_known_guest = mac in guest_ips
                 is_local_guest_port = str(port_name).startswith("ens")
@@ -513,6 +519,11 @@ class DistributedL2Switch(app_manager.RyuApp):
                 continue
             location_dpid, _, port_no = str(location).partition(":")
             if not location_dpid or not port_no or location_dpid not in dpids:
+                continue
+            if not (
+                self.redis.exists(f"active_mac:{location_dpid}:{mac}") or
+                self.redis.exists(f"health:{mac}")
+            ):
                 continue
             ports = self.redis.hgetall(f"switch_ports:{location_dpid}") or {}
             port_name = ports.get(str(port_no), "")
