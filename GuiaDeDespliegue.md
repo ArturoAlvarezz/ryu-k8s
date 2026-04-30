@@ -431,6 +431,8 @@ sudo systemctl daemon-reload
 
 ## 10. Instalación de K3s Agent (Auto-Join)
 
+Ejecuta esta sección en la **VM base del Worker**, antes del sellado de la Golden Image. Así cada clon que arrastres en GNS3 ya tendrá el servicio habilitado y se unirá automáticamente al cluster al arrancar, sin entrar a la consola del worker.
+
 ### 10.1 Script de auto-configuración
 
 Al arrancar un clon, este script: obtiene IP DHCP, genera hostname único, espera al Maestro y se une al cluster automáticamente.
@@ -442,16 +444,17 @@ Antes de crear el script, copia el token real desde el Maestro:
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-Luego reemplaza `<TOKEN_REAL_DEL_MAESTRO>` en el script por ese valor. No reutilices tokens antiguos ni tokens de otra instalación de K3s.
+Guarda ese valor para el servicio systemd de la VM base del Worker. No lo pegues dentro del script ni lo subas a git; el script debe leerlo desde `K3S_NODE_TOKEN`.
 
 ```bash
 sudo tee /usr/local/bin/k3s-autojoin.sh > /dev/null << 'SCRIPT'
 #!/bin/bash
 # k3s-autojoin.sh — Auto-configuración de Worker K3s
+set -euo pipefail
 
-K3S_NODE_TOKEN="K1008fc21ab5b1e9fb8b276fc97d9538b61b971389b23008986dc37c27efc1847bc::server:36d6a324fc1204f78e50a90cb295c193"
+K3S_NODE_TOKEN="${K3S_NODE_TOKEN:-}"
 if [ -z "$K3S_NODE_TOKEN" ] || echo "$K3S_NODE_TOKEN" | grep -q '^<'; then
-  echo "[autojoin] ERROR: Reemplaza el placeholder por el token real del Maestro."
+  echo "[autojoin] ERROR: Define K3S_NODE_TOKEN con el token real del Maestro."
   exit 1
 fi
 
@@ -472,7 +475,7 @@ echo "[autojoin] IP obtenida: $MY_IP"
 # Si el agente ya fue instalado, no reinstalar K3s en cada arranque.
 # La IP debe mantenerse estable por DHCP con dhcp-identifier: mac.
 if systemctl list-unit-files k3s-agent.service 2>/dev/null | grep -q '^k3s-agent.service'; then
-  if grep -R -- "--node-ip=$MY_IP" /etc/systemd/system/k3s-agent.service* /etc/rancher/k3s 2>/dev/null | grep -q .; then
+  if grep -R -q -- "--node-ip=$MY_IP" /etc/systemd/system/k3s-agent.service* /etc/rancher/k3s 2>/dev/null; then
     echo "[autojoin] k3s-agent ya instalado con la IP actual ($MY_IP)."
     exit 0
   fi
@@ -491,10 +494,19 @@ echo "[autojoin] Hostname asignado: $NEW_HOSTNAME"
 
 # 3. Esperar que el Maestro sea alcanzable
 echo "[autojoin] Esperando al Maestro en 192.168.122.100..."
+MASTER_REACHABLE=false
 for i in $(seq 1 30); do
-  ping -c1 -W2 192.168.122.100 > /dev/null 2>&1 && break
+  if ping -c1 -W2 192.168.122.100 > /dev/null 2>&1; then
+    MASTER_REACHABLE=true
+    break
+  fi
   sleep 3
 done
+
+if [ "$MASTER_REACHABLE" != true ]; then
+  echo "[autojoin] ERROR: El Maestro no responde en 192.168.122.100 tras 90s. Abortando."
+  exit 1
+fi
 
 # 4. Unirse al cluster K3s
 curl -sfL https://get.k3s.io | \
@@ -512,6 +524,8 @@ sudo chmod +x /usr/local/bin/k3s-autojoin.sh
 ```
 
 ### 10.2 Servicio systemd del Worker
+
+En la VM base del Worker, crea el servicio y el drop-in con el token real. El archivo `token.conf` queda dentro de la Golden Image para que los clones GNS3 se conecten solos al cluster.
 
 ```bash
 sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service << EOF
@@ -533,9 +547,24 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF'
 
+# Crear el drop-in con el token real obtenido desde el Maestro.
+# Este archivo es local del Worker y no debe versionarse.
+sudo mkdir -p /etc/systemd/system/k3s-autojoin.service.d
+sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service.d/token.conf << EOF
+[Service]
+Environment=K3S_NODE_TOKEN=<TOKEN_REAL_DEL_MAESTRO>
+EOF'
+sudo chmod 600 /etc/systemd/system/k3s-autojoin.service.d/token.conf
+
 sudo systemctl daemon-reload
 sudo systemctl enable k3s-autojoin.service
 ```
+
+No ejecutes todavía `systemctl start k3s-autojoin.service` en la VM base si la vas a sellar como appliance. Solo debe quedar `enabled`; el join ocurrirá automáticamente en cada clon al primer arranque.
+
+Si el servicio falla con `ERROR: Define K3S_NODE_TOKEN`, el script está correcto pero falta el drop-in `/etc/systemd/system/k3s-autojoin.service.d/token.conf` o contiene el token equivocado. Corrige el drop-in, ejecuta `sudo systemctl daemon-reload` y reinicia con `sudo systemctl restart k3s-autojoin.service`.
+
+Si reinstalas el Maestro, el `node-token` cambia. En ese caso actualiza `token.conf` en la VM base del Worker y vuelve a exportar la appliance; los clones creados con una Golden Image vieja seguirán usando el token anterior y no podrán unirse.
 
 ---
 
