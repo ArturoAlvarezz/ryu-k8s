@@ -1,12 +1,14 @@
 import os
-import redis
 import eventlet
+import redis
 from datetime import datetime
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
+from ryu.controller.controller import datapath_connection_factory
 from ryu.lib import hub
+from ryu.lib.hub import StreamServer
 from ryu.topology import event
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
@@ -16,9 +18,6 @@ from ryu.lib.packet import ipv4
 from ryu.lib.packet import ether_types
 
 from ryu.topology import event, switches
-
-# Patch eventlet heavily used by Ryu to work properly with Redis and other sockets
-eventlet.monkey_patch()
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
 
@@ -53,6 +52,19 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.metrics_started_at = datetime.utcnow().timestamp()
         self.monitor_thread = hub.spawn(self._monitor_datapaths)
         self.metrics_thread = hub.spawn(self._start_metrics_server)
+
+    def start(self):
+        super(DistributedL2Switch, self).start()
+        self.openflow_controller_thread = hub.spawn(self._start_openflow_controller)
+        self.threads.append(self.openflow_controller_thread)
+
+    def _start_openflow_controller(self):
+        try:
+            self.logger.info("Starting OpenFlow controller listener from app.py")
+            server = StreamServer(('0.0.0.0', 6653), datapath_connection_factory)
+            server.serve_forever()
+        except Exception as e:
+            self.logger.warning("OpenFlow controller listener was not started by app.py: %s", e)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):

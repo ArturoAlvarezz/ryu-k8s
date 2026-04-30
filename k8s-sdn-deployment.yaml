@@ -180,19 +180,22 @@ spec:
           subPath: app.py
         readinessProbe:
           tcpSocket:
-            port: 6653
+            host: 127.0.0.1
+            port: 8000
           initialDelaySeconds: 5
           periodSeconds: 5
           # FIX: 100s de tolerancia para reconvergencia VXLAN tras reconexión de nodos
           failureThreshold: 20
         startupProbe:
           tcpSocket:
-            port: 6653
+            host: 127.0.0.1
+            port: 8000
           periodSeconds: 5
           failureThreshold: 60   # 300s máximo para startup — sin cambio
         livenessProbe:
           tcpSocket:
-            port: 6653
+            host: 127.0.0.1
+            port: 8000
           # FIX: period 30s + delay 30s + 6 fallos = 210s de tolerancia (antes: 60s)
           # Evita SIGKILL (Exit 137) durante reconvergencias VXLAN transitorias
           initialDelaySeconds: 30
@@ -1015,6 +1018,8 @@ spec:
       labels:
         app: loki
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: master
       containers:
       - name: loki
         image: grafana/loki:2.9.8
@@ -1023,6 +1028,13 @@ spec:
         ports:
         - containerPort: 3100
           name: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
         volumeMounts:
         - name: config
           mountPath: /etc/loki
