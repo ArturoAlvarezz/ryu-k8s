@@ -31,6 +31,39 @@ def normalize_dpid(dpid):
         return value
 
 
+def looks_like_worker_name(name):
+    value = (name or "").lower()
+    return value.startswith("worker") or value.startswith("master") or value.startswith("maestro")
+
+
+def observed_workers(r):
+    node_names = r.hgetall("topology:node_names")
+    node_ips = r.hgetall("topology:node_ips")
+    workers = []
+
+    for raw_dpid, name in sorted(node_names.items(), key=lambda item: item[1]):
+        if not looks_like_worker_name(name):
+            continue
+        dpid = normalize_dpid(raw_dpid)
+        mac = ""
+        if len(raw_dpid) >= 12:
+            raw_mac = raw_dpid[-12:]
+            mac = ":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower()
+        workers.append({
+            "mac": mac,
+            "ip": node_ips.get(raw_dpid, ""),
+            "name": name,
+            "dpid": dpid,
+            "in_port": "",
+            "port_name": "node",
+            "node_name": name,
+            "online": bool(r.exists(f"switch:alive:{raw_dpid}")),
+            "kind": "worker",
+        })
+
+    return workers
+
+
 def observed_guests(r):
     guest_ips = r.hgetall("topology:guest_ips")
     guest_names = r.hgetall("topology:guest_names")
@@ -40,6 +73,8 @@ def observed_guests(r):
 
     for mac, ip in guest_ips.items():
         mac = registry.normalize_mac(mac)
+        if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+            continue
         guests[mac] = {
             "mac": mac,
             "ip": ip,
@@ -49,7 +84,7 @@ def observed_guests(r):
             "port_name": "",
             "node_name": "",
             "online": bool(r.exists(f"health:{mac}")),
-            "kind": "worker" if mac in worker_macs else "guest",
+            "kind": "guest",
         }
 
     for key in r.scan_iter("mac_to_port:*"):
@@ -60,8 +95,9 @@ def observed_guests(r):
             if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                 continue
             port_name = ports.get(str(in_port), "")
-            is_worker = mac in worker_macs
-            if not is_worker and not port_name.startswith("ens"):
+            if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+                continue
+            if not port_name.startswith("ens"):
                 continue
             guest = guests.setdefault(
                 mac,
@@ -79,11 +115,14 @@ def observed_guests(r):
                     "in_port": str(in_port),
                     "port_name": port_name,
                     "node_name": node_names.get(raw_dpid, ""),
-                    "kind": "worker" if is_worker else "guest",
+                    "kind": "guest",
                 }
             )
 
-    return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
+    return sorted(
+        (guest for guest in guests.values() if guest.get("online")),
+        key=lambda item: (item.get("ip") or "", item["mac"]),
+    )
 
 
 def with_security_state(r, guest):
@@ -138,11 +177,10 @@ def ready():
 def api_guests():
     try:
         r = redis_client()
-        observed = [with_security_state(r, guest) for guest in observed_guests(r)]
-        workers = [item for item in observed if item.get("kind") == "worker"]
-        guests = [item for item in observed if item.get("kind") != "worker"]
+        workers = [with_security_state(r, worker) for worker in observed_workers(r)]
+        guests = [with_security_state(r, guest) for guest in observed_guests(r)]
         registered = registry.list_devices(r)
-        observed_macs = {item["mac"] for item in observed}
+        observed_macs = {item["mac"] for item in workers + guests}
         offline_registered = [device for device in registered if device["mac"] not in observed_macs]
         return jsonify({"guests": guests, "workers": workers, "offline_registered": offline_registered})
     except Exception as exc:

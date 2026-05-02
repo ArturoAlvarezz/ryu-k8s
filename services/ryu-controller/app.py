@@ -15,6 +15,7 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import arp
 from ryu.lib.packet import ipv4
+from ryu.lib.packet import udp
 from ryu.lib.packet import ether_types
 
 from ryu.topology import event, switches
@@ -28,6 +29,14 @@ def _escape_label(value):
 
 def _edge_link_id(source, target):
     return "%s--%s" % tuple(sorted([str(source), str(target)]))
+
+
+def _mac_from_dpid(dpid):
+    try:
+        hex_dpid = hex(int(str(dpid)))[2:].zfill(12)[-12:]
+        return ":".join(hex_dpid[i:i + 2] for i in range(0, 12, 2)).lower()
+    except Exception:
+        return ""
 
 
 class DistributedL2Switch(app_manager.RyuApp):
@@ -65,6 +74,56 @@ class DistributedL2Switch(app_manager.RyuApp):
             server.serve_forever()
         except Exception as e:
             self.logger.warning("OpenFlow controller listener was not started by app.py: %s", e)
+
+    def _known_worker_macs(self):
+        worker_macs = set()
+        for known_dpid in self.redis.smembers("topology:switches") or []:
+            worker_mac = _mac_from_dpid(known_dpid)
+            if worker_mac:
+                worker_macs.add(worker_mac)
+        for raw_dpid in self.redis.hkeys("topology:node_names") or []:
+            if len(raw_dpid) >= 12:
+                raw_mac = raw_dpid[-12:]
+                worker_macs.add(":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower())
+        return worker_macs
+
+    def _get_security_device_by_mac(self, mac):
+        import json
+
+        device_id = self.redis.get(f"security:mac_to_device:{mac}")
+        if not device_id:
+            return None
+        payload = self.redis.get(f"security:device:{device_id}")
+        return json.loads(payload) if payload else None
+
+    def _is_security_authorized(self, mac, ip_addr, dpid, in_port, dst_ip=None, udp_dst_port=None):
+        mac = str(mac).lower()
+        if mac in self._known_worker_macs():
+            return True, "worker_auto_allowed"
+
+        device = self._get_security_device_by_mac(mac)
+        if not device:
+            return False, "mac_not_registered"
+        if device.get("status") != "authorized":
+            return False, f"status_{device.get('status')}"
+        if device.get("ip") and ip_addr and device.get("ip") != ip_addr:
+            return False, "ip_mismatch"
+        if device.get("dpid") and device.get("dpid") != str(dpid):
+            return False, "dpid_mismatch"
+        if device.get("in_port") and device.get("in_port") != str(in_port):
+            return False, "port_mismatch"
+        if dst_ip and device.get("allowed_dst_ip") and device.get("allowed_dst_ip") != dst_ip:
+            return False, "dst_ip_not_allowed"
+        if udp_dst_port and str(device.get("allowed_udp_port")) != str(udp_dst_port):
+            return False, "udp_port_not_allowed"
+        return True, "authorized"
+
+    def _drop_guest_packet(self, datapath, in_port, src, eth_type, reason, install_flow=False):
+        if install_flow:
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_type=eth_type)
+            self.add_flow(datapath, 20, match, [], None)
+        self.logger.warning("Security drop installed: dpid=%s in_port=%s mac=%s eth_type=%s reason=%s", datapath.id, in_port, src, eth_type, reason)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -255,7 +314,14 @@ class DistributedL2Switch(app_manager.RyuApp):
             if in_port != ofproto.OFPP_LOCAL and not in_port_name.startswith("vx") and in_port_name != "br-sdn":
                 self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
 
+        udp_pkt = pkt.get_protocol(udp.udp)
         arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
+            allowed, reason = self._is_security_authorized(src, arp_pkt.src_ip, dpid, in_port, dst_ip=arp_pkt.dst_ip)
+            if not allowed:
+                self._drop_guest_packet(datapath, in_port, src, ether_types.ETH_TYPE_ARP, reason, install_flow=True)
+                return
+
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
             raw_dpid = self._decimal_dpid_to_raw(dpid)
             gateway_mac = ":".join(raw_dpid[-12:][i:i + 2] for i in range(0, 12, 2))
@@ -283,6 +349,19 @@ class DistributedL2Switch(app_manager.RyuApp):
             datapath.send_msg(out)
             return
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        if ip_pkt and not (udp_pkt and udp_pkt.src_port == 68 and udp_pkt.dst_port == 67):
+            allowed, reason = self._is_security_authorized(
+                src,
+                ip_pkt.src,
+                dpid,
+                in_port,
+                dst_ip=ip_pkt.dst,
+                udp_dst_port=udp_pkt.dst_port if udp_pkt else None,
+            )
+            if not allowed:
+                self._drop_guest_packet(datapath, in_port, src, ether_types.ETH_TYPE_IP, reason)
+                return
+
         if ip_pkt and ip_pkt.dst == "10.0.0.1":
             out_port = ofproto.OFPP_LOCAL
             actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
