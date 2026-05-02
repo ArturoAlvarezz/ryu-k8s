@@ -1,0 +1,380 @@
+# Plano SDN del host: OVS/VXLAN y DHCP distribuido.
+---
+# ==========================
+# Auto-Configurador de OVS Host (DaemonSet) - Compatible Kernel Host
+# ==========================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ovs-sdn-initializer
+  namespace: sdn-controller
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: ovs-init
+  template:
+    metadata:
+      labels:
+        app: ovs-init
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: ovs-configurator
+        image: ubuntu:22.04  # Usamos la misma base nativa del nodo anfitrión
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Instalando dependencias y demonios de red nativa L2..."
+          until apt-get update > /dev/null && apt-get install -y openvswitch-switch kmod iproute2 iputils-ping redis-tools lldpd jq > /dev/null; do
+            echo "apt no disponible todavia; reintentando dependencias OVS..."
+            sleep 5
+          done
+
+          MASTER_NODE_IP="${MASTER_NODE_IP:-192.168.122.100}"
+
+          get_br0_ip() {
+            ip -4 addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1
+          }
+
+          wait_for_management_plane() {
+            while true; do
+              MY_IP=$(get_br0_ip)
+              if [ -z "$MY_IP" ]; then
+                echo "br0 aun no tiene IPv4 de gestion; esperando..."
+                sleep 3
+                continue
+              fi
+
+              if ! ip link show br0 2>/dev/null | grep -q "state UP"; then
+                echo "br0 existe pero no esta UP; intentando levantarlo..."
+                ip link set br0 up 2>/dev/null || true
+                sleep 3
+                continue
+              fi
+
+              if [ "$MY_IP" != "$MASTER_NODE_IP" ] && ! ping -c1 -W1 "$MASTER_NODE_IP" > /dev/null 2>&1; then
+                echo "Sin conectividad L3 hacia master $MASTER_NODE_IP desde $MY_IP; esperando red GNS3..."
+                sleep 3
+                continue
+              fi
+
+              if ! redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 PING > /dev/null 2>&1; then
+                echo "Redis Sentinel aun no esta alcanzable desde $MY_IP; esperando..."
+                sleep 3
+                continue
+              fi
+
+              echo "Plano de gestion listo en $MY_IP."
+              return 0
+            done
+          }
+
+          get_redis_master() {
+            redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1
+          }
+
+          wait_for_management_plane
+          
+          echo "Cargando módulo del kernel..."
+          modprobe openvswitch || true
+          
+          echo "Iniciando servicio OVS y LLDPD..."
+          service openvswitch-switch start
+          mkdir -p /run/lldpd
+          lldpd -d &
+          sleep 2
+          
+          echo "Limpiando estado anterior para evitar fantasmas..."
+          ovs-vsctl --if-exists del-br br-sdn
+          
+          # Generar el DPID permanente usando la MAC principal de la máquina (br0) tal como los switches físicos
+          BR0_MAC=$(ip link show br0 | awk '/ether/ {print $2}')
+          MAC_ADDR=$(echo "$BR0_MAC" | tr -d ':')
+          DPID="0000${MAC_ADDR}"
+          
+          echo "Creando br-sdn con DPID físico estático: $DPID..."
+          ovs-vsctl --may-exist add-br br-sdn
+          ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
+          ovs-vsctl set bridge br-sdn other-config:hwaddr=$BR0_MAC
+          ip link set br-sdn address $BR0_MAC
+          ip link set br-sdn up
+
+          echo "Asignando gateway/collector SDN local 10.0.0.1/24 al br-sdn..."
+          ip addr show br-sdn | grep -q "10.0.0.1/24" || ip addr add 10.0.0.1/24 dev br-sdn || true
+          
+          echo "Conectando al controlador Ryu..."
+          ovs-vsctl set bridge br-sdn protocols=OpenFlow13
+          ovs-vsctl set-controller br-sdn tcp:127.0.0.1:6653
+
+          refresh_table_miss() {
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=0,actions=CONTROLLER:65535" > /dev/null 2>&1 || true
+          }
+          refresh_table_miss
+          
+          echo "Obteniendo IP del Redis Master vía Sentinel..."
+          MY_IP=$(get_br0_ip)
+          MASTER_IP=$(get_redis_master)
+          if [ -n "$MASTER_IP" ] && redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
+            redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME || true
+            redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP || true
+            echo "Nodo registrado en Master $MASTER_IP: $NODE_NAME ($MY_IP)"
+          else
+            echo "Error: No se pudo obtener el Redis Master de Sentinel."
+          fi
+
+          echo "Esperando 15 segundos para dar tiempo a convergencia topologica de lldpd..."
+          sleep 15
+
+          echo "Evaluando mapa físico mediante LLDP Point-to-Point asíncrono..."
+          mkdir -p /run/ryu-vx-stale
+          while true; do
+            # Identificar MgmtIP capturadas por LLDP en interfaces físicas puras (ej. lldp.ens4.chassis.mgmt-ip=192.168.122.101)
+            MY_IP=$(get_br0_ip)
+            if [ -z "$MY_IP" ]; then
+              echo "br0 perdio IPv4 de gestion; pausando heartbeat SDN..."
+              sleep 3
+              continue
+            fi
+
+            MASTER_IP=$(get_redis_master)
+            if [ -z "$MASTER_IP" ] || ! redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
+              echo "Redis Master no alcanzable; pausando heartbeat SDN..."
+              sleep 3
+              continue
+            fi
+
+            PHYSICAL_NEIGHBORS=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "\.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | sort -u || true)
+
+            for remote_ip in $PHYSICAL_NEIGHBORS; do
+              # Validar IP
+              if [ -z "$remote_ip" ] || [ "$remote_ip" = "$MY_IP" ]; then continue; fi
+
+              # Nombre de puerto unico: vx + los 4 octetos sin puntos
+              PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
+              
+              # Crear el tunel VXLAN SDN hacia lo que físicamente existe
+              if ! ovs-vsctl list-ports br-sdn | grep -q "^${PORT_NAME}$"; then
+                echo "Auto-detectado vecino L2 físico: $remote_ip. Instanciando encapsulación SDN..."
+                ovs-vsctl --may-exist add-port br-sdn $PORT_NAME \
+                  -- set interface $PORT_NAME type=vxlan \
+                     options:remote_ip=$remote_ip \
+                     options:key=100 \
+                     options:dst_port=4789 \
+                  > /dev/null 2>&1 || true
+                ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
+                refresh_table_miss
+              fi
+              rm -f "/run/ryu-vx-stale/${PORT_NAME}" 2>/dev/null || true
+            done
+
+            for vx_port in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep "^vx" || true); do
+              remote_ip=$(echo "$vx_port" | sed -E 's/^vx192168122([0-9]{1,3})$/192.168.122.\1/')
+              if echo "$PHYSICAL_NEIGHBORS" | grep -qx "$remote_ip"; then
+                rm -f "/run/ryu-vx-stale/${vx_port}" 2>/dev/null || true
+                continue
+              fi
+
+              miss_file="/run/ryu-vx-stale/${vx_port}"
+              misses=0
+              [ -f "$miss_file" ] && misses=$(cat "$miss_file" 2>/dev/null || echo 0)
+              misses=$((misses + 1))
+              echo "$misses" > "$miss_file"
+              if [ "$misses" -ge 4 ]; then
+                echo "Vecino LLDP perdido: $remote_ip ($vx_port). Eliminando túnel VXLAN obsoleto..."
+                ovs-vsctl --if-exists del-port br-sdn "$vx_port" > /dev/null 2>&1 || true
+                ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
+                refresh_table_miss
+                rm -f "$miss_file" 2>/dev/null || true
+              fi
+            done
+
+            # Añadir Guests en cualquier interfaz ensX que NO pertenezca a br0 (topología física)
+            for intf in $(ls /sys/class/net | grep -E "^ens[4-9]$|^ens[1-9][0-9]$"); do
+              if ip link show $intf | grep -q "master br0"; then continue; fi
+              
+              if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then
+                echo "Auto-detectado nuevo Guest en $intf. Añadiendo a la red SDN..."
+                ip link set $intf up > /dev/null 2>&1 || true
+                ovs-vsctl --may-exist add-port br-sdn $intf > /dev/null 2>&1 || true
+              fi
+            done
+
+            # Persistir ubicación de guests conocidos usando la FDB local de OVS.
+            # Esto reconstruye el mapa aunque Ryu haya reiniciado y todavía no haya recibido Packet-In.
+            if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
+              DPID_DEC=$((16#$DPID))
+              KNOWN_GUESTS=$(redis-cli -h $MASTER_IP HKEYS topology:guest_ips 2>/dev/null || true)
+              for intf in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep -E "^ens" || true); do
+                OFPORT=$(ovs-vsctl get Interface "$intf" ofport 2>/dev/null || echo "")
+                [ -z "$OFPORT" ] && continue
+                for guest_mac in $(ovs-appctl fdb/show br-sdn 2>/dev/null | awk -v port="$OFPORT" '$1 == port {print $3}'); do
+                  if echo "$KNOWN_GUESTS" | grep -qx "$guest_mac"; then
+                    redis-cli -h $MASTER_IP HSET "mac_to_port:${DPID_DEC}" "$guest_mac" "$OFPORT" > /dev/null 2>&1 || true
+                    redis-cli -h $MASTER_IP HSET topology:guest_locations "$guest_mac" "${DPID_DEC}:${OFPORT}" > /dev/null 2>&1 || true
+                  fi
+                done
+              done
+            fi
+
+            # Heartbeat (Latido L2): Avisar al Controlador global que este nodo físico sigue vivo. (TTL 30s)
+            if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
+              redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
+              redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP > /dev/null 2>&1 || true
+              OLD_BR0_STP_KEYS=$(redis-cli -h $MASTER_IP HKEYS topology:br0_stp_ports 2>/dev/null | grep "^${DPID}:" || true)
+              for stp_key in $OLD_BR0_STP_KEYS; do
+                redis-cli -h $MASTER_IP HDEL topology:br0_stp_ports "$stp_key" > /dev/null 2>&1 || true
+              done
+              for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
+                STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null || echo "")
+                case "$STATE_NUM" in
+                  0) STP_STATE="disabled" ;;
+                  1) STP_STATE="listening" ;;
+                  2) STP_STATE="learning" ;;
+                  3) STP_STATE="forwarding" ;;
+                  4) STP_STATE="blocking" ;;
+                  *) STP_STATE="unknown" ;;
+                esac
+                REMOTE_IP=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
+                if [ -n "$REMOTE_IP" ]; then
+                  redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
+                fi
+              done
+              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 15 > /dev/null 2>&1 || true
+            fi
+            sleep 2
+          done
+        volumeMounts:
+        - name: libmodules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: run-openvswitch
+          mountPath: /var/run/openvswitch
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              test -e /sys/class/net/br0 &&
+              test -e /sys/class/net/br-sdn &&
+              ovs-vsctl br-exists br-sdn &&
+              ovs-vsctl get-controller br-sdn | grep -q "tcp:127.0.0.1:6653"
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12
+        startupProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              test -e /sys/class/net/br0 &&
+              ovs-vsctl br-exists br-sdn
+          periodSeconds: 5
+          failureThreshold: 90
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - |
+              test -e /sys/class/net/br0 &&
+              ovs-vsctl br-exists br-sdn
+          periodSeconds: 20
+          failureThreshold: 6
+      volumes:
+      - name: libmodules
+        hostPath:
+          path: /lib/modules
+      - name: run-openvswitch
+        hostPath:
+          path: /var/run/openvswitch
+          type: DirectoryOrCreate
+---
+# ==========================
+# Servidor DHCP Distribuido sobre Red VXLAN L2 
+# ==========================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sdn-dhcp-server
+  namespace: sdn-controller
+  labels:
+    app: sdn-dhcp
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: sdn-dhcp
+  template:
+    metadata:
+      labels:
+        app: sdn-dhcp
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: dhcp
+        image: arturoalvarez/ryu-dhcp:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        env:
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -e /sys/class/net/br-sdn
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 12
+        startupProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -e /sys/class/net/br-sdn
+          periodSeconds: 5
+          failureThreshold: 90
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - test -e /sys/class/net/br-sdn
+          periodSeconds: 20
+          failureThreshold: 6
+      volumes:
+      - name: code-volume
+        configMap:
+          name: dhcp-code

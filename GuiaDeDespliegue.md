@@ -643,33 +643,41 @@ cd ~
 git clone https://github.com/ArturoAlvarezz/ryu-k8s.git
 cd ryu-k8s
 
-# Crear namespace antes de crear ConfigMaps
-kubectl create namespace sdn-controller --dry-run=client -o yaml | kubectl apply -f -
+# Crear namespace antes de crear ConfigMaps y servicios
+kubectl apply -f deploy/k8s/00-namespace.yaml
 
 # Crear/actualizar ConfigMaps requeridos por el manifiesto
 kubectl create configmap ryu-code \
-  --from-file=app.py=app.py \
+  --from-file=app.py=services/ryu-controller/app.py \
   -n sdn-controller \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create configmap ryu-topology-code \
-  --from-file=app.py=topology/app.py \
-  --from-file=index.html=topology/templates/index.html \
+  --from-file=app.py=services/topology-dashboard/app.py \
+  --from-file=index.html=services/topology-dashboard/templates/index.html \
   -n sdn-controller \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create configmap dhcp-code \
-  --from-file=app.py=dhcp-server/app.py \
+  --from-file=app.py=services/dhcp-server/app.py \
   -n sdn-controller \
   --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create configmap meter-collector-code \
-  --from-file=app.py=meter-collector/app.py \
+  --from-file=app.py=services/meter-collector/app.py \
   -n sdn-controller \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Aplicar el manifiesto completo después de tener los ConfigMaps listos
-kubectl apply -f k8s-sdn-deployment.yaml
+# Aplicar los manifiestos por capa, en orden de dependencias
+kubectl apply -f deploy/k8s/01-database.yaml
+kubectl apply -f deploy/k8s/02-ryu-controller.yaml
+kubectl apply -f deploy/k8s/03-sdn-network.yaml
+kubectl apply -f deploy/k8s/04-topology-dashboard.yaml
+kubectl apply -f deploy/k8s/05-telemetry.yaml
+kubectl apply -f deploy/k8s/06-observability.yaml
+
+# Alternativa equivalente si prefieres aplicar todo el stack junto:
+# kubectl apply -k deploy/k8s/
 
 # Verificar el estado de todos los recursos
 kubectl get configmap -n sdn-controller
@@ -678,7 +686,17 @@ kubectl -n sdn-controller get pods -o wide
 kubectl -n sdn-controller get svc
 ```
 
-Los ConfigMaps son obligatorios porque el manifiesto monta el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente.
+Los ConfigMaps son obligatorios porque los manifiestos montan el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente.
+
+Los manifiestos Kubernetes están separados por responsabilidad:
+
+- `deploy/k8s/00-namespace.yaml`: namespace `sdn-controller`.
+- `deploy/k8s/01-database.yaml`: Redis + Sentinel para estado compartido.
+- `deploy/k8s/02-ryu-controller.yaml`: controlador Ryu/OpenFlow y servicio OpenFlow.
+- `deploy/k8s/03-sdn-network.yaml`: `ovs-sdn-initializer` y DHCP distribuido.
+- `deploy/k8s/04-topology-dashboard.yaml`: dashboard web propio de topología.
+- `deploy/k8s/05-telemetry.yaml`: colector y dashboard Smart Meter.
+- `deploy/k8s/06-observability.yaml`: Prometheus, Grafana, Loki, Promtail y Node Exporter.
 
 > El `meter-collector` corre como DaemonSet con `hostNetwork` en todos los nodos y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en cada nodo; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
 >
@@ -806,7 +824,7 @@ Si Redis queda bloqueado por PVCs de una instalación anterior:
 kubectl delete statefulset redis -n sdn-controller
 kubectl delete pod -l app=redis -n sdn-controller --ignore-not-found
 kubectl delete pvc data-redis-0 data-redis-1 data-redis-2 -n sdn-controller --ignore-not-found
-kubectl apply -f k8s-sdn-deployment.yaml
+kubectl apply -f deploy/k8s/01-database.yaml
 kubectl rollout status statefulset/redis -n sdn-controller
 kubectl rollout restart ds/ovs-sdn-initializer ds/sdn-dhcp-server ds/ryu ds/ryu-topology -n sdn-controller
 ```
@@ -835,7 +853,7 @@ curl http://192.168.122.100:8081/api/stats
 
 ### 14.7 Observabilidad con Prometheus y Grafana
 
-El stack de observabilidad queda incluido en `k8s-sdn-deployment.yaml`:
+El stack de observabilidad queda incluido en `deploy/k8s/06-observability.yaml`:
 
 - `node-exporter`: DaemonSet, un pod por nodo para CPU, memoria, filesystem y tráfico del host.
 - `prometheus`: Deployment con 2 réplicas y retención local corta de 6h.
@@ -933,7 +951,7 @@ Si en `tcpdump` solo ves ARP pero no UDP `5555`, revisa que el DHCP tenga el fix
 kubectl -n sdn-controller logs -l app=sdn-dhcp --tail=30 | grep 'Healthcheck ARP'
 ```
 
-El pod DHCP del Maestro debe mostrar `psrc=10.0.0.1 en nodo=master`; los pods en Workers deben mostrar `psrc=0.0.0.0`. Si un Worker anuncia `psrc=10.0.0.1`, recrea el ConfigMap `dhcp-code` desde `dhcp-server/app.py` y reinicia `ds/sdn-dhcp-server`.
+El pod DHCP del Maestro debe mostrar `psrc=10.0.0.1 en nodo=master`; los pods en Workers deben mostrar `psrc=0.0.0.0`. Si un Worker anuncia `psrc=10.0.0.1`, recrea el ConfigMap `dhcp-code` desde `services/dhcp-server/app.py` y reinicia `ds/sdn-dhcp-server`.
 
 ### 14.9 Trazar rutas en OVS (verificar caminos reales)
 

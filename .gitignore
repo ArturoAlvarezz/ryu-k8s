@@ -15,4 +15,4 @@ GSYMS
 covhtml/
 coverage.xml
 nosetests.xml
-k3s_worker_command.sh
+tools/gns3/k3s_worker_command.sh

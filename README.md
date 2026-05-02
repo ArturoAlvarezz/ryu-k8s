@@ -2,7 +2,7 @@
 
 Este repositorio contiene la implementación y los manifiestos de despliegue para una arquitectura de plano de control SDN (Software Defined Networking) resiliente y altamente disponible construida sobre **Ryu**, externalizando su estado en **Redis** y orquestada con **Kubernetes (K3s)**.
 
-## 1. Explicación del Código (`app.py`)
+## 1. Explicación del Código (`services/ryu-controller/app.py`)
 
 El diseño tradicional de controladores SDN monolíticos almacena el estado de la red (por ejemplo, el mapeo de MAC a puerto y los switches conectados) en la memoria RAM del proceso en ejecución. Para que el controlador pueda escalar horizontalmente (aumentar el número de réplicas en Kubernetes) sin perder consistencia, se ha refactorizado la aplicación Ryu para usar una base de datos externa compartida (Redis).
 
@@ -42,7 +42,7 @@ Construye la imagen optimizada (definida en el `Dockerfile` de Python 3.9) utili
 
 ```bash
 cd /home/artulita/Documents/Memoria/ryu-k8s
-docker build -t arturoalvarez/ryu-controller:latest .
+docker build -t arturoalvarez/ryu-controller:latest services/ryu-controller
 ```
 
 ### Paso B: Importar la Imagen al Containerd de K3s
@@ -63,7 +63,7 @@ sudo k3s ctr images import ryu-controller.tar
 Inyecta toda la arquitectura SDN en tu clúster emitiendo el mandato sobre el archivo yaml:
 
 ```bash
-kubectl apply -f k8s-sdn-deployment.yaml
+kubectl apply -k deploy/k8s/
 ```
 
 ### Paso D: Validar el Despliegue

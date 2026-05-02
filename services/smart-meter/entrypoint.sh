@@ -20,33 +20,26 @@ echo "[net] Levantando interfaz eth0..."
 ip link set eth0 up 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 2. Obtener IP via DHCP
-#    -i eth0     : interfaz objetivo
-#    -n          : salir con error si no obtiene lease en timeout
-#    -q          : modo silencioso (quiet)
-#    -t 10       : 10 intentos de descubrimiento
-#    -T 3        : timeout de 3 segundos por intento
+# 2. Obtener IP via DHCP.
+#    Los guests pueden arrancar antes que el DaemonSet DHCP del nodo SDN.
+#    Por eso no hay limite global de intentos: el contenedor sigue pidiendo
+#    lease hasta que la red de control este lista, sin requerir reinicio manual.
 # ---------------------------------------------------------------------------
 echo "[dhcp] Solicitando dirección IP via DHCP en eth0..."
-MAX_RETRIES=10
 ATTEMPT=0
+RETRY_INTERVAL="${DHCP_RETRY_INTERVAL:-5}"
 
-while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+while true; do
     ATTEMPT=$((ATTEMPT + 1))
-    echo "[dhcp] Intento $ATTEMPT/$MAX_RETRIES..."
+    echo "[dhcp] Intento $ATTEMPT..."
     
     if udhcpc -i eth0 -n -q -t 5 -T 3 2>/dev/null; then
         echo "[dhcp] ¡Lease DHCP obtenido!"
         break
     fi
-    
-    if [ $ATTEMPT -eq $MAX_RETRIES ]; then
-        echo "[dhcp] ADVERTENCIA: No se pudo obtener IP via DHCP después de $MAX_RETRIES intentos."
-        echo "[dhcp] Continuando de todos modos (la app esperará IP internamente)..."
-    else
-        echo "[dhcp] Reintentando en 5 segundos..."
-        sleep 5
-    fi
+
+    echo "[dhcp] DHCP aun no disponible; reintentando en ${RETRY_INTERVAL}s..."
+    sleep "$RETRY_INTERVAL"
 done
 
 # ---------------------------------------------------------------------------

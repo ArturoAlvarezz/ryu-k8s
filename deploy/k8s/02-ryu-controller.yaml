@@ -1,0 +1,102 @@
+# Controlador Ryu/OpenFlow distribuido.
+---
+# ==========================
+# Distributed Ryu Controller Components
+# ==========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: ryu-openflow
+  namespace: sdn-controller
+spec:
+  type: LoadBalancer # Exposes the service externally. For K3s, this will use Klipper. NodePort is also a valid fallback.
+  ports:
+  - name: openflow-6653
+    port: 6653
+    targetPort: 6653
+    protocol: TCP
+  - name: openflow-6633
+    port: 6633
+    targetPort: 6633
+    protocol: TCP
+  selector:
+    app: ryu
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ryu
+  namespace: sdn-controller
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: ryu
+  template:
+    metadata:
+      labels:
+        app: ryu
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # FIX: 60s grace period para que Ryu cierre conexiones OpenFlow con OVS limpiamente
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: ryu
+        image: arturoalvarez/ryu-controller:latest
+        # FIX: IfNotPresent evita intentos de pull fallidos en lab GNS3 aislado sin internet
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          until [ -e /sys/class/net/br0 ] && [ -e /sys/class/net/br-sdn ]; do
+            echo "Esperando br0 y br-sdn antes de iniciar Ryu..."
+            sleep 3
+          done
+          exec ryu-manager --observe-links app.py
+        env:
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        - name: METRICS_PORT
+          value: "8000"
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+        readinessProbe:
+          tcpSocket:
+            host: 127.0.0.1
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          # FIX: 100s de tolerancia para reconvergencia VXLAN tras reconexión de nodos
+          failureThreshold: 20
+        startupProbe:
+          tcpSocket:
+            host: 127.0.0.1
+            port: 8000
+          periodSeconds: 5
+          failureThreshold: 60   # 300s máximo para startup — sin cambio
+        livenessProbe:
+          tcpSocket:
+            host: 127.0.0.1
+            port: 8000
+          # FIX: period 30s + delay 30s + 6 fallos = 210s de tolerancia (antes: 60s)
+          # Evita SIGKILL (Exit 137) durante reconvergencias VXLAN transitorias
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 6
+      volumes:
+      - name: code-volume
+        configMap:
+          name: ryu-code

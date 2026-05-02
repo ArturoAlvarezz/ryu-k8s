@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- 00-namespace.yaml
+- 01-database.yaml
+- 02-ryu-controller.yaml
+- 03-sdn-network.yaml
+- 04-topology-dashboard.yaml
+- 05-telemetry.yaml
+- 06-observability.yaml

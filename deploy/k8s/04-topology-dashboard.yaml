@@ -1,0 +1,57 @@
+# Dashboard web propio para visualizar la topologia desde Redis.
+---
+# ==========================
+# Web Dashboard de Topología (Backend + Frontend)
+# ==========================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ryu-topology
+  namespace: sdn-controller
+spec:
+  selector:
+    matchLabels:
+      app: ryu-topology
+  template:
+    metadata:
+      labels:
+        app: ryu-topology
+    spec:
+      containers:
+      - name: dashboard
+        image: arturoalvarez/ryu-topology:latest
+        imagePullPolicy: Always
+        env:
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+        - name: code-volume
+          mountPath: /app/templates/index.html
+          subPath: index.html
+      volumes:
+      - name: code-volume
+        configMap:
+          name: ryu-topology-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ryu-topology
+  namespace: sdn-controller
+  labels:
+    app: ryu-topology
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+    targetPort: 5000
+    protocol: TCP
+  selector:
+    app: ryu-topology

@@ -413,6 +413,22 @@ class DistributedL2Switch(app_manager.RyuApp):
             dpids.add(self._raw_dpid_to_decimal(raw_dpid))
         return dpids
 
+    def _get_blocked_br0_links(self, ip_to_dpid, dpids):
+        br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
+        blocked_links = set()
+        for key, status in br0_stp_ports.items():
+            if ":" not in key:
+                continue
+            raw_dpid, _ = key.split(":", 1)
+            local_dpid = self._raw_dpid_to_decimal(raw_dpid)
+            state, _, remote_ip = str(status).partition(":")
+            remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
+            if not remote_dpid or local_dpid not in dpids or remote_dpid not in dpids:
+                continue
+            if state != "forwarding":
+                blocked_links.add(_edge_link_id(local_dpid, remote_dpid))
+        return blocked_links
+
     def _build_topology_snapshot(self):
         dpids = self._get_alive_switch_dpids()
         node_names = self.redis.hgetall("topology:node_names") or {}
@@ -430,6 +446,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         ip_to_dpid = {}
         for raw_dpid, ip in node_ips.items():
             ip_to_dpid[str(ip).replace(".", "")] = self._raw_dpid_to_decimal(raw_dpid)
+        blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
 
         for dpid in sorted(dpids):
             raw_dpid = self._decimal_dpid_to_raw(dpid)
@@ -452,6 +469,8 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if str(port_name).startswith("vx"):
                     target = ip_to_dpid.get(str(port_name)[2:])
                     if target and target in dpids:
+                        if _edge_link_id(dpid, target) in blocked_br0_links:
+                            continue
                         source, dest = sorted([str(dpid), str(target)])
                         edge_id = "vx:%s:%s" % (source, dest)
                         edge = vxlan_edges.setdefault(edge_id, {
@@ -614,6 +633,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         switch_ports = {}
         mac_tables = {}
         guest_locations = self.redis.hgetall("topology:guest_locations") or {}
+        blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
 
         for dpid in dpids:
             mac_table = self.redis.hgetall(f"mac_to_port:{dpid}") or {}
@@ -659,6 +679,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             next_switch = ip_to_dpid.get(str(port_name)[2:])
             if not next_switch:
                 break
+            if _edge_link_id(curr_switch, next_switch) in blocked_br0_links:
+                break
 
             path_edges.append(("path:%s" % _edge_link_id(curr_switch, next_switch), curr_switch, next_switch))
             curr_switch = next_switch
@@ -674,6 +696,8 @@ class DistributedL2Switch(app_manager.RyuApp):
                     continue
                 target = ip_to_dpid.get(str(port_name)[2:])
                 if target and target in dpids:
+                    if _edge_link_id(dpid, target) in blocked_br0_links:
+                        continue
                     adjacency[str(dpid)].add(str(target))
                     adjacency[str(target)].add(str(dpid))
 

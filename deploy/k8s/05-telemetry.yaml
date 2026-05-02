@@ -1,0 +1,86 @@
+# Colector y dashboard de telemetria Smart Meter.
+---
+# ==========================
+# Colector de Telemetría IoT (Smart Meter Collector)
+# ==========================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: meter-collector
+  namespace: sdn-controller
+  labels:
+    app: meter-collector
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 2
+  selector:
+    matchLabels:
+      app: meter-collector
+  template:
+    metadata:
+      labels:
+        app: meter-collector
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: collector
+        image: arturoalvarez/sdn-meter-collector:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+          name: http
+          protocol: TCP
+        - containerPort: 5555
+          name: udp-telemetry
+          protocol: UDP
+        env:
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        - name: UDP_PORT
+          value: "5555"
+        - name: FLASK_PORT
+          value: "5000"
+        - name: MAX_READINGS_PER_DEVICE
+          value: "100"
+        volumeMounts:
+        - name: code-volume
+          mountPath: /app/app.py
+          subPath: app.py
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/ready
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: code-volume
+        configMap:
+          name: meter-collector-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meter-collector
+  namespace: sdn-controller
+  labels:
+    app: meter-collector
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http-dashboard
+    port: 8081
+    targetPort: 5000
+    protocol: TCP
+  selector:
+    app: meter-collector

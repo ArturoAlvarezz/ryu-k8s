@@ -1,0 +1,102 @@
+# Redis + Sentinel: estado compartido de Ryu, topologia, DHCP y telemetria.
+---
+# ==========================
+# Redis Components
+# ==========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: sdn-controller
+spec:
+  clusterIP: None
+  ports:
+  - name: redis
+    port: 6379
+  - name: sentinel
+    port: 26379
+  selector:
+    app: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: sdn-controller
+spec:
+  ports:
+  - name: sentinel
+    port: 26379
+    targetPort: 26379
+  selector:
+    app: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: sdn-controller
+spec:
+  serviceName: redis-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: redis
+            topologyKey: kubernetes.io/hostname
+      initContainers:
+      - name: setup-ha
+        image: redis:7-alpine
+        command:
+        - sh
+        - -c
+        - |
+          # Solo crear configuración si el Pod es nuevo (volumen nuevo)
+          if [ ! -f /data/sentinel.conf ]; then
+            echo "bind 0.0.0.0" > /data/redis.conf
+            if [ "$HOSTNAME" != "redis-0" ]; then
+              echo "replicaof redis-0.redis-headless.sdn-controller.svc.cluster.local 6379" >> /data/redis.conf
+            fi
+            
+            echo "bind 0.0.0.0" > /data/sentinel.conf
+            echo "sentinel monitor mymaster redis-0.redis-headless.sdn-controller.svc.cluster.local 6379 2" >> /data/sentinel.conf
+            echo "sentinel down-after-milliseconds mymaster 2000" >> /data/sentinel.conf
+            echo "sentinel failover-timeout mymaster 5000" >> /data/sentinel.conf
+            echo "sentinel parallel-syncs mymaster 1" >> /data/sentinel.conf
+            echo "sentinel resolve-hostnames yes" >> /data/sentinel.conf
+            echo "sentinel announce-hostnames yes" >> /data/sentinel.conf
+            chmod 666 /data/sentinel.conf
+          fi
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server", "/data/redis.conf"]
+        ports:
+        - containerPort: 6379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      - name: sentinel
+        image: redis:7-alpine
+        command: ["redis-server", "/data/sentinel.conf", "--sentinel"]
+        ports:
+        - containerPort: 26379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        emptyDir: {}

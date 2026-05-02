@@ -1,0 +1,6 @@
+# Namespace base del laboratorio SDN.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sdn-controller
