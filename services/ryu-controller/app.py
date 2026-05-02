@@ -157,7 +157,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     return False, "IP_SPOOFING", "ip_mismatch"
                 
                 owner_id = self.redis.get(f"security:ip_to_device:{src_ip}")
-                if owner_id and device and owner_id != device.get("id"):
+                if owner_id and device and owner_id != device.get("device_id"):
                     return False, "IP_SPOOFING", "ip_in_use_by_other_device"
                 
                 if src_ip == "10.0.0.1":
