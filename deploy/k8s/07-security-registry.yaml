@@ -61,6 +61,10 @@ metadata:
     app: security-device-registry
 spec:
   type: LoadBalancer
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   ports:
   - name: http-admin
     port: 8082

@@ -77,6 +77,10 @@ metadata:
     app: meter-collector
 spec:
   type: LoadBalancer
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   ports:
   - name: http-dashboard
     port: 8081

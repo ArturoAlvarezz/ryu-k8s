@@ -164,7 +164,6 @@ def store_reading(reading: dict):
 def get_all_latest() -> list[dict]:
     """Retorna la última lectura de todos los medidores."""
     redis = get_redis()
-    devices = set()
     result = []
 
     if redis:
@@ -174,6 +173,8 @@ def get_all_latest() -> list[dict]:
                 data = redis.hgetall(f"meter:latest:{dev}")
                 if data:
                     result.append(data)
+                else:
+                    redis.srem("meter:devices", dev)
             return result
         except Exception as e:
             log.warning("Error leyendo Redis, usando caché: %s", e)
@@ -267,17 +268,18 @@ def api_history(device_id: str):
 def api_stats():
     """Estadísticas globales del sistema de medición."""
     redis = get_redis()
-    devices = []
-
-    if redis:
-        try:
-            devices = list(redis.smembers("meter:devices") or [])
-        except Exception:
-            pass
-
-    if not devices:
+    use_memory = redis is None
+    if use_memory:
         with _cache_lock:
             devices = list(_memory_cache.keys())
+    else:
+        try:
+            devices = list(redis.smembers("meter:devices") or [])
+        except Exception as e:
+            log.warning("Error leyendo dispositivos desde Redis, usando caché: %s", e)
+            use_memory = True
+            with _cache_lock:
+                devices = list(_memory_cache.keys())
 
     total_energy = 0.0
     total_power = 0.0
@@ -286,14 +288,17 @@ def api_stats():
 
     for dev in devices:
         latest = {}
-        redis_inst = get_redis()
-        if redis_inst:
+        if not use_memory:
             try:
-                latest = redis_inst.hgetall(f"meter:latest:{dev}") or {}
-            except Exception:
-                pass
+                latest = redis.hgetall(f"meter:latest:{dev}") or {}
+                if not latest:
+                    redis.srem("meter:devices", dev)
+                    continue
+            except Exception as e:
+                log.warning("Error leyendo última lectura de %s desde Redis: %s", dev, e)
+                continue
 
-        if not latest:
+        if use_memory:
             with _cache_lock:
                 readings = _memory_cache.get(dev, [])
                 latest = readings[-1] if readings else {}

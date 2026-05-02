@@ -87,6 +87,30 @@ def observed_guests(r):
             "kind": "guest",
         }
 
+    for key in r.scan_iter("active_mac:*"):
+        parts = key.split(":", 2)
+        if len(parts) != 3:
+            continue
+        dpid = parts[1]
+        mac = registry.normalize_mac(parts[2])
+        if mac in guests or mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+            continue
+        ip = r.get(f"dhcp:bind:{mac}") or ""
+        if not ip:
+            continue
+        raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else str(dpid)
+        guests[mac] = {
+            "mac": mac,
+            "ip": ip,
+            "name": guest_names.get(mac, ""),
+            "dpid": str(dpid),
+            "in_port": "",
+            "port_name": "active_mac",
+            "node_name": node_names.get(raw_dpid, ""),
+            "online": bool(r.exists(key)) or bool(r.exists(f"health:{mac}")),
+            "kind": "guest",
+        }
+
     for key in r.scan_iter("mac_to_port:*"):
         dpid = key.split(":", 1)[1]
         ports = r.hgetall(f"switch_ports:{dpid}")
@@ -99,11 +123,14 @@ def observed_guests(r):
                 continue
             if not port_name.startswith("ens"):
                 continue
+            dhcp_ip = r.get(f"dhcp:bind:{mac}") or ""
+            if mac not in guests and not dhcp_ip:
+                continue
             guest = guests.setdefault(
                 mac,
                 {
                     "mac": mac,
-                    "ip": "",
+                    "ip": dhcp_ip,
                     "name": guest_names.get(mac, ""),
                     "online": bool(r.exists(f"health:{mac}")),
                 },
@@ -119,10 +146,7 @@ def observed_guests(r):
                 }
             )
 
-    return sorted(
-        (guest for guest in guests.values() if guest.get("online")),
-        key=lambda item: (item.get("ip") or "", item["mac"]),
-    )
+    return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
 
 
 def with_security_state(r, guest):
