@@ -20,13 +20,13 @@
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
     .card { padding: 18px; position: relative; overflow: hidden; }
     .card::before { content: ""; position: absolute; inset: 0 0 auto; height: 4px; background: var(--cyan); }
-    .card.authorized::before { background: var(--green); }
+    .card.authorized::before, .card.worker::before { background: var(--green); }
     .card.quarantined::before { background: var(--yellow); }
     .card.blocked::before, .card.unregistered::before { background: var(--red); }
     .title { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 12px; }
     .mac { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1.05rem; }
     .badge { border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 800; text-transform: uppercase; }
-    .authorized .badge { background: rgba(46,232,138,.16); color: var(--green); }
+    .authorized .badge, .worker .badge { background: rgba(46,232,138,.16); color: var(--green); }
     .quarantined .badge { background: rgba(255,204,77,.16); color: var(--yellow); }
     .blocked .badge, .unregistered .badge { background: rgba(255,85,112,.16); color: var(--red); }
     dl { display: grid; grid-template-columns: 110px 1fr; gap: 8px 12px; margin: 0 0 16px; }
@@ -90,25 +90,35 @@
       await loadGuests();
     }
 
+    async function deleteDevice(deviceId) {
+      if (!confirm(`Eliminar ${deviceId} del registro de seguridad?`)) return;
+      await api(`/api/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+      await loadGuests();
+    }
+
     function renderStatusButtons(device) {
-      return statusOptions.map(status => `<button onclick="setStatus('${device.device_id}', '${status}')">${status}</button>`).join('');
+      return statusOptions.map(status => `<button onclick="setStatus('${device.device_id}', '${status}')">${status}</button>`).join('') +
+        `<button onclick="deleteDevice('${device.device_id}')">eliminar</button>`;
     }
 
     function renderGuest(guest) {
       const status = guest.security_status || 'unregistered';
       const deviceId = guest.device?.device_id || '';
-      const actions = guest.registered
+      const actions = guest.kind === 'worker'
+        ? '<span class="badge">trafico permitido automaticamente</span>'
+        : guest.registered
         ? renderStatusButtons(guest.device)
         : `<button onclick='registerGuest(${JSON.stringify(guest)})'>Autorizar guest</button>`;
       return `<article class="card ${status}">
-        <div class="title"><div><div class="mac">${guest.mac}</div><p>${guest.name || guest.node_name || 'Guest SDN'}</p></div><span class="badge">${status}</span></div>
+        <div class="title"><div><div class="mac">${guest.mac}</div><p>${guest.kind === 'worker' ? 'Worker SDN' : (guest.name || guest.node_name || 'Guest SDN')}</p></div><span class="badge">${status}</span></div>
         <dl>
           <dt>IP</dt><dd>${guest.ip || 'DHCP pendiente'}</dd>
+          <dt>Tipo</dt><dd>${guest.kind || 'guest'}</dd>
           <dt>DPID</dt><dd>${guest.dpid || 'sin observar'}</dd>
           <dt>Puerto</dt><dd>${guest.in_port || '-'} ${guest.port_name ? `(${guest.port_name})` : ''}</dd>
           <dt>Online</dt><dd>${guest.online ? 'si' : 'no'}</dd>
           <dt>Validacion</dt><dd>${guest.validation ? `${guest.validation.allowed ? 'permitido' : 'rechazado'}: ${guest.validation.reason}` : 'sin registro'}</dd>
-          <dt>Device ID</dt><dd>${deviceId || 'no registrado'}</dd>
+          <dt>Device ID</dt><dd>${guest.kind === 'worker' ? 'worker auto-permitido' : (deviceId || 'no registrado')}</dd>
         </dl>
         <div class="actions">${actions}</div>
       </article>`;

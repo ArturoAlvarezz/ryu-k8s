@@ -44,6 +44,14 @@ def normalize_mac(mac):
     return mac.strip().lower()
 
 
+def mac_from_dpid(dpid):
+    try:
+        hex_dpid = hex(int(str(dpid)))[2:].zfill(12)[-12:]
+        return ":".join(hex_dpid[i:i + 2] for i in range(0, 12, 2)).lower()
+    except Exception:
+        return ""
+
+
 def normalize_device(raw):
     now = utc_now()
     device = {
@@ -140,7 +148,26 @@ def update_status(redis_client, device_id, status):
     return save_device(redis_client, device)
 
 
+def delete_device(redis_client, device_id):
+    device = get_device(redis_client, device_id)
+    if not device:
+        raise LookupError(f"Dispositivo no encontrado: {device_id}")
+    pipe = redis_client.pipeline()
+    pipe.srem(KEY_DEVICES, device_id)
+    pipe.delete(KEY_DEVICE.format(device_id))
+    if device.get("mac"):
+        pipe.delete(KEY_MAC_TO_DEVICE.format(device["mac"]))
+    if device.get("ip"):
+        pipe.delete(KEY_IP_TO_DEVICE.format(device["ip"]))
+    pipe.execute()
+    log.info("Dispositivo eliminado: %s mac=%s ip=%s", device_id, device.get("mac"), device.get("ip"))
+    return device
+
+
 def validate_observed_device(redis_client, mac, ip, dpid, in_port):
+    if normalize_mac(mac) == mac_from_dpid(dpid):
+        return True, "worker_auto_allowed", None
+
     device = get_by_index(redis_client, KEY_MAC_TO_DEVICE, normalize_mac(mac))
     if not device:
         return False, "mac_not_registered", None
@@ -197,6 +224,10 @@ def cmd_set_status(redis_client, args):
     print_json(update_status(redis_client, args.device_id, args.status))
 
 
+def cmd_delete(redis_client, args):
+    print_json({"deleted": delete_device(redis_client, args.device_id)})
+
+
 def cmd_validate(redis_client, args):
     allowed, reason, device = validate_observed_device(redis_client, args.mac, args.ip, args.dpid, args.in_port)
     print_json({"allowed": allowed, "reason": reason, "device": device})
@@ -236,6 +267,10 @@ def build_parser():
     status.add_argument("device_id")
     status.add_argument("status", choices=sorted(VALID_STATUSES))
     status.set_defaults(handler=cmd_set_status)
+
+    delete = sub.add_parser("delete", help="Elimina un dispositivo del registro")
+    delete.add_argument("device_id")
+    delete.set_defaults(handler=cmd_delete)
 
     validate = sub.add_parser("validate", help="Valida MAC/IP/DPID/in_port observado por Ryu")
     validate.add_argument("--mac", required=True)

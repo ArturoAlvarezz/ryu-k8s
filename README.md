@@ -107,26 +107,26 @@ docker push arturoalvarez/security-device-registry:latest
 kubectl apply -f deploy/k8s/07-security-registry.yaml
 ```
 
-El registro queda vacío por defecto. La consola web se expone en el servicio `security-device-registry` puerto `8082`, por ejemplo `http://192.168.122.100:8082`. Desde ahí puedes autorizar guests detectados por DHCP/Ryu y cambiar su estado sin ejecutar `kubectl` manualmente.
+El registro queda vacío por defecto. La consola web se expone en el servicio `security-device-registry` puerto `8082`, por ejemplo `http://192.168.122.100:8082`. Desde ahí puedes autorizar guests detectados por DHCP/Ryu, cambiar su estado o eliminarlos sin ejecutar `kubectl` manualmente. Los workers se destacan aparte y se permiten automáticamente porque pertenecen a la arquitectura.
 
 Pruebas rápidas:
 
 ```bash
 kubectl run security-registry-list -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- list
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py list
 
 kubectl run security-registry-register -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- register \
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py register \
   --device-id meter-lab-01 --mac 02:42:0a:00:00:01 --ip 10.0.0.10 \
   --role smart_meter --allowed-dst-ip 10.0.0.1 --allowed-udp-port 5555 \
   --status authorized --dpid 1234 --in-port 5
 
 kubectl run security-registry-mac -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- get-mac 02:42:0a:00:00:01
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py get-mac 02:42:0a:00:00:01
 
 kubectl run security-registry-ip -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- get-ip 10.0.0.10
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py get-ip 10.0.0.10
 
 kubectl run security-registry-quarantine -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- set-status meter-lab-01 quarantined
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py set-status meter-lab-01 quarantined
 ```

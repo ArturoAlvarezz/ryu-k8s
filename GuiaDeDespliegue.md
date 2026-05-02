@@ -747,15 +747,15 @@ kubectl apply -f deploy/k8s/07-security-registry.yaml
 kubectl get svc security-device-registry -n sdn-controller
 ```
 
-La interfaz queda expuesta por el servicio `security-device-registry` en el puerto `8082`. Desde la red del master, abre `http://192.168.122.100:8082` si el LoadBalancer queda publicado en el master.
+La interfaz queda expuesta por el servicio `security-device-registry` en el puerto `8082`. Desde la red del master, abre `http://192.168.122.100:8082` si el LoadBalancer queda publicado en el master. El Deployment corre con 2 réplicas y anti-affinity por `kubernetes.io/hostname` para mantener los pods en nodos distintos.
 
-La consola muestra los guests observados desde Redis (`topology:guest_ips`, `mac_to_port:*`, `switch_ports:*`, `health:*`) y permite registrar un guest detectado, autorizarlo, bloquearlo o ponerlo en cuarentena sin ejecutar `kubectl run` manualmente.
+La consola muestra los guests observados desde Redis (`topology:guest_ips`, `mac_to_port:*`, `switch_ports:*`, `health:*`) y permite registrar un guest detectado, autorizarlo, bloquearlo, ponerlo en cuarentena o eliminarlo del registro sin ejecutar `kubectl run` manualmente. Las MACs que corresponden a la MAC derivada del DPID de un nodo K3s se muestran como `worker` y se consideran permitidas automáticamente para no bloquear el plano de la arquitectura.
 
 Si prefieres operar por terminal, puedes registrar tus propios guests autorizados con el CLI. Sustituye MAC, IP, DPID e `in_port` por los valores reales observados en tu laboratorio:
 
 ```bash
 kubectl run security-registry-register -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- register \
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py register \
   --device-id meter-lab-01 \
   --mac 02:42:0a:00:00:01 \
   --ip 10.0.0.10 \
@@ -772,23 +772,27 @@ Comandos de prueba desde Kubernetes:
 ```bash
 # Listar dispositivos registrados
 kubectl run security-registry-list -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- list
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py list
 
 # Consultar por MAC
 kubectl run security-registry-mac -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- get-mac 02:42:0a:00:00:01
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py get-mac 02:42:0a:00:00:01
 
 # Consultar por IP
 kubectl run security-registry-ip -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- get-ip 10.0.0.10
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py get-ip 10.0.0.10
 
 # Cambiar un dispositivo a quarantined
 kubectl run security-registry-quarantine -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- set-status meter-lab-01 quarantined
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py set-status meter-lab-01 quarantined
+
+# Eliminar un dispositivo que no pertenece a la arquitectura
+kubectl run security-registry-delete -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py delete meter-lab-01
 
 # Validar la combinación observada por Ryu antes de instalar flujos
 kubectl run security-registry-validate -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- validate \
+  --image=arturoalvarez/security-device-registry:latest --command -- python /app/registry.py validate \
   --mac 02:42:0a:00:00:01 --ip 10.0.0.10 --dpid 1234 --in-port 5
 ```
 
@@ -808,7 +812,7 @@ Ejemplo de salida esperada al listar:
 }
 ```
 
-El subcomando `validate` ya prepara la integración con Ryu: recibe `mac`, `ip`, `dpid` e `in_port`, comprueba que el dispositivo exista, que su estado sea `authorized`, que la IP coincida y que `dpid`/`in_port` coincidan cuando estén fijados en el registro. Si `dpid` o `in_port` están vacíos, se consideran no anclados todavía y no bloquean la validación.
+El subcomando `validate` ya prepara la integración con Ryu: recibe `mac`, `ip`, `dpid` e `in_port`, permite automáticamente workers cuya MAC coincide con la MAC derivada del DPID, comprueba que los guests existan, que su estado sea `authorized`, que la IP coincida y que `dpid`/`in_port` coincidan cuando estén fijados en el registro. Si `dpid` o `in_port` están vacíos en un guest registrado, se consideran no anclados todavía y no bloquean la validación.
 
 ### 13.2 Operaciones de mantenimiento
 

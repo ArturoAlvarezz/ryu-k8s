@@ -31,6 +31,14 @@ def normalize_dpid(dpid):
         return value
 
 
+def mac_from_dpid(dpid):
+    try:
+        hex_dpid = hex(int(dpid))[2:].zfill(12)[-12:]
+        return ":".join(hex_dpid[i:i + 2] for i in range(0, 12, 2)).lower()
+    except Exception:
+        return ""
+
+
 def observed_guests(r):
     guest_ips = r.hgetall("topology:guest_ips")
     guest_names = r.hgetall("topology:guest_names")
@@ -51,12 +59,14 @@ def observed_guests(r):
 
     for key in r.scan_iter("mac_to_port:*"):
         dpid = key.split(":", 1)[1]
+        worker_mac = mac_from_dpid(dpid)
         ports = r.hgetall(f"switch_ports:{dpid}")
         for mac, in_port in r.hgetall(key).items():
             if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                 continue
             port_name = ports.get(str(in_port), "")
-            if not port_name.startswith("ens"):
+            is_worker = registry.normalize_mac(mac) == worker_mac
+            if not is_worker and not port_name.startswith("ens"):
                 continue
             guest = guests.setdefault(
                 mac,
@@ -74,6 +84,7 @@ def observed_guests(r):
                     "in_port": str(in_port),
                     "port_name": port_name,
                     "node_name": node_names.get(raw_dpid, ""),
+                    "kind": "worker" if is_worker else "guest",
                 }
             )
 
@@ -81,6 +92,13 @@ def observed_guests(r):
 
 
 def with_security_state(r, guest):
+    if guest.get("kind") == "worker":
+        guest["registered"] = True
+        guest["security_status"] = "worker"
+        guest["validation"] = {"allowed": True, "reason": "worker_auto_allowed"}
+        guest["device"] = None
+        return guest
+
     device = registry.get_by_index(r, registry.KEY_MAC_TO_DEVICE, registry.normalize_mac(guest["mac"]))
     if not device:
         guest["registered"] = False
@@ -155,6 +173,16 @@ def api_set_status(device_id):
         return jsonify(device)
     except Exception as exc:
         log.exception("No se pudo cambiar estado de %s", device_id)
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/devices/<device_id>", methods=["DELETE"])
+def api_delete_device(device_id):
+    try:
+        deleted = registry.delete_device(redis_client(), device_id)
+        return jsonify({"deleted": deleted})
+    except Exception as exc:
+        log.exception("No se pudo eliminar dispositivo %s", device_id)
         return jsonify({"error": str(exc)}), 400
 
 

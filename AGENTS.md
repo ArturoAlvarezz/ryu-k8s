@@ -18,7 +18,7 @@
 - `services/topology-dashboard/app.py`: Flask topology UI backed by Redis; exposed through service port `8080`.
 - `services/meter-collector/app.py`: UDP `5555` Smart Meter collector plus Flask API/dashboard on port `5000`; K8s service exposes dashboard on `8081`.
 - `services/smart-meter/`: Alpine-based GNS3 guest image. `entrypoint.sh` obtains DHCP via `udhcpc` before running `app.py`; telemetry goes to `COLLECTOR_IP=10.0.0.1`, `COLLECTOR_PORT=5555` by default.
-- `services/security-device-registry/`: web console plus CLI registry for authorized AMI devices backed by Redis. It registers/lists/queries devices and validates observed `mac`/`ip`/`dpid`/`in_port` tuples for future Ryu security enforcement. K8s service exposes the web UI on port `8082`.
+- `services/security-device-registry/`: web console plus CLI registry for authorized AMI devices backed by Redis. It registers/lists/queries/deletes devices and validates observed `mac`/`ip`/`dpid`/`in_port` tuples for future Ryu security enforcement. Worker MACs derived from switch DPID are auto-allowed and highlighted separately. K8s service exposes the web UI on port `8082` with 2 replicas spread across nodes.
 
 ## Redis Runtime Contract
 - Core keys: `topology:switches`, `topology:node_names`, `topology:node_ips`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `topology:br0_stp_ports`, `switch:alive:{dpid}`.
