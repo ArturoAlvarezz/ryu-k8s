@@ -50,7 +50,14 @@
       <span id="summary">Cargando...</span>
       <span id="error" class="error"></span>
     </section>
-    <section id="guests" class="grid"></section>
+    <section>
+      <h2>Workers de la arquitectura</h2>
+      <div id="workers" class="grid"></div>
+    </section>
+    <section>
+      <h2>Guests SDN</h2>
+      <div id="guests" class="grid"></div>
+    </section>
     <section>
       <h2>Registrados sin presencia activa</h2>
       <div id="offline" class="grid"></div>
@@ -136,7 +143,8 @@
       document.getElementById('error').textContent = '';
       try {
         const data = await api('/api/guests');
-        document.getElementById('summary').textContent = `${data.guests.length} guests observados, ${data.offline_registered.length} registrados offline`;
+        document.getElementById('summary').textContent = `${data.workers.length} workers, ${data.guests.length} guests observados, ${data.offline_registered.length} registrados offline`;
+        document.getElementById('workers').innerHTML = data.workers.length ? data.workers.map(renderGuest).join('') : '<div class="empty card">No hay workers observados.</div>';
         document.getElementById('guests').innerHTML = data.guests.length ? data.guests.map(renderGuest).join('') : '<div class="empty card">No hay guests observados todavia.</div>';
         document.getElementById('offline').innerHTML = data.offline_registered.length ? data.offline_registered.map(renderOffline).join('') : '<div class="empty card">Sin dispositivos offline registrados.</div>';
       } catch (err) {

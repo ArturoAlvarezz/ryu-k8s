@@ -52,6 +52,21 @@ def mac_from_dpid(dpid):
         return ""
 
 
+def known_worker_macs(redis_client):
+    worker_macs = set()
+    for dpid in redis_client.smembers("topology:switches"):
+        worker_mac = mac_from_dpid(dpid)
+        if worker_mac:
+            worker_macs.add(worker_mac)
+
+    for raw_dpid in redis_client.hkeys("topology:node_names"):
+        if len(raw_dpid) >= 12:
+            raw_mac = raw_dpid[-12:]
+            worker_macs.add(":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower())
+
+    return worker_macs
+
+
 def normalize_device(raw):
     now = utc_now()
     device = {
@@ -165,7 +180,7 @@ def delete_device(redis_client, device_id):
 
 
 def validate_observed_device(redis_client, mac, ip, dpid, in_port):
-    if normalize_mac(mac) == mac_from_dpid(dpid):
+    if normalize_mac(mac) in known_worker_macs(redis_client):
         return True, "worker_auto_allowed", None
 
     device = get_by_index(redis_client, KEY_MAC_TO_DEVICE, normalize_mac(mac))

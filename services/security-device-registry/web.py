@@ -31,21 +31,15 @@ def normalize_dpid(dpid):
         return value
 
 
-def mac_from_dpid(dpid):
-    try:
-        hex_dpid = hex(int(dpid))[2:].zfill(12)[-12:]
-        return ":".join(hex_dpid[i:i + 2] for i in range(0, 12, 2)).lower()
-    except Exception:
-        return ""
-
-
 def observed_guests(r):
     guest_ips = r.hgetall("topology:guest_ips")
     guest_names = r.hgetall("topology:guest_names")
     node_names = r.hgetall("topology:node_names")
+    worker_macs = registry.known_worker_macs(r)
     guests = {}
 
     for mac, ip in guest_ips.items():
+        mac = registry.normalize_mac(mac)
         guests[mac] = {
             "mac": mac,
             "ip": ip,
@@ -55,17 +49,18 @@ def observed_guests(r):
             "port_name": "",
             "node_name": "",
             "online": bool(r.exists(f"health:{mac}")),
+            "kind": "worker" if mac in worker_macs else "guest",
         }
 
     for key in r.scan_iter("mac_to_port:*"):
         dpid = key.split(":", 1)[1]
-        worker_mac = mac_from_dpid(dpid)
         ports = r.hgetall(f"switch_ports:{dpid}")
         for mac, in_port in r.hgetall(key).items():
+            mac = registry.normalize_mac(mac)
             if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                 continue
             port_name = ports.get(str(in_port), "")
-            is_worker = registry.normalize_mac(mac) == worker_mac
+            is_worker = mac in worker_macs
             if not is_worker and not port_name.startswith("ens"):
                 continue
             guest = guests.setdefault(
@@ -143,11 +138,13 @@ def ready():
 def api_guests():
     try:
         r = redis_client()
-        guests = [with_security_state(r, guest) for guest in observed_guests(r)]
+        observed = [with_security_state(r, guest) for guest in observed_guests(r)]
+        workers = [item for item in observed if item.get("kind") == "worker"]
+        guests = [item for item in observed if item.get("kind") != "worker"]
         registered = registry.list_devices(r)
-        observed_macs = {guest["mac"] for guest in guests}
+        observed_macs = {item["mac"] for item in observed}
         offline_registered = [device for device in registered if device["mac"] not in observed_macs]
-        return jsonify({"guests": guests, "offline_registered": offline_registered})
+        return jsonify({"guests": guests, "workers": workers, "offline_registered": offline_registered})
     except Exception as exc:
         log.exception("No se pudo listar guests")
         return jsonify({"error": str(exc)}), 500
