@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SDN AMI Security Registry</title>
+  <style>
+    :root { --bg: #071016; --panel: #101c27; --line: #294155; --cyan: #00d4ff; --green: #2ee88a; --yellow: #ffcc4d; --red: #ff5570; --text: #e8f6ff; --muted: #89a5b8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: radial-gradient(circle at top left, #123247 0, var(--bg) 42%); color: var(--text); font-family: Inter, system-ui, sans-serif; min-height: 100vh; }
+    header { padding: 28px clamp(18px, 4vw, 48px); border-bottom: 1px solid var(--line); background: rgba(7, 16, 22, 0.78); backdrop-filter: blur(12px); }
+    h1 { margin: 0 0 8px; font-size: clamp(1.7rem, 4vw, 3rem); letter-spacing: -0.04em; }
+    p { color: var(--muted); margin: 0; }
+    main { padding: 24px clamp(18px, 4vw, 48px); display: grid; gap: 18px; }
+    .toolbar, .card { background: rgba(16, 28, 39, 0.88); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 20px 60px rgba(0,0,0,.24); }
+    .toolbar { padding: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button, select, input { border-radius: 10px; border: 1px solid var(--line); background: #0b1721; color: var(--text); padding: 10px 12px; }
+    button { cursor: pointer; border-color: #22718a; background: linear-gradient(135deg, #104d63, #14314a); font-weight: 700; }
+    button:hover { filter: brightness(1.15); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
+    .card { padding: 18px; position: relative; overflow: hidden; }
+    .card::before { content: ""; position: absolute; inset: 0 0 auto; height: 4px; background: var(--cyan); }
+    .card.authorized::before { background: var(--green); }
+    .card.quarantined::before { background: var(--yellow); }
+    .card.blocked::before, .card.unregistered::before { background: var(--red); }
+    .title { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 12px; }
+    .mac { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1.05rem; }
+    .badge { border-radius: 999px; padding: 5px 10px; font-size: .78rem; font-weight: 800; text-transform: uppercase; }
+    .authorized .badge { background: rgba(46,232,138,.16); color: var(--green); }
+    .quarantined .badge { background: rgba(255,204,77,.16); color: var(--yellow); }
+    .blocked .badge, .unregistered .badge { background: rgba(255,85,112,.16); color: var(--red); }
+    dl { display: grid; grid-template-columns: 110px 1fr; gap: 8px 12px; margin: 0 0 16px; }
+    dt { color: var(--muted); }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .empty { color: var(--muted); padding: 28px; text-align: center; }
+    .offline { opacity: .72; }
+    .error { color: var(--red); font-weight: 700; }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } dl { grid-template-columns: 86px 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AMI Security Registry</h1>
+    <p>Administra guests detectados por Ryu/DHCP y cambia su estado sin usar kubectl manualmente.</p>
+  </header>
+  <main>
+    <section class="toolbar">
+      <button onclick="loadGuests()">Actualizar</button>
+      <span id="summary">Cargando...</span>
+      <span id="error" class="error"></span>
+    </section>
+    <section id="guests" class="grid"></section>
+    <section>
+      <h2>Registrados sin presencia activa</h2>
+      <div id="offline" class="grid"></div>
+    </section>
+  </main>
+  <script>
+    const statusOptions = ['authorized', 'quarantined', 'blocked'];
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || response.statusText);
+      return data;
+    }
+
+    function guestDevicePayload(guest) {
+      return {
+        device_id: guest.device?.device_id || `guest-${guest.mac.replaceAll(':', '')}`,
+        mac: guest.mac,
+        ip: guest.ip || '',
+        role: guest.device?.role || 'smart_meter',
+        allowed_dst_ip: guest.device?.allowed_dst_ip || '10.0.0.1',
+        allowed_udp_port: Number(guest.device?.allowed_udp_port || 5555),
+        status: guest.device?.status || 'authorized',
+        dpid: guest.dpid || guest.device?.dpid || '',
+        in_port: guest.in_port || guest.device?.in_port || ''
+      };
+    }
+
+    async function registerGuest(guest) {
+      await api('/api/devices', { method: 'POST', body: JSON.stringify(guestDevicePayload(guest)) });
+      await loadGuests();
+    }
+
+    async function setStatus(deviceId, status) {
+      await api(`/api/devices/${encodeURIComponent(deviceId)}/status`, { method: 'PATCH', body: JSON.stringify({ status }) });
+      await loadGuests();
+    }
+
+    function renderStatusButtons(device) {
+      return statusOptions.map(status => `<button onclick="setStatus('${device.device_id}', '${status}')">${status}</button>`).join('');
+    }
+
+    function renderGuest(guest) {
+      const status = guest.security_status || 'unregistered';
+      const deviceId = guest.device?.device_id || '';
+      const actions = guest.registered
+        ? renderStatusButtons(guest.device)
+        : `<button onclick='registerGuest(${JSON.stringify(guest)})'>Autorizar guest</button>`;
+      return `<article class="card ${status}">
+        <div class="title"><div><div class="mac">${guest.mac}</div><p>${guest.name || guest.node_name || 'Guest SDN'}</p></div><span class="badge">${status}</span></div>
+        <dl>
+          <dt>IP</dt><dd>${guest.ip || 'DHCP pendiente'}</dd>
+          <dt>DPID</dt><dd>${guest.dpid || 'sin observar'}</dd>
+          <dt>Puerto</dt><dd>${guest.in_port || '-'} ${guest.port_name ? `(${guest.port_name})` : ''}</dd>
+          <dt>Online</dt><dd>${guest.online ? 'si' : 'no'}</dd>
+          <dt>Validacion</dt><dd>${guest.validation ? `${guest.validation.allowed ? 'permitido' : 'rechazado'}: ${guest.validation.reason}` : 'sin registro'}</dd>
+          <dt>Device ID</dt><dd>${deviceId || 'no registrado'}</dd>
+        </dl>
+        <div class="actions">${actions}</div>
+      </article>`;
+    }
+
+    function renderOffline(device) {
+      return `<article class="card ${device.status} offline">
+        <div class="title"><div><div class="mac">${device.mac}</div><p>${device.device_id}</p></div><span class="badge">${device.status}</span></div>
+        <dl><dt>IP</dt><dd>${device.ip}</dd><dt>DPID</dt><dd>${device.dpid || '-'}</dd><dt>Puerto</dt><dd>${device.in_port || '-'}</dd></dl>
+        <div class="actions">${renderStatusButtons(device)}</div>
+      </article>`;
+    }
+
+    async function loadGuests() {
+      document.getElementById('error').textContent = '';
+      try {
+        const data = await api('/api/guests');
+        document.getElementById('summary').textContent = `${data.guests.length} guests observados, ${data.offline_registered.length} registrados offline`;
+        document.getElementById('guests').innerHTML = data.guests.length ? data.guests.map(renderGuest).join('') : '<div class="empty card">No hay guests observados todavia.</div>';
+        document.getElementById('offline').innerHTML = data.offline_registered.length ? data.offline_registered.map(renderOffline).join('') : '<div class="empty card">Sin dispositivos offline registrados.</div>';
+      } catch (err) {
+        document.getElementById('error').textContent = err.message;
+      }
+    }
+
+    loadGuests();
+    setInterval(loadGuests, 10000);
+  </script>
+</body>
+</html>

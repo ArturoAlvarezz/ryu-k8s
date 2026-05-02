@@ -11,7 +11,6 @@ from redis.sentinel import Sentinel
 SENTINEL_HOST = os.environ.get("REDIS_SENTINEL_HOST", "redis-sentinel.sdn-controller.svc.cluster.local")
 SENTINEL_PORT = int(os.environ.get("REDIS_SENTINEL_PORT", "26379"))
 SENTINEL_MASTER = os.environ.get("REDIS_SENTINEL_MASTER", "mymaster")
-DEFAULT_SEED_FILE = os.environ.get("SECURITY_DEVICE_SEED_FILE", "/app/seed_devices.json")
 
 KEY_DEVICES = "security:devices"
 KEY_DEVICE = "security:device:{}"
@@ -160,14 +159,6 @@ def print_json(data):
     print(json.dumps(data, indent=2, sort_keys=True))
 
 
-def cmd_seed(redis_client, args):
-    with open(args.file, "r", encoding="utf-8") as handle:
-        devices = json.load(handle)
-    for raw in devices:
-        save_device(redis_client, raw)
-    print_json({"loaded": len(devices), "source": args.file})
-
-
 def cmd_register(redis_client, args):
     raw = {
         "device_id": args.device_id,
@@ -217,10 +208,6 @@ def cmd_validate(redis_client, args):
 def build_parser():
     parser = argparse.ArgumentParser(description="Registro Redis de dispositivos autorizados SDN AMI")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    seed = sub.add_parser("seed", help="Carga dispositivos iniciales desde JSON")
-    seed.add_argument("--file", default=DEFAULT_SEED_FILE)
-    seed.set_defaults(handler=cmd_seed)
 
     register = sub.add_parser("register", help="Registra o actualiza un dispositivo autorizado")
     register.add_argument("--device-id", required=True)

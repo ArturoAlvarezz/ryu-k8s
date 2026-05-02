@@ -687,7 +687,7 @@ kubectl -n sdn-controller get pods -o wide
 kubectl -n sdn-controller get svc
 ```
 
-Los ConfigMaps son obligatorios porque los manifiestos montan el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente. El registro de seguridad se ejecuta desde su imagen Docker y no requiere ConfigMap para la carga inicial.
+Los ConfigMaps son obligatorios porque los manifiestos montan el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente.
 
 Los manifiestos Kubernetes están separados por responsabilidad:
 
@@ -698,7 +698,7 @@ Los manifiestos Kubernetes están separados por responsabilidad:
 - `deploy/k8s/04-topology-dashboard.yaml`: dashboard web propio de topología.
 - `deploy/k8s/05-telemetry.yaml`: colector y dashboard Smart Meter.
 - `deploy/k8s/06-observability.yaml`: Prometheus, Grafana, Loki, Promtail y Node Exporter.
-- `deploy/k8s/07-security-registry.yaml`: Job de carga inicial para el registro Redis de medidores autorizados.
+- `deploy/k8s/07-security-registry.yaml`: consola web/API para administrar autorización de guests AMI.
 
 > El `meter-collector` corre como DaemonSet con `hostNetwork` en todos los nodos y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en cada nodo; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
 >
@@ -733,25 +733,44 @@ Modelo persistido por dispositivo:
 }
 ```
 
-Para construir y publicar la imagen del CLI:
+Para construir y publicar la imagen del CLI y la consola web:
 
 ```bash
 docker build -t arturoalvarez/security-device-registry:latest services/security-device-registry
 docker push arturoalvarez/security-device-registry:latest
 ```
 
-Para cargar los 20 medidores iniciales:
+Para desplegar la consola web:
 
 ```bash
-kubectl delete job security-device-registry-seed -n sdn-controller --ignore-not-found
 kubectl apply -f deploy/k8s/07-security-registry.yaml
-kubectl logs -n sdn-controller job/security-device-registry-seed
+kubectl get svc security-device-registry -n sdn-controller
+```
+
+La interfaz queda expuesta por el servicio `security-device-registry` en el puerto `8082`. Desde la red del master, abre `http://192.168.122.100:8082` si el LoadBalancer queda publicado en el master.
+
+La consola muestra los guests observados desde Redis (`topology:guest_ips`, `mac_to_port:*`, `switch_ports:*`, `health:*`) y permite registrar un guest detectado, autorizarlo, bloquearlo o ponerlo en cuarentena sin ejecutar `kubectl run` manualmente.
+
+Si prefieres operar por terminal, puedes registrar tus propios guests autorizados con el CLI. Sustituye MAC, IP, DPID e `in_port` por los valores reales observados en tu laboratorio:
+
+```bash
+kubectl run security-registry-register -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- register \
+  --device-id meter-lab-01 \
+  --mac 02:42:0a:00:00:01 \
+  --ip 10.0.0.10 \
+  --role smart_meter \
+  --allowed-dst-ip 10.0.0.1 \
+  --allowed-udp-port 5555 \
+  --status authorized \
+  --dpid 1234 \
+  --in-port 5
 ```
 
 Comandos de prueba desde Kubernetes:
 
 ```bash
-# Listar los 20 dispositivos registrados
+# Listar dispositivos registrados
 kubectl run security-registry-list -n sdn-controller --rm -i --restart=Never \
   --image=arturoalvarez/security-device-registry:latest -- list
 
@@ -765,7 +784,7 @@ kubectl run security-registry-ip -n sdn-controller --rm -i --restart=Never \
 
 # Cambiar un dispositivo a quarantined
 kubectl run security-registry-quarantine -n sdn-controller --rm -i --restart=Never \
-  --image=arturoalvarez/security-device-registry:latest -- set-status meter-01 quarantined
+  --image=arturoalvarez/security-device-registry:latest -- set-status meter-lab-01 quarantined
 
 # Validar la combinación observada por Ryu antes de instalar flujos
 kubectl run security-registry-validate -n sdn-controller --rm -i --restart=Never \
@@ -777,10 +796,10 @@ Ejemplo de salida esperada al listar:
 
 ```json
 {
-  "count": 20,
+  "count": 1,
   "devices": [
     {
-      "device_id": "meter-01",
+      "device_id": "meter-lab-01",
       "mac": "02:42:0a:00:00:01",
       "ip": "10.0.0.10",
       "status": "authorized"

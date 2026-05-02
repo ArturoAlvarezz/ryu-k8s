@@ -1,25 +1,30 @@
-# Registro de identidad para dispositivos autorizados SDN AMI.
-apiVersion: batch/v1
-kind: Job
+# Consola web para administrar dispositivos autorizados SDN AMI.
+---
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: security-device-registry-seed
+  name: security-device-registry
   namespace: sdn-controller
   labels:
     app: security-device-registry
 spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 3600
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-device-registry
   template:
     metadata:
       labels:
         app: security-device-registry
     spec:
-      restartPolicy: OnFailure
       containers:
-      - name: registry
+      - name: registry-web
         image: arturoalvarez/security-device-registry:latest
         imagePullPolicy: Always
-        args: ["seed", "--file", "/app/seed_devices.json"]
+        ports:
+        - containerPort: 5000
+          name: http
+          protocol: TCP
         env:
         - name: REDIS_SENTINEL_HOST
           value: "redis-sentinel.sdn-controller.svc.cluster.local"
@@ -27,3 +32,32 @@ spec:
           value: "26379"
         - name: REDIS_SENTINEL_MASTER
           value: "mymaster"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/ready
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-device-registry
+  namespace: sdn-controller
+  labels:
+    app: security-device-registry
+spec:
+  type: LoadBalancer
+  ports:
+  - name: http-admin
+    port: 8082
+    targetPort: 5000
+    protocol: TCP
+  selector:
+    app: security-device-registry
