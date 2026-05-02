@@ -20,10 +20,14 @@ Recomendación: **Ubuntu Server (QEMU)** o **Ubuntu Desktop (QEMU)**.
 Abre la consola del nodo "Attacker" e instala las dependencias necesarias. Dado que Scapy requiere privilegios para forjar paquetes crudos, ejecutaremos todo como `root`.
 
 ```bash
+# Cambiar a usuario root (Scapy requiere privilegios)
+sudo su -
+
 # Actualizar repositorios e instalar dependencias
-apt-get update
-apt-get install -y python3 python3-pip tcpdump
-apt-get install -y build-essential python3-dev libpcap-dev
+apt update
+apt install -y python3 python3-pip tcpdump
+apt install -y build-essential python3-dev libpcap-dev
+apt install -y python3.12-venv
 
 # Si hay problemas con pip (entornos manejados externamente), usa venv:
 python3 -m venv /opt/attack-env
@@ -50,7 +54,7 @@ tcpdump -i eth0 -n -e
 
 3. Ejecuta el script pasándole la MAC y la IP legítima que observaste en el paso 4:
    ```bash
-   python3 test_security_threats.py 02:42:XX:XX:XX:XX 10.0.0.Y
+   /opt/attack-env/bin/python test_security_threats.py 02:42:XX:XX:XX:XX 10.0.0.Y
    ```
 
 ## 6. Validación de Resultados
