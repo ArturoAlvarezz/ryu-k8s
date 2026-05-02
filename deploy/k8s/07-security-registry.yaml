@@ -1,0 +1,29 @@
+# Registro de identidad para dispositivos autorizados SDN AMI.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: security-device-registry-seed
+  namespace: sdn-controller
+  labels:
+    app: security-device-registry
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: security-device-registry
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: registry
+        image: arturoalvarez/security-device-registry:latest
+        imagePullPolicy: Always
+        args: ["seed", "--file", "/app/seed_devices.json"]
+        env:
+        - name: REDIS_SENTINEL_HOST
+          value: "redis-sentinel.sdn-controller.svc.cluster.local"
+        - name: REDIS_SENTINEL_PORT
+          value: "26379"
+        - name: REDIS_SENTINEL_MASTER
+          value: "mymaster"

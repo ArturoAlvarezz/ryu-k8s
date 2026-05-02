@@ -85,3 +85,41 @@ Para ver en tiempo real cómo tu controlador Ryu maneja las solicitudes OpenFlow
 ```bash
 kubectl logs -f -l app=ryu -n sdn-controller
 ```
+
+---
+
+## 4. Registro de Dispositivos Autorizados SDN AMI
+
+El módulo `services/security-device-registry/` mantiene en Redis la identidad de los medidores autorizados. Expone un CLI Python para registrar, listar, consultar por MAC/IP, cambiar estado y validar la combinación observada por Ryu (`mac`, `ip`, `dpid`, `in_port`) antes de permitir flujos.
+
+Claves Redis usadas:
+
+- `security:devices`
+- `security:device:{device_id}`
+- `security:mac_to_device:{mac}`
+- `security:ip_to_device:{ip}`
+
+Carga inicial de 20 medidores:
+
+```bash
+docker build -t arturoalvarez/security-device-registry:latest services/security-device-registry
+docker push arturoalvarez/security-device-registry:latest
+
+kubectl apply -f deploy/k8s/07-security-registry.yaml
+```
+
+Pruebas rápidas:
+
+```bash
+kubectl run security-registry-list -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- list
+
+kubectl run security-registry-mac -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- get-mac 02:42:0a:00:00:01
+
+kubectl run security-registry-ip -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- get-ip 10.0.0.10
+
+kubectl run security-registry-quarantine -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- set-status meter-01 quarantined
+```

@@ -8,3 +8,4 @@ resources:
 - 04-topology-dashboard.yaml
 - 05-telemetry.yaml
 - 06-observability.yaml
+- 07-security-registry.yaml

@@ -18,12 +18,14 @@
 - `services/topology-dashboard/app.py`: Flask topology UI backed by Redis; exposed through service port `8080`.
 - `services/meter-collector/app.py`: UDP `5555` Smart Meter collector plus Flask API/dashboard on port `5000`; K8s service exposes dashboard on `8081`.
 - `services/smart-meter/`: Alpine-based GNS3 guest image. `entrypoint.sh` obtains DHCP via `udhcpc` before running `app.py`; telemetry goes to `COLLECTOR_IP=10.0.0.1`, `COLLECTOR_PORT=5555` by default.
+- `services/security-device-registry/registry.py`: CLI registry for authorized AMI devices backed by Redis. It seeds/list/queries devices and validates observed `mac`/`ip`/`dpid`/`in_port` tuples for future Ryu security enforcement.
 
 ## Redis Runtime Contract
 - Core keys: `topology:switches`, `topology:node_names`, `topology:node_ips`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `topology:br0_stp_ports`, `switch:alive:{dpid}`.
 - DHCP keys include `dhcp:next_ip` and guest lease/health state written by `services/dhcp-server/app.py`.
 - Ryu uses distributed locks like `lock:flow:{dpid}:{src}:{dst}` to avoid conflicting flow installs during broadcasts.
 - Smart Meter telemetry keys: `meter:devices`, `meter:history:{device_id}`, `meter:latest:{device_id}`.
+- Security registry keys: `security:devices`, `security:device:{device_id}`, `security:mac_to_device:{mac}`, `security:ip_to_device:{ip}`.
 - Redis keys are consumed across services. Rename or delete keys only after checking all services that read them.
 
 ## Observability
@@ -39,7 +41,7 @@
 - Legacy upstream helper: `upstream-ryu/run_tests.sh -N <test path>` runs tests in the current environment, then pycodestyle unless `-P` is passed.
 - Style checks are `tox -e pycodestyle` and `tox -e autopep8` from `upstream-ryu/`; pycodestyle intentionally ignores W503/W504/E116/E402/E501/E722/E731/E741 per `upstream-ryu/tox.ini`.
 - Build controller image with `docker build -t arturoalvarez/ryu-controller:latest services/ryu-controller`; the Dockerfile pins Python 3.9 slim and `setuptools<58.0.0` for old Ryu compatibility.
-- Build project images with these contexts: `services/ryu-controller`, `services/dhcp-server`, `services/topology-dashboard`, `services/meter-collector`, and `services/smart-meter`.
+- Build project images with these contexts: `services/ryu-controller`, `services/dhcp-server`, `services/topology-dashboard`, `services/meter-collector`, `services/smart-meter`, and `services/security-device-registry`.
 
 ## Cluster Access
 - Do not assume local `kubectl` or Docker reaches the lab cluster. The K3s master is reached over SSH at `ubuntu@192.168.122.100` with password `ubuntu`; use `python tools/gns3/ssh_k3s.py "kubectl get pods -n sdn-controller"` for remote commands.
@@ -49,7 +51,7 @@
 ## Hot Reload / Deploy
 - Python app code is mounted into pods via ConfigMaps, so small code changes usually do not require rebuilding images.
 - Reload Ryu controller code with `kubectl create configmap ryu-code --from-file=app.py=services/ryu-controller/app.py -n sdn-controller -o yaml --dry-run=client | kubectl replace -f -` then `kubectl rollout restart ds ryu -n sdn-controller`.
-- ConfigMaps used by the manifest: `ryu-code` for `services/ryu-controller/app.py`, `ryu-topology-code` for `services/topology-dashboard/app.py` and `services/topology-dashboard/templates/index.html`, `dhcp-code` for `services/dhcp-server/app.py`, and `meter-collector-code` for `services/meter-collector/app.py`.
+- ConfigMaps used by the manifest: `ryu-code` for `services/ryu-controller/app.py`, `ryu-topology-code` for `services/topology-dashboard/app.py` and `services/topology-dashboard/templates/index.html`, `dhcp-code` for `services/dhcp-server/app.py`, and `meter-collector-code` for `services/meter-collector/app.py`. The security registry seed job uses code and seed embedded in its Docker image.
 - Public lab endpoints from the master network are Prometheus `http://192.168.122.100:9090`, Grafana `http://192.168.122.100:3000`, topology UI service port `8080`, and meter collector dashboard service port `8081`.
 - Apply manifests by layer with `kubectl apply -f deploy/k8s/00-namespace.yaml`, then `01-database`, `02-ryu-controller`, `03-sdn-network`, `04-topology-dashboard`, `05-telemetry`, and `06-observability`; or use `kubectl apply -k deploy/k8s/`.
 

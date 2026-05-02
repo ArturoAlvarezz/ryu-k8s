@@ -675,6 +675,7 @@ kubectl apply -f deploy/k8s/03-sdn-network.yaml
 kubectl apply -f deploy/k8s/04-topology-dashboard.yaml
 kubectl apply -f deploy/k8s/05-telemetry.yaml
 kubectl apply -f deploy/k8s/06-observability.yaml
+kubectl apply -f deploy/k8s/07-security-registry.yaml
 
 # Alternativa equivalente si prefieres aplicar todo el stack junto:
 # kubectl apply -k deploy/k8s/
@@ -686,7 +687,7 @@ kubectl -n sdn-controller get pods -o wide
 kubectl -n sdn-controller get svc
 ```
 
-Los ConfigMaps son obligatorios porque los manifiestos montan el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente.
+Los ConfigMaps son obligatorios porque los manifiestos montan el código de Ryu, Topología, DHCP y Meter Collector desde Kubernetes. Si se omiten, los Pods pueden quedar en `CreateContainerConfigError` o no arrancar correctamente. El registro de seguridad se ejecuta desde su imagen Docker y no requiere ConfigMap para la carga inicial.
 
 Los manifiestos Kubernetes están separados por responsabilidad:
 
@@ -697,6 +698,7 @@ Los manifiestos Kubernetes están separados por responsabilidad:
 - `deploy/k8s/04-topology-dashboard.yaml`: dashboard web propio de topología.
 - `deploy/k8s/05-telemetry.yaml`: colector y dashboard Smart Meter.
 - `deploy/k8s/06-observability.yaml`: Prometheus, Grafana, Loki, Promtail y Node Exporter.
+- `deploy/k8s/07-security-registry.yaml`: Job de carga inicial para el registro Redis de medidores autorizados.
 
 > El `meter-collector` corre como DaemonSet con `hostNetwork` en todos los nodos y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en cada nodo; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
 >
@@ -704,7 +706,92 @@ Los manifiestos Kubernetes están separados por responsabilidad:
 >
 > `br-sdn` debe usar la misma MAC que `br0`. Ryu deriva la MAC gateway de `10.0.0.1` desde el DPID físico del nodo; si `br-sdn` usa otra MAC, los paquetes UDP destinados al collector local pueden llegar al puerto local de OVS con una MAC que el kernel no acepta.
 
-### 13.1 Operaciones de mantenimiento
+### 13.1 Registro de dispositivos autorizados SDN AMI
+
+El servicio `security-device-registry` crea la fuente de identidad de los medidores autorizados en Redis. Usa estas claves sin modificar el contrato existente de topología, DHCP ni telemetría:
+
+- `security:devices`: set de `device_id` registrados.
+- `security:device:{device_id}`: JSON completo del dispositivo.
+- `security:mac_to_device:{mac}`: índice MAC a `device_id`.
+- `security:ip_to_device:{ip}`: índice IP a `device_id`.
+
+Modelo persistido por dispositivo:
+
+```json
+{
+  "device_id": "meter-01",
+  "mac": "02:42:0a:00:00:01",
+  "ip": "10.0.0.10",
+  "role": "smart_meter",
+  "allowed_dst_ip": "10.0.0.1",
+  "allowed_udp_port": 5555,
+  "status": "authorized",
+  "registered_at": "2026-05-02T00:00:00+00:00",
+  "last_seen": "",
+  "dpid": "",
+  "in_port": ""
+}
+```
+
+Para construir y publicar la imagen del CLI:
+
+```bash
+docker build -t arturoalvarez/security-device-registry:latest services/security-device-registry
+docker push arturoalvarez/security-device-registry:latest
+```
+
+Para cargar los 20 medidores iniciales:
+
+```bash
+kubectl delete job security-device-registry-seed -n sdn-controller --ignore-not-found
+kubectl apply -f deploy/k8s/07-security-registry.yaml
+kubectl logs -n sdn-controller job/security-device-registry-seed
+```
+
+Comandos de prueba desde Kubernetes:
+
+```bash
+# Listar los 20 dispositivos registrados
+kubectl run security-registry-list -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- list
+
+# Consultar por MAC
+kubectl run security-registry-mac -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- get-mac 02:42:0a:00:00:01
+
+# Consultar por IP
+kubectl run security-registry-ip -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- get-ip 10.0.0.10
+
+# Cambiar un dispositivo a quarantined
+kubectl run security-registry-quarantine -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- set-status meter-01 quarantined
+
+# Validar la combinación observada por Ryu antes de instalar flujos
+kubectl run security-registry-validate -n sdn-controller --rm -i --restart=Never \
+  --image=arturoalvarez/security-device-registry:latest -- validate \
+  --mac 02:42:0a:00:00:01 --ip 10.0.0.10 --dpid 1234 --in-port 5
+```
+
+Ejemplo de salida esperada al listar:
+
+```json
+{
+  "count": 20,
+  "devices": [
+    {
+      "device_id": "meter-01",
+      "mac": "02:42:0a:00:00:01",
+      "ip": "10.0.0.10",
+      "status": "authorized"
+    }
+  ]
+}
+```
+
+El subcomando `validate` ya prepara la integración con Ryu: recibe `mac`, `ip`, `dpid` e `in_port`, comprueba que el dispositivo exista, que su estado sea `authorized`, que la IP coincida y que `dpid`/`in_port` coincidan cuando estén fijados en el registro. Si `dpid` o `in_port` están vacíos, se consideran no anclados todavía y no bloquean la validación.
+
+### 13.2 Operaciones de mantenimiento
 
 ```bash
 # Reiniciar el controlador RYU
