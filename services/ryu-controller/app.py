@@ -129,7 +129,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     dev["status"] = action
                     self.redis.set(f"security:device:{device_id}", json.dumps(dev))
 
-    def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port):
+    def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name=""):
         mac = str(eth.src).lower()
         if mac in self._known_worker_macs():
             return True, None, None
@@ -143,10 +143,12 @@ class DistributedL2Switch(app_manager.RyuApp):
             if device.get("status") not in ["authorized", "learning"]:
                 return False, "MAC_SPOOFING", f"status_{device.get('status')}"
                 
-            if device.get("dpid") and device.get("dpid") != str(dpid):
-                return False, "MAC_SPOOFING", "dpid_mismatch"
-            if device.get("in_port") and device.get("in_port") != str(in_port):
-                return False, "MAC_SPOOFING", "port_mismatch"
+            is_tunnel = in_port_name.startswith("vx") or in_port_name in ["br-sdn", "br0"]
+            if not is_tunnel:
+                if device.get("dpid") and device.get("dpid") != str(dpid):
+                    return False, "MAC_SPOOFING", "dpid_mismatch"
+                if device.get("in_port") and device.get("in_port") != str(in_port):
+                    return False, "MAC_SPOOFING", "port_mismatch"
         
         if ip_pkt:
             src_ip = ip_pkt.src
@@ -373,7 +375,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         arp_pkt = pkt.get_protocol(arp.arp)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        allowed, threat_type, reason = self._evaluate_security_threats(eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port)
+        allowed, threat_type, reason = self._evaluate_security_threats(eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name)
         if not allowed:
             action = "log_only" if SECURITY_LEARNING_MODE else "quarantine"
             
