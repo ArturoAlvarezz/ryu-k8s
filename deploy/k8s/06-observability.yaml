@@ -646,6 +646,18 @@ data:
             "sortOrder": "Descending",
             "dedupStrategy": "none"
           }
+        },
+        {
+          "type": "timeseries",
+          "title": "Eventos de Seguridad (por tipo)",
+          "gridPos": {"x": 0, "y": 52, "w": 18, "h": 8},
+          "targets": [{"expr": "sum by (type) (rate(ryu_security_events_by_type[1m]))", "legendFormat": "{{type}}"}]
+        },
+        {
+          "type": "stat",
+          "title": "Ataques Totales",
+          "gridPos": {"x": 18, "y": 52, "w": 6, "h": 8},
+          "targets": [{"expr": "max(ryu_security_events_total)", "legendFormat": "Eventos detectados"}]
         }
       ]
     }

@@ -21,6 +21,7 @@ from ryu.lib.packet import ether_types
 from ryu.topology import event, switches
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
+SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
 
 
 def _escape_label(value):
@@ -96,27 +97,81 @@ class DistributedL2Switch(app_manager.RyuApp):
         payload = self.redis.get(f"security:device:{device_id}")
         return json.loads(payload) if payload else None
 
-    def _is_security_authorized(self, mac, ip_addr, dpid, in_port, dst_ip=None, udp_dst_port=None):
-        mac = str(mac).lower()
+    def _record_security_event(self, threat_type, mac, ip, dpid, in_port, reason, action):
+        import uuid
+        import time
+        import json
+        event_id = str(uuid.uuid4())
+        timestamp = int(time.time())
+        
+        event_data = {
+            "id": event_id,
+            "type": threat_type,
+            "mac": mac,
+            "ip": ip,
+            "dpid": dpid,
+            "in_port": in_port,
+            "reason": reason,
+            "action": action,
+            "timestamp": timestamp
+        }
+        
+        self.redis.setex(f"security:event:{timestamp}:{event_id}", 86400 * 7, json.dumps(event_data))
+        self.redis.incr("security:events_total")
+        self.redis.incr(f"security:events:{threat_type}")
+        
+        if action in ["quarantine", "suspicious"]:
+            device_id = self.redis.get(f"security:mac_to_device:{mac}")
+            if device_id:
+                payload = self.redis.get(f"security:device:{device_id}")
+                if payload:
+                    dev = json.loads(payload)
+                    dev["status"] = action
+                    self.redis.set(f"security:device:{device_id}", json.dumps(dev))
+
+    def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port):
+        mac = str(eth.src).lower()
         if mac in self._known_worker_macs():
-            return True, "worker_auto_allowed"
+            return True, None, None
 
         device = self._get_security_device_by_mac(mac)
+        
         if not device:
-            return False, "mac_not_registered"
-        if device.get("status") != "authorized":
-            return False, f"status_{device.get('status')}"
-        if device.get("ip") and ip_addr and device.get("ip") != ip_addr:
-            return False, "ip_mismatch"
-        if device.get("dpid") and device.get("dpid") != str(dpid):
-            return False, "dpid_mismatch"
-        if device.get("in_port") and device.get("in_port") != str(in_port):
-            return False, "port_mismatch"
-        if dst_ip and device.get("allowed_dst_ip") and device.get("allowed_dst_ip") != dst_ip:
-            return False, "dst_ip_not_allowed"
-        if udp_dst_port and str(device.get("allowed_udp_port")) != str(udp_dst_port):
-            return False, "udp_port_not_allowed"
-        return True, "authorized"
+            if udp_pkt and udp_pkt.dst_port == 5555:
+                return False, "MAC_SPOOFING", "unregistered_mac_telemetry"
+        else:
+            if device.get("status") not in ["authorized", "learning"]:
+                return False, "MAC_SPOOFING", f"status_{device.get('status')}"
+                
+            if device.get("dpid") and device.get("dpid") != str(dpid):
+                return False, "MAC_SPOOFING", "dpid_mismatch"
+            if device.get("in_port") and device.get("in_port") != str(in_port):
+                return False, "MAC_SPOOFING", "port_mismatch"
+        
+        if ip_pkt:
+            src_ip = ip_pkt.src
+            if not (udp_pkt and udp_pkt.src_port == 68 and udp_pkt.dst_port == 67):
+                if device and device.get("ip") and device.get("ip") != src_ip:
+                    return False, "IP_SPOOFING", "ip_mismatch"
+                
+                owner_id = self.redis.get(f"security:ip_to_device:{src_ip}")
+                if owner_id and device and owner_id != device.get("id"):
+                    return False, "IP_SPOOFING", "ip_in_use_by_other_device"
+                
+                if src_ip == "10.0.0.1":
+                    return False, "IP_SPOOFING", "reserved_ip_used"
+
+        if arp_pkt:
+            if arp_pkt.src_ip == "10.0.0.1":
+                return False, "ARP_POISONING", "unauthorized_gateway_claim"
+                
+            if arp_pkt.src_mac.lower() != mac:
+                return False, "ARP_POISONING", "arp_mac_mismatch"
+                
+            if device and device.get("ip") and arp_pkt.src_ip != device.get("ip"):
+                return False, "ARP_POISONING", "arp_ip_mismatch"
+                
+        return True, None, None
 
     def _drop_guest_packet(self, datapath, in_port, src, eth_type, reason, install_flow=False):
         if install_flow:
@@ -316,10 +371,21 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         udp_pkt = pkt.get_protocol(udp.udp)
         arp_pkt = pkt.get_protocol(arp.arp)
-        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
-            allowed, reason = self._is_security_authorized(src, arp_pkt.src_ip, dpid, in_port, dst_ip=arp_pkt.dst_ip)
-            if not allowed:
-                self._drop_guest_packet(datapath, in_port, src, ether_types.ETH_TYPE_ARP, reason, install_flow=True)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        allowed, threat_type, reason = self._evaluate_security_threats(eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port)
+        if not allowed:
+            action = "log_only" if SECURITY_LEARNING_MODE else "quarantine"
+            
+            src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
+            self.logger.warning("%s_DETECTED: dpid=%s in_port=%s mac=%s ip=%s reason=%s action=%s", 
+                                threat_type, dpid, in_port, src, src_ip, reason, action)
+            
+            self._record_security_event(threat_type, src, src_ip, dpid, in_port, reason, action)
+            
+            if not SECURITY_LEARNING_MODE:
+                eth_type = ether_types.ETH_TYPE_IP if ip_pkt else (ether_types.ETH_TYPE_ARP if arp_pkt else eth.ethertype)
+                self._drop_guest_packet(datapath, in_port, src, eth_type, reason, install_flow=True)
                 return
 
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
@@ -348,19 +414,6 @@ class DistributedL2Switch(app_manager.RyuApp):
             )
             datapath.send_msg(out)
             return
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
-        if ip_pkt and not (udp_pkt and udp_pkt.src_port == 68 and udp_pkt.dst_port == 67):
-            allowed, reason = self._is_security_authorized(
-                src,
-                ip_pkt.src,
-                dpid,
-                in_port,
-                dst_ip=ip_pkt.dst,
-                udp_dst_port=udp_pkt.dst_port if udp_pkt else None,
-            )
-            if not allowed:
-                self._drop_guest_packet(datapath, in_port, src, ether_types.ETH_TYPE_IP, reason)
-                return
 
         if ip_pkt and ip_pkt.dst == "10.0.0.1":
             out_port = ofproto.OFPP_LOCAL
@@ -874,7 +927,20 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _render_prometheus_metrics(self):
         redis_counts = self._redis_metric_counts()
+        security_total = self.redis.get("security:events_total") or 0
+        mac_spoofing = self.redis.get("security:events:MAC_SPOOFING") or 0
+        ip_spoofing = self.redis.get("security:events:IP_SPOOFING") or 0
+        arp_poisoning = self.redis.get("security:events:ARP_POISONING") or 0
+
         lines = [
+            "# HELP ryu_security_events_total Total security events detected.",
+            "# TYPE ryu_security_events_total counter",
+            "ryu_security_events_total %s" % security_total,
+            "# HELP ryu_security_events_by_type Security events by type.",
+            "# TYPE ryu_security_events_by_type counter",
+            'ryu_security_events_by_type{type="MAC_SPOOFING"} %s' % mac_spoofing,
+            'ryu_security_events_by_type{type="IP_SPOOFING"} %s' % ip_spoofing,
+            'ryu_security_events_by_type{type="ARP_POISONING"} %s' % arp_poisoning,
             "# HELP ryu_packet_in_total Total Packet-In messages processed by Ryu.",
             "# TYPE ryu_packet_in_total counter",
         ]
