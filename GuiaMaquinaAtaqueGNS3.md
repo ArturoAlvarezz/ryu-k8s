@@ -3,15 +3,15 @@
 Esta guía explica cómo configurar y conectar un nodo de ataque dentro de la topología GNS3 de nuestro laboratorio SDN. Esta máquina será utilizada para simular amenazas como MAC Spoofing, IP Spoofing y ARP Poisoning y validar la seguridad del controlador Ryu.
 
 ## 1. Requisitos de la Imagen en GNS3
-Para simular el ataque se recomienda utilizar un nodo ligero pero que cuente con Python y acceso a paquetes de red.
-Recomendación: **Docker container "alpine"** o un **Linux Microcore**.
+Para simular el ataque se recomienda utilizar un nodo que cuente con Python y acceso a paquetes de red.
+Recomendación: **Ubuntu Server (QEMU)** o **Ubuntu Desktop (QEMU)**.
 
-1. En GNS3, ve a *Edit -> Preferences -> Docker containers*.
-2. Crea un nuevo template usando la imagen `alpine:latest`.
-3. Dale permisos de red (opcional: asegúrate de asignarle al menos 1 interfaz).
+1. En GNS3, ve a *Edit -> Preferences -> QEMU VMs*.
+2. Crea un nuevo template usando una imagen de Ubuntu (puedes descargar el appliance oficial `.gns3a` desde el marketplace de GNS3 o usar una imagen `.qcow2`).
+3. Dale permisos de red asegurándote de asignarle al menos 1 interfaz.
 
 ## 2. Conexión a la Topología SDN
-1. Arrastra el nuevo nodo Alpine (llamémoslo "Attacker") al canvas de GNS3.
+1. Arrastra el nuevo nodo Ubuntu (llamémoslo "Attacker") al canvas de GNS3.
 2. Conecta su interfaz `eth0` a un puerto de uno de los switches Open vSwitch (OVS) que represente la red de acceso de los Smart Meters (dentro de un nodo K3s).
    - *Nota:* Asegúrate de conectarlo a la misma red puente `br-sdn` si estás usando el host directo, o al switch correspondiente que mapea a la SDN.
 3. Inicia el nodo.
@@ -21,16 +21,16 @@ Abre la consola del nodo "Attacker" e instala las dependencias necesarias. Dado 
 
 ```bash
 # Actualizar repositorios e instalar dependencias
-apk update
-apk add python3 py3-pip tcpdump
-apk add build-base python3-dev libpcap-dev
+apt-get update
+apt-get install -y python3 python3-pip tcpdump
+apt-get install -y build-essential python3-dev libpcap-dev
 
-# Si hay problemas con pip (managed environments), usa venv:
+# Si hay problemas con pip (entornos manejados externamente), usa venv:
 python3 -m venv /opt/attack-env
 source /opt/attack-env/bin/activate
 
 # Instalar Scapy
-pip install scapy
+pip3 install scapy
 ```
 
 ## 4. Obtención de Credenciales Legítimas
