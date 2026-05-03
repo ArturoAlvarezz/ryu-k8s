@@ -669,6 +669,18 @@ data:
           "title": "Paquetes AMI invalidos",
           "gridPos": {"x": 18, "y": 64, "w": 6, "h": 4},
           "targets": [{"expr": "max(meter_hmac_invalid_total)", "legendFormat": "rechazados"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Potencia por Smart Meter",
+          "gridPos": {"x": 0, "y": 68, "w": 18, "h": 8},
+          "targets": [{"expr": "max by (device_id, source_ip) (meter_latest_power_kw)", "legendFormat": "{{device_id}} {{source_ip}}"}]
+        },
+        {
+          "type": "stat",
+          "title": "Smart Meters con telemetria",
+          "gridPos": {"x": 18, "y": 68, "w": 6, "h": 8},
+          "targets": [{"expr": "count(count by (device_id) (meter_latest_info))", "legendFormat": "meters"}]
         }
       ]
     }
