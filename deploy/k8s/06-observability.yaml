@@ -658,6 +658,24 @@ data:
           "title": "Ataques Totales",
           "gridPos": {"x": 18, "y": 52, "w": 6, "h": 8},
           "targets": [{"expr": "max(ryu_security_events_total)", "legendFormat": "Eventos detectados"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Telemetria AMI rechazada por HMAC/replay",
+          "gridPos": {"x": 0, "y": 60, "w": 18, "h": 8},
+          "targets": [{"expr": "max by (reason) (rate(meter_hmac_invalid_by_reason_total[1m]))", "legendFormat": "{{reason}}"}]
+        },
+        {
+          "type": "stat",
+          "title": "Paquetes AMI validos",
+          "gridPos": {"x": 18, "y": 60, "w": 6, "h": 4},
+          "targets": [{"expr": "max(meter_hmac_accepted_total)", "legendFormat": "aceptados"}]
+        },
+        {
+          "type": "stat",
+          "title": "Paquetes AMI invalidos",
+          "gridPos": {"x": 18, "y": 64, "w": 6, "h": 4},
+          "targets": [{"expr": "max(meter_hmac_invalid_total)", "legendFormat": "rechazados"}]
         }
       ]
     }

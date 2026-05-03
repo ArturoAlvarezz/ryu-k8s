@@ -11,6 +11,8 @@ Variables de entorno:
   COLLECTOR_IP     IP del colector (default: 10.0.0.1)
   COLLECTOR_PORT   Puerto UDP destino (default: 5555)
   REPORT_INTERVAL  Segundos entre reportes (default: 5)
+  HMAC_ENABLED     Firma telemetría con HMAC-SHA256 (default: true)
+  HMAC_SECRET      Secreto compartido del medidor
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ import random
 import math
 import uuid
 import logging
-from datetime import datetime, timezone
+import hmac
+import hashlib
+import secrets
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -40,11 +44,26 @@ DEVICE_ID       = os.environ.get("DEVICE_ID") or socket.gethostname()
 COLLECTOR_IP    = os.environ.get("COLLECTOR_IP", "10.0.0.1")
 COLLECTOR_PORT  = int(os.environ.get("COLLECTOR_PORT", 5555))
 REPORT_INTERVAL = float(os.environ.get("REPORT_INTERVAL", 5))
+HMAC_ENABLED    = os.environ.get("HMAC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+HMAC_SECRET     = os.environ.get("HMAC_SECRET", "")
 
 # Parámetros eléctricos base para la simulación (distribución trifásica)
 VOLTAGE_BASE    = 220.0   # Voltios RMS
 CURRENT_BASE    = 15.0    # Amperios base
 POWER_FACTOR    = 0.92    # Factor de potencia típico
+
+
+def canonical_json(payload: dict) -> bytes:
+    """Representación estable usada para firmar y verificar HMAC."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sign_payload(payload: dict) -> str:
+    return hmac.new(
+        HMAC_SECRET.encode("utf-8"),
+        canonical_json(payload),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -82,19 +101,31 @@ class SmartMeter:
         self.energy_kwh  = round(self.energy_kwh, 4)
         self.reading_count += 1
 
-        return {
+        active_power = round(voltage * current * POWER_FACTOR, 2)
+        reactive_power = round((active_power / 1000) * math.tan(math.acos(POWER_FACTOR)), 3)
+
+        reading = {
             "device_id"      : self.device_id,
+            "timestamp"      : int(time.time()),
+            "nonce"          : secrets.token_hex(16),
             "session_id"     : self.session_id,
             "seq"            : self.reading_count,
-            "timestamp"      : datetime.now(timezone.utc).isoformat(),
+            "voltage"        : voltage,
+            "current"        : current,
+            "active_power"   : active_power,
+            "reactive_power" : reactive_power,
             "voltage_v"      : voltage,
             "current_a"      : current,
             "active_power_kw": power_kw,
             "reactive_power_kvar": reactive,
             "power_factor"   : POWER_FACTOR,
             "energy_kwh"     : self.energy_kwh,
+            "energy"         : self.energy_kwh,
             "status"         : "OK",
         }
+        if HMAC_ENABLED:
+            reading["signature"] = sign_payload(reading)
+        return reading
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +187,12 @@ def main():
     log.info("  device_id      : %s", DEVICE_ID)
     log.info("  collector      : %s:%d", COLLECTOR_IP, COLLECTOR_PORT)
     log.info("  interval       : %.1fs", REPORT_INTERVAL)
+    log.info("  hmac_enabled   : %s", HMAC_ENABLED)
     log.info("=" * 60)
+
+    if HMAC_ENABLED and not HMAC_SECRET:
+        log.error("HMAC_ENABLED=true pero HMAC_SECRET no está configurado.")
+        sys.exit(1)
 
     # Esperar IP de la red SDN. En GNS3 es normal que el puerto tarde en
     # estabilizarse si se recrean enlaces; no salimos para evitar que el nodo

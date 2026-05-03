@@ -18,6 +18,11 @@
     button { cursor: pointer; border-color: #22718a; background: linear-gradient(135deg, #104d63, #14314a); font-weight: 700; }
     button:hover { filter: brightness(1.15); }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 18px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .stat { padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: #0b1721; }
+    .stat strong { display: block; font-size: 1.8rem; letter-spacing: -0.04em; }
+    .events { margin-top: 14px; display: grid; gap: 8px; }
+    .event { border-left: 3px solid var(--red); padding: 8px 10px; background: rgba(255,85,112,.08); border-radius: 8px; color: var(--muted); }
     .card { padding: 18px; position: relative; overflow: hidden; }
     .card::before { content: ""; position: absolute; inset: 0 0 auto; height: 4px; background: var(--cyan); }
     .card.authorized::before, .card.worker::before { background: var(--green); }
@@ -49,6 +54,11 @@
       <button onclick="loadGuests()">Actualizar</button>
       <span id="summary">Cargando...</span>
       <span id="error" class="error"></span>
+    </section>
+    <section class="card">
+      <h2>Integridad de telemetría AMI</h2>
+      <div id="telemetrySecurity" class="stats"><div class="empty">Cargando métricas HMAC...</div></div>
+      <div id="telemetryEvents" class="events"></div>
     </section>
     <section>
       <h2>Workers de la arquitectura</h2>
@@ -139,6 +149,27 @@
       </article>`;
     }
 
+    function renderTelemetrySecurity(data) {
+      const reasons = Object.entries(data.by_reason || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([reason, count]) => `<div class="stat"><span>${reason}</span><strong>${count}</strong></div>`)
+        .join('');
+      document.getElementById('telemetrySecurity').innerHTML = `
+        <div class="stat"><span>Paquetes validos</span><strong>${data.accepted_total || 0}</strong></div>
+        <div class="stat"><span>Paquetes rechazados</span><strong>${data.invalid_total || 0}</strong></div>
+        ${reasons || '<div class="stat"><span>Sin rechazos HMAC/replay</span><strong>0</strong></div>'}
+      `;
+      const events = (data.recent_events || []).map(event => `
+        <div class="event">${event.time || ''} · ${event.reason || 'unknown'} · device=${event.device_id || 'unknown'} · source=${event.source_ip || '-'}</div>
+      `).join('');
+      document.getElementById('telemetryEvents').innerHTML = events || '<p>Sin eventos recientes de firma inválida o replay.</p>';
+    }
+
+    async function loadTelemetrySecurity() {
+      const data = await api('/api/telemetry-security');
+      renderTelemetrySecurity(data);
+    }
+
     async function loadGuests() {
       document.getElementById('error').textContent = '';
       try {
@@ -147,6 +178,7 @@
         document.getElementById('workers').innerHTML = data.workers.length ? data.workers.map(renderGuest).join('') : '<div class="empty card">No hay workers observados.</div>';
         document.getElementById('guests').innerHTML = data.guests.length ? data.guests.map(renderGuest).join('') : '<div class="empty card">No hay guests observados todavia.</div>';
         document.getElementById('offline').innerHTML = data.offline_registered.length ? data.offline_registered.map(renderOffline).join('') : '<div class="empty card">Sin dispositivos offline registrados.</div>';
+        await loadTelemetrySecurity();
       } catch (err) {
         document.getElementById('error').textContent = err.message;
       }

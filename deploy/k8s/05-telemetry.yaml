@@ -22,6 +22,10 @@ spec:
     metadata:
       labels:
         app: meter-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -47,6 +51,18 @@ spec:
           value: "5000"
         - name: MAX_READINGS_PER_DEVICE
           value: "100"
+        - name: HMAC_ENABLED
+          value: "true"
+        - name: HMAC_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: meter-hmac-secret
+              key: hmac-secret
+              optional: true
+        - name: MAX_TIME_SKEW_SECONDS
+          value: "60"
+        - name: NONCE_TTL_SECONDS
+          value: "300"
         volumeMounts:
         - name: code-volume
           mountPath: /app/app.py

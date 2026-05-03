@@ -14,6 +14,11 @@ Variables de entorno:
   UDP_PORT             Puerto de escucha UDP (default: 5555)
   FLASK_PORT           Puerto HTTP (default: 5000)
   MAX_READINGS_PER_DEVICE  Historial máximo por medidor en Redis (default: 100)
+  HMAC_ENABLED         Requiere firma HMAC-SHA256 (default: true)
+  HMAC_SECRET          Secreto global de fallback para medidores
+  HMAC_DEVICE_SECRETS  JSON opcional {"device_id":"secret"}
+  MAX_TIME_SKEW_SECONDS Ventana permitida de timestamp Unix (default: 60)
+  NONCE_TTL_SECONDS    TTL de nonces aceptados para evitar replay (default: 300)
 """
 
 from __future__ import annotations
@@ -25,10 +30,12 @@ import time
 import socket
 import threading
 import logging
+import hmac
+import hashlib
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from redis.sentinel import Sentinel
 import redis as redis_lib
 
@@ -47,10 +54,26 @@ SENTINEL_PORT         = int(os.environ.get("REDIS_SENTINEL_PORT", 26379))
 UDP_PORT              = int(os.environ.get("UDP_PORT", 5555))
 FLASK_PORT            = int(os.environ.get("FLASK_PORT", 5000))
 MAX_READINGS          = int(os.environ.get("MAX_READINGS_PER_DEVICE", 100))
+HMAC_ENABLED          = os.environ.get("HMAC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+HMAC_SECRET           = os.environ.get("HMAC_SECRET", "")
+MAX_TIME_SKEW_SECONDS = int(os.environ.get("MAX_TIME_SKEW_SECONDS", 60))
+NONCE_TTL_SECONDS     = int(os.environ.get("NONCE_TTL_SECONDS", 300))
+
+try:
+    HMAC_DEVICE_SECRETS = json.loads(os.environ.get("HMAC_DEVICE_SECRETS", "{}"))
+except json.JSONDecodeError:
+    HMAC_DEVICE_SECRETS = {}
+    log.warning("HMAC_DEVICE_SECRETS inválido; se ignora configuración por dispositivo.")
 
 # Cache en memoria (fallback si Redis no está disponible)
 _memory_cache: dict[str, list] = defaultdict(list)
+_memory_nonces: dict[str, float] = {}
+_memory_hmac_counters: dict[str, int] = defaultdict(int)
 _cache_lock = threading.Lock()
+
+
+def canonical_json(payload: dict) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 # ---------------------------------------------------------------------------
 # Redis
@@ -109,6 +132,196 @@ def redis_is_ready() -> bool:
         return True
     except Exception:
         return False
+
+
+def get_device_secrets(device_id: str) -> list[str]:
+    secrets = []
+    if device_id in HMAC_DEVICE_SECRETS:
+        configured = HMAC_DEVICE_SECRETS[device_id]
+        if isinstance(configured, list):
+            secrets.extend(str(secret) for secret in configured if secret)
+        elif configured:
+            secrets.append(str(configured))
+
+    redis = get_redis()
+    if redis is not None:
+        try:
+            data = redis.hgetall(f"meter:secret:{device_id}") or {}
+            for field in ("active", "next"):
+                if data.get(field):
+                    secrets.append(data[field])
+        except Exception as e:
+            log.warning("No se pudo leer secreto HMAC para device=%s desde Redis: %s", device_id, e)
+
+    if HMAC_SECRET:
+        secrets.append(HMAC_SECRET)
+    return secrets
+
+
+def _record_invalid_event(reason: str, device_id: str, source_ip: str):
+    with _cache_lock:
+        _memory_hmac_counters["invalid_total"] += 1
+        _memory_hmac_counters[f"invalid_total:{reason}"] += 1
+
+    redis = get_redis()
+    if redis is not None:
+        try:
+            pipe = redis.pipeline()
+            pipe.incr(f"meter:hmac:invalid_total:{reason}")
+            pipe.incr("meter:hmac:invalid_total")
+            pipe.lpush("meter:hmac:events", json.dumps({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+                "device_id": device_id,
+                "source_ip": source_ip,
+            }))
+            pipe.ltrim("meter:hmac:events", 0, 199)
+            pipe.execute()
+        except Exception as e:
+            log.warning("No se pudo registrar evento HMAC inválido: %s", e)
+
+    log.warning("Telemetría rechazada reason=%s device=%s source=%s", reason, device_id or "unknown", source_ip)
+
+
+def record_hmac_accept(device_id: str):
+    with _cache_lock:
+        _memory_hmac_counters["accepted_total"] += 1
+
+    redis = get_redis()
+    if redis is not None:
+        try:
+            pipe = redis.pipeline()
+            pipe.incr("meter:hmac:accepted_total")
+            pipe.hset("meter:hmac:last_valid", device_id, datetime.now(timezone.utc).isoformat())
+            pipe.execute()
+        except Exception as e:
+            log.warning("No se pudo registrar telemetría HMAC válida: %s", e)
+
+
+def _claim_nonce(device_id: str, nonce: str) -> bool:
+    redis = get_redis()
+    nonce_key = f"meter:nonce:{device_id}:{nonce}"
+    if redis is not None:
+        try:
+            return bool(redis.set(nonce_key, "1", ex=NONCE_TTL_SECONDS, nx=True))
+        except Exception as e:
+            log.warning("No se pudo validar nonce en Redis; usando memoria local: %s", e)
+
+    now = time.time()
+    with _cache_lock:
+        expired = [key for key, expires_at in _memory_nonces.items() if expires_at <= now]
+        for key in expired:
+            _memory_nonces.pop(key, None)
+        if nonce_key in _memory_nonces:
+            return False
+        _memory_nonces[nonce_key] = now + NONCE_TTL_SECONDS
+    return True
+
+
+def verify_hmac(reading: dict, source_ip: str) -> bool:
+    if not HMAC_ENABLED:
+        return True
+
+    device_id = str(reading.get("device_id", ""))
+    signature = reading.get("signature")
+    nonce = str(reading.get("nonce", ""))
+    if not device_id or not signature or not nonce:
+        _record_invalid_event("missing_hmac_fields", device_id, source_ip)
+        return False
+
+    try:
+        timestamp = int(reading.get("timestamp"))
+    except (TypeError, ValueError):
+        _record_invalid_event("invalid_timestamp", device_id, source_ip)
+        return False
+
+    if abs(int(time.time()) - timestamp) > MAX_TIME_SKEW_SECONDS:
+        _record_invalid_event("timestamp_skew", device_id, source_ip)
+        return False
+
+    secrets = get_device_secrets(device_id)
+    if not secrets:
+        _record_invalid_event("missing_secret", device_id, source_ip)
+        return False
+
+    signed_payload = dict(reading)
+    signed_payload.pop("signature", None)
+    canonical_payload = canonical_json(signed_payload)
+    valid_signature = False
+    for secret in secrets:
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            canonical_payload,
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(str(signature), expected):
+            valid_signature = True
+            break
+    if not valid_signature:
+        _record_invalid_event("invalid_signature", device_id, source_ip)
+        return False
+
+    if not _claim_nonce(device_id, nonce):
+        _record_invalid_event("replay_nonce", device_id, source_ip)
+        return False
+
+    record_hmac_accept(device_id)
+    return True
+
+
+def hmac_counter_snapshot() -> dict:
+    counters = defaultdict(int)
+    with _cache_lock:
+        counters.update(_memory_hmac_counters)
+
+    redis = get_redis()
+    if redis is not None:
+        try:
+            counters["accepted_total"] = int(redis.get("meter:hmac:accepted_total") or 0)
+            counters["invalid_total"] = int(redis.get("meter:hmac:invalid_total") or 0)
+            for key in redis.scan_iter("meter:hmac:invalid_total:*"):
+                reason = key.rsplit(":", 1)[-1]
+                counters[f"invalid_total:{reason}"] = int(redis.get(key) or 0)
+        except Exception as e:
+            log.warning("No se pudieron leer contadores HMAC desde Redis: %s", e)
+    return dict(counters)
+
+
+def prometheus_metrics() -> str:
+    counters = hmac_counter_snapshot()
+    lines = [
+        "# HELP meter_hmac_accepted_total Telemetry packets accepted after HMAC validation",
+        "# TYPE meter_hmac_accepted_total counter",
+        f"meter_hmac_accepted_total {counters.get('accepted_total', 0)}",
+        "# HELP meter_hmac_invalid_total Telemetry packets rejected by HMAC/replay validation",
+        "# TYPE meter_hmac_invalid_total counter",
+        f"meter_hmac_invalid_total {counters.get('invalid_total', 0)}",
+        "# HELP meter_hmac_invalid_by_reason_total Telemetry packets rejected by reason",
+        "# TYPE meter_hmac_invalid_by_reason_total counter",
+    ]
+    for key, value in sorted(counters.items()):
+        if not key.startswith("invalid_total:"):
+            continue
+        reason = key.split(":", 1)[1].replace('\\', '\\\\').replace('"', '\\"')
+        lines.append(f'meter_hmac_invalid_by_reason_total{{reason="{reason}"}} {value}')
+    return "\n".join(lines) + "\n"
+
+
+def normalize_reading(reading: dict) -> dict:
+    normalized = dict(reading)
+    if "voltage_v" not in normalized and "voltage" in normalized:
+        normalized["voltage_v"] = normalized["voltage"]
+    if "current_a" not in normalized and "current" in normalized:
+        normalized["current_a"] = normalized["current"]
+    if "active_power_kw" not in normalized and "active_power" in normalized:
+        normalized["active_power_kw"] = round(float(normalized["active_power"]) / 1000, 3)
+    if "reactive_power_kvar" not in normalized and "reactive_power" in normalized:
+        normalized["reactive_power_kvar"] = round(float(normalized["reactive_power"]) / 1000, 3)
+    if "energy_kwh" not in normalized and "energy" in normalized:
+        normalized["energy_kwh"] = normalized["energy"]
+    if isinstance(normalized.get("timestamp"), (int, float)):
+        normalized["timestamp"] = datetime.fromtimestamp(int(normalized["timestamp"]), timezone.utc).isoformat()
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +431,9 @@ def udp_listener():
         try:
             data, addr = sock.recvfrom(4096)
             reading = json.loads(data.decode("utf-8"))
+            if not verify_hmac(reading, addr[0]):
+                continue
+            reading = normalize_reading(reading)
             device_id = reading.get("device_id", "unknown")
             seq = reading.get("seq", "?")
             log.info("UDP [%s] seq=%s device=%s P=%.3fkW",
@@ -335,6 +551,11 @@ def health():
         "redis": "connected" if redis_ok else "disconnected (memory mode)",
         "udp_port": UDP_PORT,
     })
+
+
+@app.route("/metrics")
+def metrics():
+    return Response(prometheus_metrics(), mimetype="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.route("/api/ready")

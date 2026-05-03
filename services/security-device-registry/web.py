@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 
 from flask import Flask, jsonify, render_template, request
 
@@ -178,6 +179,24 @@ def with_security_state(r, guest):
     return guest
 
 
+def telemetry_security_state(r):
+    counters = {
+        "accepted_total": int(r.get("meter:hmac:accepted_total") or 0),
+        "invalid_total": int(r.get("meter:hmac:invalid_total") or 0),
+        "by_reason": {},
+        "recent_events": [],
+    }
+    for key in r.scan_iter("meter:hmac:invalid_total:*"):
+        reason = key.rsplit(":", 1)[-1]
+        counters["by_reason"][reason] = int(r.get(key) or 0)
+    for raw in r.lrange("meter:hmac:events", 0, 9):
+        try:
+            counters["recent_events"].append(json.loads(raw))
+        except Exception:
+            continue
+    return counters
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -209,6 +228,15 @@ def api_guests():
         return jsonify({"guests": guests, "workers": workers, "offline_registered": offline_registered})
     except Exception as exc:
         log.exception("No se pudo listar guests")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/telemetry-security")
+def api_telemetry_security():
+    try:
+        return jsonify(telemetry_security_state(redis_client()))
+    except Exception as exc:
+        log.exception("No se pudo leer seguridad de telemetría")
         return jsonify({"error": str(exc)}), 500
 
 
