@@ -94,7 +94,7 @@ metadata:
   labels:
     app: prometheus
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: prometheus
@@ -104,15 +104,8 @@ spec:
         app: prometheus
     spec:
       serviceAccountName: prometheus
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchLabels:
-                  app: prometheus
-              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        kubernetes.io/hostname: master
       containers:
       - name: prometheus
         image: prom/prometheus:v2.53.3
