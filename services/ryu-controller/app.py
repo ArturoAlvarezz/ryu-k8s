@@ -186,6 +186,21 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.add_flow(datapath, 100, match, [], None)
         self.logger.warning("Security drop installed: dpid=%s in_port=%s mac=%s eth_type=%s reason=%s", datapath.id, in_port, src, eth_type or "any", reason)
 
+    def _delete_guest_drop_flow(self, datapath, in_port, src):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch(in_port=in_port, eth_src=src)
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            priority=100,
+            match=match,
+        )
+        datapath.send_msg(mod)
+        self.logger.info("Security drop removed: dpid=%s in_port=%s mac=%s", datapath.id, in_port, src)
+
     def _sync_quarantine_flows(self):
         while True:
             try:
@@ -195,8 +210,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                         continue
                     import json
                     device = json.loads(payload)
-                    if device.get("status") not in ("quarantine", "quarantined", "blocked"):
-                        continue
                     try:
                         dpid = int(device.get("dpid"))
                         in_port = int(device.get("in_port"))
@@ -206,7 +219,10 @@ class DistributedL2Switch(app_manager.RyuApp):
                     mac = str(device.get("mac", "")).lower()
                     if not datapath or not mac:
                         continue
-                    self._drop_guest_packet(datapath, in_port, mac, reason="status_%s" % device.get("status"), install_flow=True)
+                    if device.get("status") in ("quarantine", "quarantined", "blocked"):
+                        self._drop_guest_packet(datapath, in_port, mac, reason="status_%s" % device.get("status"), install_flow=True)
+                    elif device.get("status") in ("authorized", "learning"):
+                        self._delete_guest_drop_flow(datapath, in_port, mac)
             except Exception as e:
                 self.logger.warning("Error syncing quarantine flows: %s", e)
             hub.sleep(5)
