@@ -45,7 +45,7 @@ COLLECTOR_IP    = os.environ.get("COLLECTOR_IP", "10.0.0.1")
 COLLECTOR_PORT  = int(os.environ.get("COLLECTOR_PORT", 5555))
 REPORT_INTERVAL = float(os.environ.get("REPORT_INTERVAL", 5))
 HMAC_ENABLED    = os.environ.get("HMAC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-HMAC_SECRET     = os.environ.get("HMAC_SECRET", "")
+HMAC_SECRET     = os.environ.get("HMAC_SECRET", "sdn-ami-hmac-lab-secret-v1")
 
 # Parámetros eléctricos base para la simulación (distribución trifásica)
 VOLTAGE_BASE    = 220.0   # Voltios RMS

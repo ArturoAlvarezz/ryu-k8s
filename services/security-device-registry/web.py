@@ -72,6 +72,14 @@ def observed_guests(r):
     worker_macs = registry.known_worker_macs(r)
     guests = {}
 
+    def guest_is_online(mac):
+        if r.exists(f"health:{mac}"):
+            return True
+        for key in r.scan_iter(f"active_mac:*:{mac}"):
+            if r.exists(key):
+                return True
+        return False
+
     for mac, ip in guest_ips.items():
         mac = registry.normalize_mac(mac)
         if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
@@ -84,7 +92,7 @@ def observed_guests(r):
             "in_port": "",
             "port_name": "",
             "node_name": "",
-            "online": bool(r.exists(f"health:{mac}")),
+            "online": guest_is_online(mac),
             "kind": "guest",
         }
 
@@ -133,7 +141,7 @@ def observed_guests(r):
                     "mac": mac,
                     "ip": dhcp_ip,
                     "name": guest_names.get(mac, ""),
-                    "online": bool(r.exists(f"health:{mac}")),
+                    "online": guest_is_online(mac),
                 },
             )
             raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else str(dpid)
@@ -143,6 +151,7 @@ def observed_guests(r):
                     "in_port": str(in_port),
                     "port_name": port_name,
                     "node_name": node_names.get(raw_dpid, ""),
+                    "online": guest_is_online(mac),
                     "kind": "guest",
                 }
             )

@@ -18,7 +18,7 @@
         "adapters": 1,
         "image": "arturoalvarez/sdn-smart-meter:latest",
         "start_command": "",
-        "environment": "COLLECTOR_IP=10.0.0.1\nCOLLECTOR_PORT=5555\nREPORT_INTERVAL=5\nDEVICE_ID=\nHMAC_ENABLED=true\nHMAC_SECRET=",
+        "environment": "COLLECTOR_IP=10.0.0.1\nCOLLECTOR_PORT=5555\nREPORT_INTERVAL=5\nDEVICE_ID=\nHMAC_ENABLED=true\nHMAC_SECRET=sdn-ami-hmac-lab-secret-v1",
         "console_type": "telnet"
     }
 }

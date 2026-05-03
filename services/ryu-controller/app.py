@@ -742,10 +742,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                 # Reemplazar VXLAN si existe para el mismo par — STP bloqueado tiene prioridad visual
                 edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
                 edges.append(edge)
-            else:
-                # FIX: siempre agregar STP forwarding aunque ya haya VXLAN para el mismo par.
-                # br0 (capa física) y VXLAN (overlay SDN) son capas distintas; deben coexistir en el grafo.
-                edges.append(edge)
 
         nodes.extend(guests.values())
         return nodes, edges, guests, ip_to_dpid
