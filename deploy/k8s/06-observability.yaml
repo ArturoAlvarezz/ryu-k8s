@@ -730,6 +730,8 @@ spec:
           value: "true"
         - name: GF_AUTH_ANONYMOUS_ORG_ROLE
           value: Viewer
+        - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+          value: /var/lib/grafana/dashboards/sdn-observability.json
         volumeMounts:
         - name: provisioning
           mountPath: /etc/grafana/provisioning/datasources/datasource.yml
