@@ -62,6 +62,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.metrics_started_at = datetime.utcnow().timestamp()
         self.monitor_thread = hub.spawn(self._monitor_datapaths)
         self.metrics_thread = hub.spawn(self._start_metrics_server)
+        self.security_sync_thread = hub.spawn(self._sync_quarantine_flows)
 
     def start(self):
         super(DistributedL2Switch, self).start()
@@ -175,12 +176,40 @@ class DistributedL2Switch(app_manager.RyuApp):
                 
         return True, None, None
 
-    def _drop_guest_packet(self, datapath, in_port, src, eth_type, reason, install_flow=False):
+    def _drop_guest_packet(self, datapath, in_port, src, eth_type=None, reason="security", install_flow=False):
         if install_flow:
             parser = datapath.ofproto_parser
-            match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_type=eth_type)
-            self.add_flow(datapath, 20, match, [], None)
-        self.logger.warning("Security drop installed: dpid=%s in_port=%s mac=%s eth_type=%s reason=%s", datapath.id, in_port, src, eth_type, reason)
+            match_fields = {"in_port": in_port, "eth_src": src}
+            if eth_type is not None:
+                match_fields["eth_type"] = eth_type
+            match = parser.OFPMatch(**match_fields)
+            self.add_flow(datapath, 100, match, [], None)
+        self.logger.warning("Security drop installed: dpid=%s in_port=%s mac=%s eth_type=%s reason=%s", datapath.id, in_port, src, eth_type or "any", reason)
+
+    def _sync_quarantine_flows(self):
+        while True:
+            try:
+                for device_id in self.redis.smembers("security:devices") or []:
+                    payload = self.redis.get(f"security:device:{device_id}")
+                    if not payload:
+                        continue
+                    import json
+                    device = json.loads(payload)
+                    if device.get("status") not in ("quarantine", "quarantined", "blocked"):
+                        continue
+                    try:
+                        dpid = int(device.get("dpid"))
+                        in_port = int(device.get("in_port"))
+                    except (TypeError, ValueError):
+                        continue
+                    datapath = self.datapaths.get(dpid)
+                    mac = str(device.get("mac", "")).lower()
+                    if not datapath or not mac:
+                        continue
+                    self._drop_guest_packet(datapath, in_port, mac, reason="status_%s" % device.get("status"), install_flow=True)
+            except Exception as e:
+                self.logger.warning("Error syncing quarantine flows: %s", e)
+            hub.sleep(5)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -391,8 +420,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             self._record_security_event(threat_type, src, src_ip, dpid, in_port, reason, action)
             
             if not SECURITY_LEARNING_MODE:
-                eth_type = ether_types.ETH_TYPE_IP if ip_pkt else (ether_types.ETH_TYPE_ARP if arp_pkt else eth.ethertype)
-                self._drop_guest_packet(datapath, in_port, src, eth_type, reason, install_flow=True)
+                self._drop_guest_packet(datapath, in_port, src, reason=reason, install_flow=True)
                 return
 
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
@@ -692,6 +720,27 @@ class DistributedL2Switch(app_manager.RyuApp):
             if not location_dpid or not port_no or location_dpid not in dpids:
                 continue
             self._add_guest_node_edge(guests, edges, mac, location_dpid, port_no, guest_ips)
+
+        import json
+        for device_id in self.redis.smembers("security:devices") or []:
+            payload = self.redis.get(f"security:device:{device_id}")
+            if not payload:
+                continue
+            try:
+                device = json.loads(payload)
+            except Exception:
+                continue
+            mac = str(device.get("mac", "")).lower()
+            dpid = str(device.get("dpid", ""))
+            port_no = str(device.get("in_port", ""))
+            if not mac or mac in worker_macs or mac in guests:
+                continue
+            if not dpid or not port_no or dpid not in dpids:
+                continue
+            if self._add_guest_node_edge(guests, edges, mac, dpid, port_no, {mac: device.get("ip", "") or "DHCP pendiente"}):
+                if device.get("status") not in ("authorized", "learning"):
+                    guests[mac]["color"] = "#f97316"
+                    guests[mac]["mainstat"] = device.get("status", "restricted")
 
         for edge in vxlan_edges.values():
             if edge["details"]:
