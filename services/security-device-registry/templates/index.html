@@ -55,11 +55,6 @@
       <span id="summary">Cargando...</span>
       <span id="error" class="error"></span>
     </section>
-    <section class="card">
-      <h2>Integridad de telemetría AMI</h2>
-      <div id="telemetrySecurity" class="stats"><div class="empty">Cargando métricas HMAC...</div></div>
-      <div id="telemetryEvents" class="events"></div>
-    </section>
     <section>
       <h2>Workers de la arquitectura</h2>
       <div id="workers" class="grid"></div>
@@ -149,27 +144,6 @@
       </article>`;
     }
 
-    function renderTelemetrySecurity(data) {
-      const reasons = Object.entries(data.by_reason || {})
-        .sort((a, b) => b[1] - a[1])
-        .map(([reason, count]) => `<div class="stat"><span>${reason}</span><strong>${count}</strong></div>`)
-        .join('');
-      document.getElementById('telemetrySecurity').innerHTML = `
-        <div class="stat"><span>Paquetes validos</span><strong>${data.accepted_total || 0}</strong></div>
-        <div class="stat"><span>Paquetes rechazados</span><strong>${data.invalid_total || 0}</strong></div>
-        ${reasons || '<div class="stat"><span>Sin rechazos HMAC/replay</span><strong>0</strong></div>'}
-      `;
-      const events = (data.recent_events || []).map(event => `
-        <div class="event">${event.time || ''} · ${event.reason || 'unknown'} · device=${event.device_id || 'unknown'} · source=${event.source_ip || '-'}</div>
-      `).join('');
-      document.getElementById('telemetryEvents').innerHTML = events || '<p>Sin eventos recientes de firma inválida o replay.</p>';
-    }
-
-    async function loadTelemetrySecurity() {
-      const data = await api('/api/telemetry-security');
-      renderTelemetrySecurity(data);
-    }
-
     async function loadGuests() {
       document.getElementById('error').textContent = '';
       try {
@@ -178,7 +152,6 @@
         document.getElementById('workers').innerHTML = data.workers.length ? data.workers.map(renderGuest).join('') : '<div class="empty card">No hay workers observados.</div>';
         document.getElementById('guests').innerHTML = data.guests.length ? data.guests.map(renderGuest).join('') : '<div class="empty card">No hay guests observados todavia.</div>';
         document.getElementById('offline').innerHTML = data.offline_registered.length ? data.offline_registered.map(renderOffline).join('') : '<div class="empty card">Sin dispositivos offline registrados.</div>';
-        await loadTelemetrySecurity();
       } catch (err) {
         document.getElementById('error').textContent = err.message;
       }

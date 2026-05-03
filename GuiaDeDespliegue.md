@@ -835,6 +835,41 @@ kubectl rollout restart deploy/prometheus deploy/grafana -n sdn-controller
 
 > Redis usa `emptyDir` en este entorno GNS3. Es intencional: evita que PVC/PV `local-path` queden pegados a nodos antiguos cuando se recrean Workers. Si ves `redis-0 Pending` con `didn't match PersistentVolume's node affinity`, recrea Redis y limpia PVCs antiguos.
 
+### 13.2.1 Reset completo de la base de datos para pruebas
+
+Usa este procedimiento cuando quieras limpiar completamente el estado runtime del laboratorio antes de repetir pruebas. Borra topología, aprendizaje MAC, leases DHCP, telemetría Smart Meter, estado HMAC, registro de seguridad, contadores y eventos. No borra manifiestos ni imágenes.
+
+```bash
+# Confirmar el master Redis actual vía Sentinel
+kubectl exec redis-0 -c sentinel -n sdn-controller -- \
+  redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+
+# Reset completo de Redis. ⚠️ Borra todo el estado runtime del laboratorio.
+kubectl exec redis-0 -c redis -n sdn-controller -- redis-cli FLUSHALL
+
+# Reiniciar servicios que reconstruyen estado desde OVS, DHCP, guests y Redis
+kubectl rollout restart statefulset/redis -n sdn-controller
+kubectl rollout restart daemonset/ryu -n sdn-controller
+kubectl rollout restart daemonset/sdn-dhcp-server -n sdn-controller
+kubectl rollout restart daemonset/meter-collector -n sdn-controller
+kubectl rollout restart deployment/ryu-topology -n sdn-controller
+kubectl rollout restart deployment/security-device-registry -n sdn-controller
+kubectl rollout restart deployment/prometheus -n sdn-controller
+kubectl rollout restart deployment/grafana -n sdn-controller
+
+# Esperar convergencia
+kubectl rollout status statefulset/redis -n sdn-controller
+kubectl rollout status daemonset/ryu -n sdn-controller
+kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller
+kubectl rollout status daemonset/meter-collector -n sdn-controller
+kubectl rollout status deployment/ryu-topology -n sdn-controller
+kubectl rollout status deployment/security-device-registry -n sdn-controller
+kubectl rollout status deployment/prometheus -n sdn-controller
+kubectl rollout status deployment/grafana -n sdn-controller
+```
+
+Después del reset, reinicia o recrea los guests Smart Meter en GNS3 para que pidan DHCP otra vez y vuelvan a poblar Redis. Si usas el registro de seguridad, vuelve a autorizar los guests desde `http://192.168.122.100:8082` antes de ejecutar pruebas de cuarentena/bloqueo.
+
 ### 13.3 Reinicio de todos los pods por servicio
 
 Usa estos comandos para reiniciar cada servicio completo en el namespace `sdn-controller`.
