@@ -39,6 +39,13 @@ spec:
           value: "26379"
         - name: REDIS_SENTINEL_MASTER
           value: "mymaster"
+        volumeMounts:
+        - name: security-registry-code
+          mountPath: /app/web.py
+          subPath: web.py
+        - name: security-registry-code
+          mountPath: /app/templates/index.html
+          subPath: index.html
         livenessProbe:
           httpGet:
             path: /api/health
@@ -51,6 +58,10 @@ spec:
             port: 5000
           initialDelaySeconds: 5
           periodSeconds: 10
+      volumes:
+      - name: security-registry-code
+        configMap:
+          name: security-registry-code
 ---
 apiVersion: v1
 kind: Service
