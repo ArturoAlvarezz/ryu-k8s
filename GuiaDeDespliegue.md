@@ -835,6 +835,50 @@ kubectl rollout restart deploy/prometheus deploy/grafana -n sdn-controller
 
 > Redis usa `emptyDir` en este entorno GNS3. Es intencional: evita que PVC/PV `local-path` queden pegados a nodos antiguos cuando se recrean Workers. Si ves `redis-0 Pending` con `didn't match PersistentVolume's node affinity`, recrea Redis y limpia PVCs antiguos.
 
+### 13.3 Reinicio de todos los pods por servicio
+
+Usa estos comandos para reiniciar cada servicio completo en el namespace `sdn-controller`.
+
+```bash
+# Controlador SDN y red de datos
+kubectl rollout restart daemonset/ovs-sdn-initializer -n sdn-controller
+kubectl rollout restart daemonset/ryu -n sdn-controller
+kubectl rollout restart daemonset/sdn-dhcp-server -n sdn-controller
+kubectl rollout restart daemonset/ryu-topology -n sdn-controller
+
+# Telemetría y observabilidad
+kubectl rollout restart daemonset/meter-collector -n sdn-controller
+kubectl rollout restart daemonset/node-exporter -n sdn-controller
+kubectl rollout restart daemonset/promtail -n sdn-controller
+kubectl rollout restart deployment/prometheus -n sdn-controller
+kubectl rollout restart deployment/grafana -n sdn-controller
+kubectl rollout restart deployment/loki -n sdn-controller
+
+# Base de datos y servicios web
+kubectl rollout restart statefulset/redis -n sdn-controller
+kubectl rollout restart deployment/security-device-registry -n sdn-controller
+
+# Validar estado tras reinicios
+kubectl get pods -n sdn-controller -o wide
+```
+
+Si quieres esperar a que cada servicio termine su rollout antes de pasar al siguiente, usa:
+
+```bash
+kubectl rollout status daemonset/ovs-sdn-initializer -n sdn-controller
+kubectl rollout status daemonset/ryu -n sdn-controller
+kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller
+kubectl rollout status daemonset/ryu-topology -n sdn-controller
+kubectl rollout status daemonset/meter-collector -n sdn-controller
+kubectl rollout status daemonset/node-exporter -n sdn-controller
+kubectl rollout status daemonset/promtail -n sdn-controller
+kubectl rollout status deployment/prometheus -n sdn-controller
+kubectl rollout status deployment/grafana -n sdn-controller
+kubectl rollout status deployment/loki -n sdn-controller
+kubectl rollout status statefulset/redis -n sdn-controller
+kubectl rollout status deployment/security-device-registry -n sdn-controller
+```
+
 ---
 
 ## 14. Verificación y monitoreo

@@ -245,7 +245,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             port_no = p.port_no
             name = p.name.decode('utf-8')
             self.redis.hset(f"switch_ports:{dpid}", port_no, name)
-            self.logger.info("Port registered: DPID %s, Port %s, Name %s", dpid, port_no, name)
+            self.logger.debug("Port registered: DPID %s, Port %s, Name %s", dpid, port_no, name)
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     def port_status_handler(self, ev):
@@ -268,7 +268,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         timeouts = {}
         if priority > 0:
-            timeouts = {"idle_timeout": 5, "hard_timeout": 15}
+            timeouts = {"idle_timeout": 120, "hard_timeout": 0}
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                              actions)]
@@ -339,7 +339,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         dpid = datapath.id
         self.packet_in_total[dpid] = self.packet_in_total.get(dpid, 0) + 1
 
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+        self.logger.debug("packet in %s %s %s %s", dpid, src, dst, in_port)
 
         # Externalize State: Learn the mac address to avoid FLOOD next time.
         # Store the mac_to_port table for this dpid in Redis natively (Hash)
@@ -347,7 +347,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.redis.hset(mac_table_key, src, in_port)
         
         # MAC Ageing (Auto Limpieza): mantener el mapa sensible a cambios STP.
-        self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=8)
+        self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=180)
 
         # ─── TOPOLOGY INFERENCE ───────────────────────────────────────────────
         # Si el src MAC pertenece a otro switch conocido y llega por un puerto
@@ -365,11 +365,16 @@ class DistributedL2Switch(app_manager.RyuApp):
         # Retrieve destination port from Redis
         out_port_str = self.redis.hget(mac_table_key, dst)
         
+        known_worker_macs = self._known_worker_macs()
         ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
         in_port_name = str(ports.get(str(in_port), ""))
-        if src in (self.redis.hgetall("topology:guest_ips") or {}):
-            if in_port != ofproto.OFPP_LOCAL and not in_port_name.startswith("vx") and in_port_name != "br-sdn":
-                self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
+        if (
+            src not in known_worker_macs and
+            in_port != ofproto.OFPP_LOCAL and
+            not in_port_name.startswith("vx") and
+            in_port_name != "br-sdn"
+        ):
+            self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
 
         udp_pkt = pkt.get_protocol(udp.udp)
         arp_pkt = pkt.get_protocol(arp.arp)
@@ -484,7 +489,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     datapath.send_msg(parser.OFPPortStatsRequest(datapath, 0, datapath.ofproto.OFPP_ANY))
                 except Exception as e:
                     self.logger.warning("Error requesting OpenFlow stats: %s", e)
-            hub.sleep(5)
+            hub.sleep(30)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
@@ -563,6 +568,44 @@ class DistributedL2Switch(app_manager.RyuApp):
                 blocked_links.add(_edge_link_id(local_dpid, remote_dpid))
         return blocked_links
 
+    def _is_recent_guest(self, mac, dpid):
+        return (
+            self.redis.exists(f"active_mac:{dpid}:{mac}") or
+            self.redis.exists(f"health:{mac}") or
+            mac in (self.redis.hgetall("topology:guest_ips") or {})
+        )
+
+    def _add_guest_node_edge(self, guests, edges, mac, dpid, port_no, guest_ips):
+        ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        port_name = ports.get(str(port_no), "")
+        if str(port_name).startswith("vx") or str(port_no) == "4294967294" or str(port_name) == "br-sdn":
+            return False
+        if not self._is_recent_guest(mac, dpid):
+            return False
+
+        guests[mac] = {
+            "id": mac,
+            "title": mac,
+            "subtitle": guest_ips.get(mac, "DHCP pendiente"),
+            "mainstat": "guest",
+            "color": "#ff00ee",
+            "icon": "desktop",
+            "type": "guest",
+            "switch": dpid,
+        }
+        edges.append({
+            "id": "guest:%s:%s" % (dpid, mac),
+            "source": dpid,
+            "target": mac,
+            "mainstat": "local",
+            "secondarystat": "guest",
+            "color": "#ff00ee",
+            "strokeDasharray": "3 3",
+            "thickness": "1",
+            "type": "guest",
+        })
+        return True
+
     def _build_topology_snapshot(self):
         dpids = self._get_alive_switch_dpids()
         node_names = self.redis.hgetall("topology:node_names") or {}
@@ -624,11 +667,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
-
-                if mac in guest_ips and not (
-                    self.redis.exists(f"active_mac:{dpid}:{mac}") or
-                    self.redis.exists(f"health:{mac}")
-                ):
+                if mac in guest_locations:
                     continue
 
                 port_name = ports.get(str(port_no), "")
@@ -643,66 +682,16 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if not is_local_guest_port and not is_non_tunnel_port:
                     continue
 
-                ip = guest_ips.get(mac, "sin IP")
-                if mac not in guests:
-                    guests[mac] = {
-                        "id": mac,
-                        "title": mac,
-                        "subtitle": ip,
-                        "mainstat": "guest",
-                        "color": "#ff00ee",
-                        "icon": "desktop",
-                        "type": "guest",
-                        "switch": dpid,
-                    }
-                edges.append({
-                    "id": "guest:%s:%s" % (dpid, mac),
-                    "source": dpid,
-                    "target": mac,
-                    "mainstat": "local",
-                    "secondarystat": "guest",
-                    "color": "#ff00ee",
-                    "strokeDasharray": "3 3",
-                    "thickness": "1",
-                    "type": "guest",
-                })
-
+        worker_macs = self._known_worker_macs()
         for mac, location in guest_locations.items():
-            if mac in guests or mac not in guest_ips:
+            if mac in worker_macs:
+                continue
+            if mac in guests:
                 continue
             location_dpid, _, port_no = str(location).partition(":")
             if not location_dpid or not port_no or location_dpid not in dpids:
                 continue
-            if not (
-                self.redis.exists(f"active_mac:{location_dpid}:{mac}") or
-                self.redis.exists(f"health:{mac}")
-            ):
-                continue
-            ports = self.redis.hgetall(f"switch_ports:{location_dpid}") or {}
-            port_name = ports.get(str(port_no), "")
-            if str(port_name).startswith("vx") or str(port_no) == "4294967294" or str(port_name) == "br-sdn":
-                continue
-            guests[mac] = {
-                "id": mac,
-                "title": mac,
-                "subtitle": guest_ips.get(mac, "sin IP"),
-                "mainstat": "guest",
-                "color": "#ff00ee",
-                "icon": "desktop",
-                "type": "guest",
-                "switch": location_dpid,
-            }
-            edges.append({
-                "id": "guest:%s:%s" % (location_dpid, mac),
-                "source": location_dpid,
-                "target": mac,
-                "mainstat": "local",
-                "secondarystat": "guest",
-                "color": "#ff00ee",
-                "strokeDasharray": "3 3",
-                "thickness": "1",
-                "type": "guest",
-            })
+            self._add_guest_node_edge(guests, edges, mac, location_dpid, port_no, guest_ips)
 
         for edge in vxlan_edges.values():
             if edge["details"]:
