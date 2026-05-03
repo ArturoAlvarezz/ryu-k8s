@@ -289,6 +289,7 @@ def hmac_counter_snapshot() -> dict:
 
 def prometheus_metrics() -> str:
     counters = hmac_counter_snapshot()
+    meters = get_all_latest()
     lines = [
         "# HELP meter_hmac_accepted_total Telemetry packets accepted after HMAC validation",
         "# TYPE meter_hmac_accepted_total counter",
@@ -304,6 +305,22 @@ def prometheus_metrics() -> str:
             continue
         reason = key.split(":", 1)[1].replace('\\', '\\\\').replace('"', '\\"')
         lines.append(f'meter_hmac_invalid_by_reason_total{{reason="{reason}"}} {value}')
+    lines.extend([
+        "# HELP meter_latest_power_kw Latest active power reported by a smart meter",
+        "# TYPE meter_latest_power_kw gauge",
+        "# HELP meter_latest_energy_kwh Latest cumulative energy reported by a smart meter",
+        "# TYPE meter_latest_energy_kwh gauge",
+        "# HELP meter_latest_info Latest smart meter metadata; value is always 1",
+        "# TYPE meter_latest_info gauge",
+    ])
+    for meter in meters:
+        device_id = str(meter.get("device_id", "unknown")).replace('\\', '\\\\').replace('"', '\\"')
+        source_ip = str(meter.get("source_ip", "")).replace('\\', '\\\\').replace('"', '\\"')
+        power = float(meter.get("active_power_kw", 0) or 0)
+        energy = float(meter.get("energy_kwh", 0) or 0)
+        lines.append(f'meter_latest_power_kw{{device_id="{device_id}",source_ip="{source_ip}"}} {power}')
+        lines.append(f'meter_latest_energy_kwh{{device_id="{device_id}",source_ip="{source_ip}"}} {energy}')
+        lines.append(f'meter_latest_info{{device_id="{device_id}",source_ip="{source_ip}"}} 1')
     return "\n".join(lines) + "\n"
 
 
@@ -362,6 +379,7 @@ def store_reading(reading: dict):
             "reactive_power_kvar": str(reading.get("reactive_power_kvar", 0)),
             "power_factor"       : str(reading.get("power_factor", 0)),
             "energy_kwh"         : str(reading.get("energy_kwh", 0)),
+            "source_ip"          : str(reading.get("source_ip", "")),
             "seq"                : str(reading.get("seq", 0)),
         })
         pipe.expire(key_latest, 300)  # TTL 5 min (medidor vivo si actualizó recientemente)
@@ -434,6 +452,7 @@ def udp_listener():
             if not verify_hmac(reading, addr[0]):
                 continue
             reading = normalize_reading(reading)
+            reading["source_ip"] = addr[0]
             device_id = reading.get("device_id", "unknown")
             seq = reading.get("seq", "?")
             log.info("UDP [%s] seq=%s device=%s P=%.3fkW",

@@ -72,6 +72,16 @@ def observed_guests(r):
     worker_macs = registry.known_worker_macs(r)
     guests = {}
 
+    def live_meter_ips():
+        ips = set()
+        for key in r.scan_iter("meter:latest:*"):
+            source_ip = (r.hget(key, "source_ip") or "").strip()
+            if source_ip:
+                ips.add(source_ip)
+        return ips
+
+    meter_ips = live_meter_ips()
+
     def guest_is_online(mac):
         if r.exists(f"health:{mac}"):
             return True
@@ -155,6 +165,23 @@ def observed_guests(r):
                     "kind": "guest",
                 }
             )
+
+    for device in registry.list_devices(r):
+        mac = registry.normalize_mac(device.get("mac", ""))
+        if not mac or mac in guests or mac in worker_macs:
+            continue
+        ip = device.get("ip", "")
+        guests[mac] = {
+            "mac": mac,
+            "ip": ip,
+            "name": device.get("device_id", ""),
+            "dpid": device.get("dpid", ""),
+            "in_port": device.get("in_port", ""),
+            "port_name": "registered",
+            "node_name": "",
+            "online": ip in meter_ips or guest_is_online(mac),
+            "kind": "guest",
+        }
 
     return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
 
