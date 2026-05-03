@@ -134,6 +134,24 @@ def redis_is_ready() -> bool:
         return False
 
 
+def telemetry_source_allowed(source_ip: str) -> bool:
+    redis = get_redis()
+    if redis is None or not source_ip:
+        return True
+    try:
+        device_id = redis.get(f"security:ip_to_device:{source_ip}")
+        if not device_id:
+            return True
+        payload = redis.get(f"security:device:{device_id}")
+        if not payload:
+            return True
+        device = json.loads(payload)
+        return device.get("status") in ("authorized", "learning")
+    except Exception as e:
+        log.warning("No se pudo validar estado de seguridad para source=%s: %s", source_ip, e)
+        return True
+
+
 def get_device_secrets(device_id: str) -> list[str]:
     secrets = []
     if device_id in HMAC_DEVICE_SECRETS:
@@ -403,6 +421,8 @@ def get_all_latest() -> list[dict]:
             for dev in devices:
                 data = redis.hgetall(f"meter:latest:{dev}")
                 if data:
+                    if not telemetry_source_allowed(data.get("source_ip", "")):
+                        continue
                     result.append(data)
                 else:
                     redis.srem("meter:devices", dev)
@@ -450,6 +470,9 @@ def udp_listener():
             data, addr = sock.recvfrom(4096)
             reading = json.loads(data.decode("utf-8"))
             if not verify_hmac(reading, addr[0]):
+                continue
+            if not telemetry_source_allowed(addr[0]):
+                _record_invalid_event("security_status_blocked", str(reading.get("device_id", "")), addr[0])
                 continue
             reading = normalize_reading(reading)
             reading["source_ip"] = addr[0]
@@ -528,6 +551,8 @@ def api_stats():
                 latest = redis.hgetall(f"meter:latest:{dev}") or {}
                 if not latest:
                     redis.srem("meter:devices", dev)
+                    continue
+                if not telemetry_source_allowed(latest.get("source_ip", "")):
                     continue
             except Exception as e:
                 log.warning("Error leyendo última lectura de %s desde Redis: %s", dev, e)

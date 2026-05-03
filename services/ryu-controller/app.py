@@ -737,10 +737,28 @@ class DistributedL2Switch(app_manager.RyuApp):
                 continue
             if not dpid or not port_no or dpid not in dpids:
                 continue
-            if self._add_guest_node_edge(guests, edges, mac, dpid, port_no, {mac: device.get("ip", "") or "DHCP pendiente"}):
-                if device.get("status") not in ("authorized", "learning"):
-                    guests[mac]["color"] = "#f97316"
-                    guests[mac]["mainstat"] = device.get("status", "restricted")
+            status = device.get("status", "authorized")
+            guests[mac] = {
+                "id": mac,
+                "title": mac,
+                "subtitle": device.get("ip", "") or "DHCP pendiente",
+                "mainstat": "guest" if status in ("authorized", "learning") else status,
+                "color": "#ff00ee" if status in ("authorized", "learning") else "#f97316",
+                "icon": "desktop",
+                "type": "guest",
+                "switch": dpid,
+            }
+            edges.append({
+                "id": "guest:%s:%s" % (dpid, mac),
+                "source": dpid,
+                "target": mac,
+                "mainstat": "local",
+                "secondarystat": "guest",
+                "color": "#ff00ee" if status in ("authorized", "learning") else "#f97316",
+                "strokeDasharray": "3 3",
+                "thickness": "1",
+                "type": "guest",
+            })
 
         for edge in vxlan_edges.values():
             if edge["details"]:
