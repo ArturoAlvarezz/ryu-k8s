@@ -697,15 +697,8 @@ spec:
       labels:
         app: grafana
     spec:
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchLabels:
-                  app: grafana
-              topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        kubernetes.io/hostname: master
       containers:
       - name: grafana
         image: grafana/grafana:11.1.4

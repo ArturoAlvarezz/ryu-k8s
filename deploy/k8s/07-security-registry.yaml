@@ -8,7 +8,7 @@ metadata:
   labels:
     app: security-device-registry
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: security-device-registry
@@ -17,13 +17,8 @@ spec:
       labels:
         app: security-device-registry
     spec:
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchLabels:
-                app: security-device-registry
-            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        kubernetes.io/hostname: master
       containers:
       - name: registry-web
         image: arturoalvarez/security-device-registry:latest
