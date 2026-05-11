@@ -98,6 +98,21 @@ class DistributedL2Switch(app_manager.RyuApp):
         payload = self.redis.get(f"security:device:{device_id}")
         return json.loads(payload) if payload else None
 
+    def _refresh_security_device_location(self, device, dpid, in_port):
+        current_dpid = str(dpid)
+        current_port = str(in_port)
+        if device.get("dpid") == current_dpid and device.get("in_port") == current_port:
+            return
+
+        import json
+        device["dpid"] = current_dpid
+        device["in_port"] = current_port
+        self.redis.set(f"security:device:{device['device_id']}", json.dumps(device, sort_keys=True))
+        self.logger.info(
+            "Security device location refreshed: device=%s mac=%s dpid=%s in_port=%s",
+            device.get("device_id"), device.get("mac"), current_dpid, current_port,
+        )
+
     def _record_security_event(self, threat_type, mac, ip, dpid, in_port, reason, action):
         import uuid
         import time
@@ -136,6 +151,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             return True, None, None
 
         device = self._get_security_device_by_mac(mac)
+        is_dhcp_request = bool(udp_pkt and udp_pkt.src_port == 68 and udp_pkt.dst_port == 67)
+        observed_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
         
         if not device:
             if udp_pkt and udp_pkt.dst_port == 5555:
@@ -145,15 +162,22 @@ class DistributedL2Switch(app_manager.RyuApp):
                 return False, "MAC_SPOOFING", f"status_{device.get('status')}"
                 
             is_tunnel = in_port_name.startswith("vx") or in_port_name in ["br-sdn", "br0"]
+            is_local_guest_port = str(in_port_name).startswith("ens") and str(in_port) != "4294967294"
             if not is_tunnel:
-                if device.get("dpid") and device.get("dpid") != str(dpid):
-                    return False, "MAC_SPOOFING", "dpid_mismatch"
-                if device.get("in_port") and device.get("in_port") != str(in_port):
-                    return False, "MAC_SPOOFING", "port_mismatch"
+                dpid_mismatch = device.get("dpid") and device.get("dpid") != str(dpid)
+                port_mismatch = device.get("in_port") and device.get("in_port") != str(in_port)
+                if dpid_mismatch or port_mismatch:
+                    ip_matches = observed_ip in ("", "0.0.0.0", device.get("ip", ""))
+                    if is_local_guest_port and (is_dhcp_request or ip_matches):
+                        self._refresh_security_device_location(device, dpid, in_port)
+                    elif dpid_mismatch:
+                        return False, "MAC_SPOOFING", "dpid_mismatch"
+                    else:
+                        return False, "MAC_SPOOFING", "port_mismatch"
         
         if ip_pkt:
             src_ip = ip_pkt.src
-            if not (udp_pkt and udp_pkt.src_port == 68 and udp_pkt.dst_port == 67):
+            if not is_dhcp_request:
                 if device and device.get("ip") and device.get("ip") != src_ip:
                     return False, "IP_SPOOFING", "ip_mismatch"
                 
