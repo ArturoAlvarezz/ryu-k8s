@@ -7,13 +7,13 @@
 
 ## Índice
 
-### Parte I — Nodo Maestro
+### Parte I — Plano de control HA
 
-1. [Requisitos del Maestro](#1-requisitos-del-maestro)
+1. [Requisitos del plano de control HA](#1-requisitos-del-plano-de-control-ha)
 2. [Actualizar sistema e instalar utilidades](#2-actualizar-sistema-e-instalar-utilidades)
 3. [Instalación de Docker](#3-instalación-de-docker)
-4. [Configuración de red del Maestro (IP fija)](#4-configuración-de-red-del-maestro-ip-fija)
-5. [Instalación de K3s Servidor](#5-instalación-de-k3s-servidor)
+4. [Configuración de red del primer servidor](#4-configuración-de-red-del-primer-servidor-ip-fija)
+5. [Instalación de K3s HA](#5-instalación-de-k3s-ha)
 
 ### Parte II — Workers (Golden Image)
 
@@ -32,29 +32,32 @@
 
 ---
 
-# Parte I — Nodo Maestro
+# Parte I — Plano de control HA
 
-> ℹ️ **El Maestro se configura manualmente** — tiene IP fija y no es un clon. Ejecuta todos estos pasos directamente en su consola antes de arrancar ningún Worker.
+> ℹ️ **El cluster debe desplegarse en modo HA** — usa 3 nodos K3s `server` con embedded etcd y un VIP estable para el API Server. El primer servidor conserva la IP fija `192.168.122.100`, pero `kubectl` y los workers deben apuntar al VIP `192.168.122.10`.
 
 ---
 
-## 1. Requisitos del Maestro
+## 1. Requisitos del plano de control HA
 
 | Recurso            | Mínimo                        |
 | ------------------ | ----------------------------- |
-| RAM                | 2 GB                          |
-| CPU                | 2 hilos                       |
+| RAM                | 2 GB por server               |
+| CPU                | 2 hilos por server            |
 | Almacenamiento     | 20 GB                         |
 | Adaptadores de red | 6 (1 gestión + 5 puertos OVS) |
 
-**Arquitectura de red del Maestro:**
+**Arquitectura de red del primer servidor:**
 
-- `br0` → Bridge de gestión/fabric con **IP fija `192.168.122.100`**.
+- `br0` → Bridge de gestión/fabric con **IP fija `192.168.122.100`** en el primer server.
+- `192.168.122.10` → VIP del API Server K3s HA, anunciado por `kube-vip` sobre `br0`.
 - `ens3` → Puerto del bridge `br0`, conectado al Cloud `virbr0` en GNS3.
 - `ens4`–`ens6` → Puertos del bridge `br0` para extender la red `192.168.122.0/24` hacia Workers y permitir DHCP en cadena.
 - `ens7`–`ens8` / `Ethernet4`–`Ethernet5` → Puertos reservados para Guests SDN, fuera de `br0`; el `ovs-sdn-initializer` los agrega a `br-sdn`.
 
 > ⚠️ **Importante:** En este modo, K3s debe instalarse con `--flannel-iface=br0`, no con `ens3`. La IP vive en el bridge, por lo que `ens3` no tendrá IPv4 propia.
+
+> ⚠️ **Alta disponibilidad:** no uses `192.168.122.100` como endpoint permanente del cluster. Esa IP pertenece a un nodo. El endpoint estable debe ser `https://192.168.122.10:6443`.
 
 ---
 
@@ -96,7 +99,7 @@ sudo usermod -aG docker $USER
 
 ---
 
-## 4. Configuración de red del Maestro (IP fija)
+## 4. Configuración de red del primer servidor (IP fija)
 
 ### 4.1 Asignar hostname e IP estática
 
@@ -213,20 +216,88 @@ sudo systemctl enable --now k3s-iptables.service
 
 ---
 
-## 5. Instalación de K3s Servidor
+## 5. Instalación de K3s HA
 
-### 5.1 Instalar K3s Servidor y guardar token real
+El despliegue recomendado usa embedded etcd con 3 servidores K3s y un VIP (`192.168.122.10`) para que el API Server siga disponible si cae el nodo `master`.
+
+Topología recomendada:
+
+| Rol | Cantidad | Ejemplo |
+| --- | --- | --- |
+| K3s server / control-plane / etcd | 3 | `master`, `worker-5540b0`, `worker-6a4a6d` |
+| K3s agent | 3 | resto de workers |
+| VIP API Server | 1 | `192.168.122.10` |
+
+Usa siempre un número impar de servidores etcd. Con 3 servidores, el cluster tolera la caída de 1 servidor. Con 5 servidores tolera 2, pero consume más CPU/RAM y complica el laboratorio.
+
+Variables estándar usadas en esta guía:
 
 ```bash
-curl -sfL https://get.k3s.io | \
-  INSTALL_K3S_EXEC="--node-ip=192.168.122.100 --advertise-address=192.168.122.100 --bind-address=192.168.122.100 --flannel-iface=br0" \
-  sh -
+export K3S_API_ENDPOINT=192.168.122.10
+export K3S_FIRST_SERVER_IP=192.168.122.100
+```
 
-# Guarda este token: se usará en el script de Auto-Join de los Workers
+`K3S_API_ENDPOINT` debe ser una IP libre en `br0`. No debe pertenecer permanentemente a ningún nodo.
+
+### 5.1 Instalar el primer servidor con cluster-init
+
+```bash
+git clone https://github.com/ArturoAlvarezz/ryu-k8s.git ~/ryu-k8s
+cd ~/ryu-k8s
+
+sudo K3S_CLUSTER_INIT=true \
+  K3S_API_ENDPOINT=192.168.122.10 \
+  K3S_NODE_IP=192.168.122.100 \
+  ./tools/gns3/k3s-server-ha-install.sh
+
+# Guarda este token: se usará en servidores adicionales y agents.
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-### 5.2 Configurar kubectl
+### 5.2 Configurar kube-vip para el VIP del API Server
+
+Ejecuta este bloque en cada nodo que actúe como K3s `server`:
+
+```bash
+export VIP=192.168.122.10
+export INTERFACE=br0
+export KVVERSION=v0.8.7
+
+sudo mkdir -p /var/lib/rancher/k3s/server/manifests
+sudo ctr image pull ghcr.io/kube-vip/kube-vip:${KVVERSION}
+sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vip manifest pod \
+  --interface ${INTERFACE} \
+  --address ${VIP} \
+  --controlplane \
+  --services \
+  --arp \
+  --leaderElection \
+  | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+```
+
+`kube-vip` anuncia `192.168.122.10` en la red L2 de `br0`. Si el server que posee el VIP cae, otro server toma el VIP mediante leader election.
+
+### 5.3 Unir dos servidores adicionales
+
+En dos nodos elegidos como control-plane adicionales, ejecuta:
+
+```bash
+cd ~/ryu-k8s
+sudo K3S_NODE_TOKEN='<token-real>' \
+  K3S_API_ENDPOINT=192.168.122.10 \
+  K3S_FIRST_SERVER_IP=192.168.122.100 \
+  ./tools/gns3/k3s-server-ha-install.sh
+```
+
+Cuando termines debe haber 3 nodos con rol `control-plane`:
+
+```bash
+kubectl get nodes -o wide
+```
+
+Después de que cada server adicional se una al cluster, instala `kube-vip` en ese nodo con el mismo bloque de la sección 5.2.
+
+### 5.4 Configurar kubectl
 
 ```bash
 # Configurar kubectl para el usuario actual
@@ -237,9 +308,9 @@ echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.bashrc
 export KUBECONFIG=$HOME/.kube/config
 source ~/.bashrc
 
-# Confirmar que kubectl apunta al API Server del Maestro
+# Confirmar que kubectl apunta al VIP HA del API Server
 grep 'server:' ~/.kube/config
-# Debe mostrar: server: https://192.168.122.100:6443
+# Debe mostrar: server: https://192.168.122.10:6443
 
 # Persistir kubeconfig automáticamente en cada reinicio
 sudo bash -c 'cat > /etc/systemd/system/k3s-kubeconfig.service << EOF
@@ -259,11 +330,33 @@ EOF'
 sudo systemctl daemon-reload
 sudo systemctl enable --now k3s-kubeconfig.service
 
-# Verificar que el Maestro está activo
+# Verificar que el plano de control HA está activo
 kubectl get nodes -o wide
 ```
 
-> Si `kubectl get nodes` devuelve `connection refused`, primero revisa `sudo systemctl status k3s` y `journalctl -u k3s -n 80`. En esta guía, ese error normalmente significa que el API Server está reiniciándose o que K3s fue instalado apuntando a la interfaz equivocada. En este modo debe decir `--flannel-iface=br0`.
+> Si `kubectl get nodes` devuelve `connection refused`, primero revisa `sudo systemctl status k3s`, `journalctl -u k3s -n 80` y que `kube-vip` esté anunciando `192.168.122.10`. En este modo K3s debe decir `--flannel-iface=br0` y `--tls-san=192.168.122.10`.
+
+### 5.5 Distribuir componentes base de kube-system
+
+Después de crear los 3 servers, distribuye componentes base para que no queden todos en el primer nodo:
+
+```bash
+kubectl -n kube-system scale deployment/coredns --replicas=2
+kubectl -n kube-system rollout restart deployment/coredns deployment/metrics-server deployment/traefik
+kubectl -n kube-system get pods -o wide
+```
+
+`local-path-provisioner` puede seguir con una réplica en este laboratorio porque Redis, Prometheus y Loki usan `emptyDir`. Si más adelante introduces PVCs persistentes, debes rediseñar almacenamiento antes de exigir HA real de datos.
+
+### 5.6 Comportamiento esperado de administración HA
+
+Los manifiestos del proyecto no deben fijar servicios de administración al hostname `master`:
+
+- `ryu-topology` corre con 2 réplicas y anti-affinity.
+- `grafana` corre con 2 réplicas y anti-affinity.
+- `prometheus` y `loki` son movibles y mantienen 1 réplica porque usan `emptyDir`; Kubernetes puede recrearlos en otro nodo, pero sus datos locales se reinician.
+
+Para HA real de métricas/logs en producción se necesitaría Thanos/Mimir/Loki distributed o almacenamiento replicado. En este laboratorio, el objetivo es que la administración, `kubectl` y los DaemonSets críticos sigan operativos cuando cae un server.
 
 ---
 
@@ -429,97 +522,25 @@ sudo systemctl daemon-reload
 
 ---
 
-## 10. Instalación de K3s Agent (Auto-Join)
+## 10. Instalación de K3s Agent (Auto-Join HA)
 
 Ejecuta esta sección en la **VM base del Worker**, antes del sellado de la Golden Image. Así cada clon que arrastres en GNS3 ya tendrá el servicio habilitado y se unirá automáticamente al cluster al arrancar, sin entrar a la consola del worker.
 
 ### 10.1 Script de auto-configuración
 
-Al arrancar un clon, este script: obtiene IP DHCP, genera hostname único, espera al Maestro y se une al cluster automáticamente.
+Al arrancar un clon, este script obtiene IP DHCP, genera hostname único, espera al VIP del API Server y se une al cluster automáticamente.
 
-Antes de crear el script, copia el token real desde el Maestro:
+Antes de crear el script, copia el token real desde cualquier servidor K3s:
 
 ```bash
-# Ejecutar en el Maestro
+# Ejecutar en cualquier server K3s
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-Guarda ese valor para el servicio systemd de la VM base del Worker. No lo pegues dentro del script ni lo subas a git; el script debe leerlo desde `K3S_NODE_TOKEN`.
+Guarda ese valor para el servicio systemd de la VM base del Worker. No lo pegues dentro del script ni lo subas a git; el script debe leerlo desde `K3S_NODE_TOKEN`. Los workers deben unirse al VIP `192.168.122.10`, no a la IP del primer server.
 
 ```bash
-sudo tee /usr/local/bin/k3s-autojoin.sh > /dev/null << 'SCRIPT'
-#!/bin/bash
-# k3s-autojoin.sh — Auto-configuración de Worker K3s
-set -euo pipefail
-
-K3S_NODE_TOKEN="${K3S_NODE_TOKEN:-}"
-if [ -z "$K3S_NODE_TOKEN" ] || echo "$K3S_NODE_TOKEN" | grep -q '^<'; then
-  echo "[autojoin] ERROR: Define K3S_NODE_TOKEN con el token real del Maestro."
-  exit 1
-fi
-
-# 1. Esperar IP de gestión en br0 (192.168.122.x)
-echo "[autojoin] Esperando IP de gestión en br0..."
-for i in $(seq 1 90); do
-  MY_IP=$(ip addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
-  [ -n "$MY_IP" ] && break
-  sleep 2
-done
-
-if [ -z "$MY_IP" ]; then
-  echo "[autojoin] ERROR: No se obtuvo IP en br0 tras 180s. Abortando."
-  exit 1
-fi
-echo "[autojoin] IP obtenida: $MY_IP"
-
-# Si el agente ya fue instalado, no reinstalar K3s en cada arranque.
-# La IP debe mantenerse estable por DHCP con dhcp-identifier: mac.
-if systemctl list-unit-files k3s-agent.service 2>/dev/null | grep -q '^k3s-agent.service'; then
-  if grep -R -q -- "--node-ip=$MY_IP" /etc/systemd/system/k3s-agent.service* /etc/rancher/k3s 2>/dev/null; then
-    echo "[autojoin] k3s-agent ya instalado con la IP actual ($MY_IP)."
-    exit 0
-  fi
-  echo "[autojoin] ERROR: k3s-agent ya existe, pero no coincide con la IP actual ($MY_IP)."
-  echo "[autojoin] Esto indica que el DHCP cambió la IP del worker. Corrige dhcp-identifier: mac y reune el nodo al cluster."
-  exit 1
-fi
-
-# 2. Generar hostname único basado en la MAC de br0
-MAC_ADDR=$(ip link show br0 | awk '/ether/ {print $2}' | awk -F: '{print $4$5$6}')
-NEW_HOSTNAME="worker-${MAC_ADDR}"
-hostnamectl set-hostname "$NEW_HOSTNAME"
-sed -i '/127.0.1.1/d' /etc/hosts
-echo "127.0.1.1 $NEW_HOSTNAME" >> /etc/hosts
-echo "[autojoin] Hostname asignado: $NEW_HOSTNAME"
-
-# 3. Esperar que el Maestro sea alcanzable
-echo "[autojoin] Esperando al Maestro en 192.168.122.100..."
-MASTER_REACHABLE=false
-for i in $(seq 1 30); do
-  if ping -c1 -W2 192.168.122.100 > /dev/null 2>&1; then
-    MASTER_REACHABLE=true
-    break
-  fi
-  sleep 3
-done
-
-if [ "$MASTER_REACHABLE" != true ]; then
-  echo "[autojoin] ERROR: El Maestro no responde en 192.168.122.100 tras 90s. Abortando."
-  exit 1
-fi
-
-# 4. Unirse al cluster K3s
-curl -sfL https://get.k3s.io | \
-  INSTALL_K3S_EXEC="--node-ip=$MY_IP --flannel-iface=br0" \
-  K3S_URL=https://192.168.122.100:6443 \
-  K3S_TOKEN="$K3S_NODE_TOKEN" \
-  sh -
-
-# 5. Mantener este servicio habilitado. En futuros arranques valida que la IP DHCP
-#    siga siendo la misma y sale sin reinstalar K3s.
-echo "[autojoin] ¡Nodo $NEW_HOSTNAME unido exitosamente al cluster!"
-SCRIPT
-
+sudo cp ~/ryu-k8s/tools/gns3/k3s-autojoin-ha.sh /usr/local/bin/k3s-autojoin.sh
 sudo chmod +x /usr/local/bin/k3s-autojoin.sh
 ```
 
@@ -547,12 +568,13 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF'
 
-# Crear el drop-in con el token real obtenido desde el Maestro.
+# Crear el drop-in con el token real obtenido desde el cluster HA.
 # Este archivo es local del Worker y no debe versionarse.
 sudo mkdir -p /etc/systemd/system/k3s-autojoin.service.d
 sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service.d/token.conf << EOF
 [Service]
-Environment=K3S_NODE_TOKEN=<TOKEN_REAL_DEL_MAESTRO>
+Environment=K3S_NODE_TOKEN=<TOKEN_REAL_DEL_CLUSTER_HA>
+Environment=K3S_API_ENDPOINT=192.168.122.10
 EOF'
 sudo chmod 600 /etc/systemd/system/k3s-autojoin.service.d/token.conf
 
@@ -564,7 +586,7 @@ No ejecutes todavía `systemctl start k3s-autojoin.service` en la VM base si la 
 
 Si el servicio falla con `ERROR: Define K3S_NODE_TOKEN`, el script está correcto pero falta el drop-in `/etc/systemd/system/k3s-autojoin.service.d/token.conf` o contiene el token equivocado. Corrige el drop-in, ejecuta `sudo systemctl daemon-reload` y reinicia con `sudo systemctl restart k3s-autojoin.service`.
 
-Si reinstalas el Maestro, el `node-token` cambia. En ese caso actualiza `token.conf` en la VM base del Worker y vuelve a exportar la appliance; los clones creados con una Golden Image vieja seguirán usando el token anterior y no podrán unirse.
+Si reconstruyes el cluster HA, el `node-token` cambia. En ese caso actualiza `token.conf` en la VM base del Worker y vuelve a exportar la appliance; los clones creados con una Golden Image vieja seguirán usando el token anterior y no podrán unirse.
 
 ---
 
@@ -620,23 +642,23 @@ sudo poweroff
 
 1. **Arrastra** la Appliance `SDN-Worker` al canvas tantas veces como Workers necesites.
 2. **Conecta los cables** según tu topología. Recuerda que el Cloud `virbr0` debe llegar al Maestro, y desde ahí puedes encadenar Workers usando `ens3`–`ens6` porque forman parte de `br0`. Reserva `ens7`–`ens8` / `Ethernet4`–`Ethernet5` para Smart Meters u otros Guests SDN.
-3. **Inicia primero el Maestro** y espera a que K3s esté activo.
+3. **Inicia primero los 3 nodos control-plane** y espera a que `kubectl get nodes` muestre quorum.
 4. Presiona **"Start All"** para los Workers.
 5. En ~60 segundos cada Worker obtiene IP, genera hostname y se une al cluster.
-6. Verifica en el Maestro:
+6. Verifica desde cualquier nodo con kubeconfig apuntando al VIP:
 
 ```bash
 kubectl get nodes
-# Verás todos los workers con STATUS Ready
+# Verás 3 control-plane y el resto de workers con STATUS Ready
 ```
 
-> ⚠️ **Requisito:** El Maestro debe estar operativo **antes** de iniciar los Workers.
+> ⚠️ **Requisito:** El VIP `192.168.122.10` debe responder en `:6443` antes de iniciar los agents.
 
 ---
 
 ## 13. Despliegue de RYU en K3s
 
-Ejecuta esta sección dentro del nodo `master`, después de confirmar que `kubectl get nodes -o wide` responde correctamente.
+Ejecuta esta sección desde cualquier nodo control-plane o estación con kubeconfig apuntando a `https://192.168.122.10:6443`, después de confirmar que `kubectl get nodes -o wide` responde correctamente.
 
 ```bash
 cd ~
@@ -665,6 +687,8 @@ kubectl create configmap dhcp-code \
 
 kubectl create configmap meter-collector-code \
   --from-file=app.py=services/meter-collector/app.py \
+  --from-file=registry.py=services/meter-collector/registry.py \
+  --from-file=index.html=services/meter-collector/templates/index.html \
   -n sdn-controller \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -675,7 +699,6 @@ kubectl apply -f deploy/k8s/03-sdn-network.yaml
 kubectl apply -f deploy/k8s/04-topology-dashboard.yaml
 kubectl apply -f deploy/k8s/05-telemetry.yaml
 kubectl apply -f deploy/k8s/06-observability.yaml
-kubectl apply -f deploy/k8s/07-security-registry.yaml
 
 # Alternativa equivalente si prefieres aplicar todo el stack junto:
 # kubectl apply -k deploy/k8s/
@@ -696,9 +719,8 @@ Los manifiestos Kubernetes están separados por responsabilidad:
 - `deploy/k8s/02-ryu-controller.yaml`: controlador Ryu/OpenFlow y servicio OpenFlow.
 - `deploy/k8s/03-sdn-network.yaml`: `ovs-sdn-initializer` y DHCP distribuido.
 - `deploy/k8s/04-topology-dashboard.yaml`: dashboard web propio de topología.
-- `deploy/k8s/05-telemetry.yaml`: colector y dashboard Smart Meter.
+- `deploy/k8s/05-telemetry.yaml`: colector, dashboard Smart Meter y consola unificada de seguridad AMI.
 - `deploy/k8s/06-observability.yaml`: Prometheus, Grafana, Loki, Promtail y Node Exporter.
-- `deploy/k8s/07-security-registry.yaml`: consola web/API para administrar autorización de guests AMI.
 
 > El `meter-collector` corre como DaemonSet con `hostNetwork` en todos los nodos y escucha UDP `5555` directamente sobre la SDN. El `ovs-sdn-initializer` asigna `10.0.0.1/24` a `br-sdn` en cada nodo; los Smart Meters deben enviar telemetría a `COLLECTOR_IP=10.0.0.1`.
 >
@@ -708,7 +730,7 @@ Los manifiestos Kubernetes están separados por responsabilidad:
 
 ### 13.1 Registro de dispositivos autorizados SDN AMI
 
-El servicio `security-device-registry` crea la fuente de identidad de los medidores autorizados en Redis. Usa estas claves sin modificar el contrato existente de topología, DHCP ni telemetría:
+La consola unificada `SDN AMI Operations`, servida por `meter-collector` en el puerto `8081`, crea la fuente de identidad de los medidores autorizados en Redis. Usa estas claves sin modificar el contrato existente de topología, DHCP ni telemetría:
 
 - `security:devices`: set de `device_id` registrados.
 - `security:device:{device_id}`: JSON completo del dispositivo.
@@ -733,23 +755,23 @@ Modelo persistido por dispositivo:
 }
 ```
 
-Para construir y publicar la imagen del CLI y la consola web:
+Para construir y publicar la imagen de la consola unificada:
 
 ```bash
-docker build -t arturoalvarez/security-device-registry:latest services/security-device-registry
-docker push arturoalvarez/security-device-registry:latest
+docker build -t arturoalvarez/sdn-meter-collector:latest services/meter-collector
+docker push arturoalvarez/sdn-meter-collector:latest
 ```
 
-Para desplegar la consola web:
+Para actualizar la consola web:
 
 ```bash
-kubectl apply -f deploy/k8s/07-security-registry.yaml
-kubectl get svc security-device-registry -n sdn-controller
+kubectl rollout restart daemonset/meter-collector -n sdn-controller
+kubectl get svc meter-collector -n sdn-controller
 ```
 
-La interfaz queda expuesta por el servicio `security-device-registry` en el puerto `8082`. Desde la red del master, abre `http://192.168.122.100:8082` si el LoadBalancer queda publicado en el master. El Deployment corre con 2 réplicas y anti-affinity por `kubernetes.io/hostname` para mantener los pods en nodos distintos.
+La interfaz queda expuesta por el servicio `meter-collector` en el puerto `8081`. Desde la red del laboratorio, abre `http://192.168.122.10:8081` o la IP LoadBalancer de cualquier nodo disponible. La pestaña `Seguridad AMI` permite autorizar guests detectados por DHCP/Ryu, cambiar su estado o eliminarlos sin ejecutar `kubectl run` manualmente.
 
-La consola muestra los guests observados desde Redis (`topology:guest_ips`, `mac_to_port:*`, `switch_ports:*`, `health:*`) y permite registrar un guest detectado, autorizarlo, bloquearlo, ponerlo en cuarentena o eliminarlo del registro sin ejecutar `kubectl run` manualmente. Las MACs que corresponden a la MAC derivada del DPID de un nodo K3s se muestran como `worker` y se consideran permitidas automáticamente para no bloquear el plano de la arquitectura.
+La consola muestra los guests observados desde Redis (`topology:guest_ips`, `mac_to_port:*`, `switch_ports:*`, `health:*`). Las MACs que corresponden a la MAC derivada del DPID de un nodo K3s se muestran como `worker` y se consideran permitidas automáticamente para no bloquear el plano de la arquitectura.
 
 Si prefieres operar por terminal, puedes registrar tus propios guests autorizados con el CLI. Sustituye MAC, IP, DPID e `in_port` por los valores reales observados en tu laboratorio:
 
@@ -853,7 +875,6 @@ kubectl rollout restart daemonset/ryu -n sdn-controller
 kubectl rollout restart daemonset/sdn-dhcp-server -n sdn-controller
 kubectl rollout restart daemonset/meter-collector -n sdn-controller
 kubectl rollout restart deployment/ryu-topology -n sdn-controller
-kubectl rollout restart deployment/security-device-registry -n sdn-controller
 kubectl rollout restart deployment/prometheus -n sdn-controller
 kubectl rollout restart deployment/grafana -n sdn-controller
 
@@ -863,12 +884,11 @@ kubectl rollout status daemonset/ryu -n sdn-controller
 kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller
 kubectl rollout status daemonset/meter-collector -n sdn-controller
 kubectl rollout status deployment/ryu-topology -n sdn-controller
-kubectl rollout status deployment/security-device-registry -n sdn-controller
 kubectl rollout status deployment/prometheus -n sdn-controller
 kubectl rollout status deployment/grafana -n sdn-controller
 ```
 
-Después del reset, reinicia o recrea los guests Smart Meter en GNS3 para que pidan DHCP otra vez y vuelvan a poblar Redis. Si usas el registro de seguridad, vuelve a autorizar los guests desde `http://192.168.122.100:8082` antes de ejecutar pruebas de cuarentena/bloqueo.
+Después del reset, reinicia o recrea los guests Smart Meter en GNS3 para que pidan DHCP otra vez y vuelvan a poblar Redis. Si usas el registro de seguridad, vuelve a autorizar los guests desde `http://192.168.122.10:8081` antes de ejecutar pruebas de cuarentena/bloqueo.
 
 ### 13.3 Reinicio de todos los pods por servicio
 
@@ -879,7 +899,7 @@ Usa estos comandos para reiniciar cada servicio completo en el namespace `sdn-co
 kubectl rollout restart daemonset/ovs-sdn-initializer -n sdn-controller
 kubectl rollout restart daemonset/ryu -n sdn-controller
 kubectl rollout restart daemonset/sdn-dhcp-server -n sdn-controller
-kubectl rollout restart daemonset/ryu-topology -n sdn-controller
+kubectl rollout restart deployment/ryu-topology -n sdn-controller
 
 # Telemetría y observabilidad
 kubectl rollout restart daemonset/meter-collector -n sdn-controller
@@ -889,9 +909,8 @@ kubectl rollout restart deployment/prometheus -n sdn-controller
 kubectl rollout restart deployment/grafana -n sdn-controller
 kubectl rollout restart deployment/loki -n sdn-controller
 
-# Base de datos y servicios web
+# Base de datos
 kubectl rollout restart statefulset/redis -n sdn-controller
-kubectl rollout restart deployment/security-device-registry -n sdn-controller
 
 # Validar estado tras reinicios
 kubectl get pods -n sdn-controller -o wide
@@ -903,7 +922,7 @@ Si quieres esperar a que cada servicio termine su rollout antes de pasar al sigu
 kubectl rollout status daemonset/ovs-sdn-initializer -n sdn-controller
 kubectl rollout status daemonset/ryu -n sdn-controller
 kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller
-kubectl rollout status daemonset/ryu-topology -n sdn-controller
+kubectl rollout status deployment/ryu-topology -n sdn-controller
 kubectl rollout status daemonset/meter-collector -n sdn-controller
 kubectl rollout status daemonset/node-exporter -n sdn-controller
 kubectl rollout status daemonset/promtail -n sdn-controller
@@ -911,7 +930,6 @@ kubectl rollout status deployment/prometheus -n sdn-controller
 kubectl rollout status deployment/grafana -n sdn-controller
 kubectl rollout status deployment/loki -n sdn-controller
 kubectl rollout status statefulset/redis -n sdn-controller
-kubectl rollout status deployment/security-device-registry -n sdn-controller
 ```
 
 ---
@@ -932,12 +950,49 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" internal="}{.
 
 La salida correcta debe tener la misma IP en `internal=` y `flannel=` para cada nodo. Si un worker muestra valores distintos después de reiniciar GNS3, ese nodo fue registrado con una IP DHCP anterior y debe reunirse al cluster.
 
-### 14.1.1 Recuperar workers con IP de Flannel cruzada
+### 14.1.1 Prueba obligatoria de fallo del master
+
+Esta prueba confirma que el cluster no depende del nodo `master` para operar.
+
+1. Verifica quorum y distribución antes del fallo:
+
+```bash
+kubectl get nodes -o wide
+kubectl -n kube-system get pods -o wide
+kubectl get pods -n sdn-controller -o wide
+```
+
+2. Apaga el nodo `master` en GNS3.
+
+3. Desde otro server control-plane, verifica que el API sigue respondiendo por el VIP:
+
+```bash
+kubectl get nodes
+curl -k https://192.168.122.10:6443/readyz
+```
+
+4. Confirma servicios del proyecto:
+
+```bash
+kubectl get pods -n sdn-controller -o wide
+curl http://192.168.122.10:8080/api/topology
+curl http://192.168.122.10:8081/api/health
+curl http://192.168.122.10:3000/api/health
+```
+
+Resultado esperado:
+
+- `kubectl` sigue funcionando por `192.168.122.10`.
+- Redis Sentinel mantiene o elige master.
+- `ryu`, `sdn-dhcp-server`, `meter-collector` y `ovs-sdn-initializer` siguen activos en los nodos vivos.
+- Los dashboards movibles se recrean en otro nodo si estaban en el nodo caído.
+
+### 14.1.2 Recuperar workers con IP de Flannel cruzada
 
 Si ya existen pods en `Unknown` por un reinicio anterior, primero corrige la Golden Image o cada worker con `dhcp-identifier: mac`. Luego recrea los workers afectados para que K3s y Flannel tomen la IP estable:
 
 ```bash
-# En el Maestro: identificar workers con IP cruzada
+# Desde cualquier nodo con kubectl: identificar workers con IP cruzada
 kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" internal="}{.status.addresses[?(@.type=="InternalIP")].address}{" flannel="}{.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}{"\n"}{end}'
 
 # Por cada worker afectado, borrar el objeto Node.
@@ -955,7 +1010,7 @@ sudo /usr/local/bin/k3s-agent-uninstall.sh
 sudo systemctl enable --now k3s-autojoin.service
 ```
 
-No borres ni cambies el `node-token` del Maestro para esta recuperación. El punto crítico es que el worker vuelva a pedir la misma IP por DHCP en cada arranque.
+No borres ni cambies el `node-token` del cluster para esta recuperación. El punto crítico es que el worker vuelva a pedir la misma IP por DHCP en cada arranque.
 
 ### 14.2 Consultar Redis (Sentinel HA)
 
@@ -1034,10 +1089,10 @@ kubectl logs -f -l app=sdn-dhcp -n sdn-controller
 
 ```bash
 # Acceder al dashboard del colector de telemetría
-curl http://192.168.122.100:8081/api/stats
+curl http://192.168.122.10:8081/api/stats
 
 # Ver lecturas en tiempo real desde el navegador
-# http://192.168.122.100:8081
+# http://192.168.122.10:8081
 ```
 
 ### 14.7 Observabilidad con Prometheus y Grafana
@@ -1058,11 +1113,11 @@ kubectl get svc prometheus grafana -n sdn-controller
 curl http://localhost:8000/metrics | head
 
 # Ver targets descubiertos por Prometheus
-curl http://192.168.122.100:9090/api/v1/targets
+curl http://192.168.122.10:9090/api/v1/targets
 
 # Acceso web
-# Prometheus: http://192.168.122.100:9090
-# Grafana:    http://192.168.122.100:3000
+# Prometheus: http://192.168.122.10:9090
+# Grafana:    http://192.168.122.10:3000
 # Login:      admin / admin
 ```
 
@@ -1113,14 +1168,14 @@ ip -br addr show br-sdn
 # El collector debe escuchar UDP 5555 en hostNetwork
 ss -lunp | grep ':5555'
 
-# Capturar tráfico real desde el Maestro
+# Capturar tráfico real desde un nodo donde corra el guest o collector
 sudo timeout 20 tcpdump -ni br-sdn 'arp or udp port 5555'
 
 # Prueba sintética de telemetría hacia el collector
 printf '{"device_id":"test-meter","timestamp":"2026-04-24T00:00:00Z","voltage_v":220,"current_a":1,"active_power_kw":0.22,"reactive_power_kvar":0.1,"power_factor":0.92,"energy_kwh":0.01,"seq":1}' \
   > /tmp/meter-test.json
 bash -lc 'cat /tmp/meter-test.json > /dev/udp/10.0.0.1/5555'
-curl http://192.168.122.100:8081/api/meters
+curl http://192.168.122.10:8081/api/meters
 
 # Limpiar dato de prueba
 kubectl -n sdn-controller exec redis-0 -c redis -- redis-cli SREM meter:devices test-meter

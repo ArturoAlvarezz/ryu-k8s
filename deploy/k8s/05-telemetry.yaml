@@ -67,6 +67,12 @@ spec:
         - name: code-volume
           mountPath: /app/app.py
           subPath: app.py
+        - name: code-volume
+          mountPath: /app/registry.py
+          subPath: registry.py
+        - name: code-volume
+          mountPath: /app/templates/index.html
+          subPath: index.html
         livenessProbe:
           httpGet:
             path: /api/health

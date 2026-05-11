@@ -104,8 +104,15 @@ spec:
         app: prometheus
     spec:
       serviceAccountName: prometheus
-      nodeSelector:
-        kubernetes.io/hostname: master
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: prometheus
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: prometheus
         image: prom/prometheus:v2.53.3
@@ -286,8 +293,15 @@ spec:
       labels:
         app: loki
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: master
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: loki
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: loki
         image: grafana/loki:2.9.8
@@ -693,7 +707,7 @@ metadata:
   labels:
     app: grafana
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: grafana
@@ -702,8 +716,15 @@ spec:
       labels:
         app: grafana
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: master
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: grafana
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: grafana
         image: grafana/grafana:11.1.4

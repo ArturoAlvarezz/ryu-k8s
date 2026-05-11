@@ -9,7 +9,7 @@ metadata:
   name: ryu-topology
   namespace: sdn-controller
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: ryu-topology
@@ -18,8 +18,15 @@ spec:
       labels:
         app: ryu-topology
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: master
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: ryu-topology
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: dashboard
         image: arturoalvarez/ryu-topology:latest

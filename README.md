@@ -34,7 +34,7 @@ La aplicación dejó de ser un simple script sobre una terminal para convertirse
 
 ## 3. Cómo Desplegar en K3s
 
-Sigue estos pasos dentro del nodo master (o en el nodo donde se encuentre el directorio `/home/artulita/Documents/Memoria/ryu-k8s/`).
+Sigue estos pasos desde cualquier nodo control-plane o estación con kubeconfig apuntando al VIP HA `https://192.168.122.10:6443`. Para reconstruir el cluster completo usa `GuiaDeDespliegue.md`; esa guía es la fuente única para desplegar K3s HA y el stack SDN.
 
 ### Paso A: Compilar la Imagen Docker
 
@@ -90,7 +90,7 @@ kubectl logs -f -l app=ryu -n sdn-controller
 
 ## 4. Registro de Dispositivos Autorizados SDN AMI
 
-El módulo `services/security-device-registry/` mantiene en Redis la identidad de los medidores autorizados. Expone una consola web y un CLI Python para registrar, listar, consultar por MAC/IP, cambiar estado y validar la combinación observada por Ryu (`mac`, `ip`, `dpid`, `in_port`) antes de permitir flujos.
+El registro mantiene en Redis la identidad de los medidores autorizados. La consola web ahora vive dentro de `services/meter-collector/` como parte del dashboard unificado `SDN AMI Operations`; el CLI Python se conserva en `services/security-device-registry/` para registrar, listar, consultar por MAC/IP, cambiar estado y validar la combinación observada por Ryu (`mac`, `ip`, `dpid`, `in_port`) antes de permitir flujos.
 
 Claves Redis usadas:
 
@@ -99,15 +99,15 @@ Claves Redis usadas:
 - `security:mac_to_device:{mac}`
 - `security:ip_to_device:{ip}`
 
-Construye y publica la imagen del CLI:
+Construye y publica la imagen del dashboard unificado:
 
 ```bash
-docker build -t arturoalvarez/security-device-registry:latest services/security-device-registry
-docker push arturoalvarez/security-device-registry:latest
-kubectl apply -f deploy/k8s/07-security-registry.yaml
+docker build -t arturoalvarez/sdn-meter-collector:latest services/meter-collector
+docker push arturoalvarez/sdn-meter-collector:latest
+kubectl apply -f deploy/k8s/05-telemetry.yaml
 ```
 
-El registro queda vacío por defecto. La consola web se expone en el servicio `security-device-registry` puerto `8082`, por ejemplo `http://192.168.122.100:8082`. Desde ahí puedes autorizar guests detectados por DHCP/Ryu, cambiar su estado o eliminarlos sin ejecutar `kubectl` manualmente. Los workers se destacan aparte y se permiten automáticamente porque pertenecen a la arquitectura.
+El registro queda vacío por defecto. La consola web se expone en el servicio `meter-collector` puerto `8081`, por ejemplo `http://192.168.122.10:8081` en el despliegue HA. Desde la pestaña `Seguridad AMI` puedes autorizar guests detectados por DHCP/Ryu, cambiar su estado o eliminarlos sin ejecutar `kubectl` manualmente. Los workers se destacan aparte y se permiten automáticamente porque pertenecen a la arquitectura.
 
 Pruebas rápidas:
 

@@ -14,6 +14,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py /app/
+COPY registry.py /app/
 COPY templates/ /app/templates/
 
 ENV PYTHONUNBUFFERED=1

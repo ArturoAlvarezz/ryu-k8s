@@ -39,6 +39,8 @@ from flask import Flask, Response, jsonify, render_template, request
 from redis.sentinel import Sentinel
 import redis as redis_lib
 
+import registry
+
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
@@ -150,6 +152,177 @@ def telemetry_source_allowed(source_ip: str) -> bool:
     except Exception as e:
         log.warning("No se pudo validar estado de seguridad para source=%s: %s", source_ip, e)
         return True
+
+
+def normalize_dpid(dpid):
+    if not dpid:
+        return ""
+    value = str(dpid)
+    if value.isdigit():
+        return value
+    try:
+        return str(int(value, 16))
+    except Exception:
+        return value
+
+
+def looks_like_worker_name(name):
+    value = (name or "").lower()
+    return value.startswith("worker") or value.startswith("master") or value.startswith("maestro")
+
+
+def observed_workers(redis):
+    node_names = redis.hgetall("topology:node_names")
+    node_ips = redis.hgetall("topology:node_ips")
+    workers = []
+    for raw_dpid, name in sorted(node_names.items(), key=lambda item: item[1]):
+        if not looks_like_worker_name(name):
+            continue
+        mac = ""
+        if len(raw_dpid) >= 12:
+            raw_mac = raw_dpid[-12:]
+            mac = ":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower()
+        workers.append({
+            "mac": mac,
+            "ip": node_ips.get(raw_dpid, ""),
+            "name": name,
+            "dpid": normalize_dpid(raw_dpid),
+            "in_port": "",
+            "port_name": "node",
+            "node_name": name,
+            "online": bool(redis.exists(f"switch:alive:{raw_dpid}")),
+            "kind": "worker",
+        })
+    return workers
+
+
+def observed_guests(redis):
+    guest_ips = redis.hgetall("topology:guest_ips")
+    guest_names = redis.hgetall("topology:guest_names")
+    node_names = redis.hgetall("topology:node_names")
+    worker_macs = registry.known_worker_macs(redis)
+    guests = {}
+
+    def guest_is_online(mac):
+        if redis.exists(f"health:{mac}"):
+            return True
+        for key in redis.scan_iter(f"active_mac:*:{mac}"):
+            if redis.exists(key):
+                return True
+        return False
+
+    def raw_dpid_from(dpid):
+        return "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else str(dpid)
+
+    for mac, ip in guest_ips.items():
+        mac = registry.normalize_mac(mac)
+        if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+            continue
+        guests[mac] = {
+            "mac": mac,
+            "ip": ip,
+            "name": guest_names.get(mac, ""),
+            "dpid": "",
+            "in_port": "",
+            "port_name": "",
+            "node_name": "",
+            "online": guest_is_online(mac),
+            "kind": "guest",
+        }
+
+    for key in redis.scan_iter("active_mac:*"):
+        parts = key.split(":", 2)
+        if len(parts) != 3:
+            continue
+        dpid = parts[1]
+        mac = registry.normalize_mac(parts[2])
+        if mac in guests or mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+            continue
+        ip = redis.get(f"dhcp:bind:{mac}") or ""
+        if not ip:
+            continue
+        raw_dpid = raw_dpid_from(dpid)
+        guests[mac] = {
+            "mac": mac,
+            "ip": ip,
+            "name": guest_names.get(mac, ""),
+            "dpid": str(dpid),
+            "in_port": "",
+            "port_name": "active_mac",
+            "node_name": node_names.get(raw_dpid, ""),
+            "online": bool(redis.exists(key)) or bool(redis.exists(f"health:{mac}")),
+            "kind": "guest",
+        }
+
+    for key in redis.scan_iter("mac_to_port:*"):
+        dpid = key.split(":", 1)[1]
+        ports = redis.hgetall(f"switch_ports:{dpid}")
+        for mac, in_port in redis.hgetall(key).items():
+            mac = registry.normalize_mac(mac)
+            if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
+                continue
+            if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+                continue
+            port_name = ports.get(str(in_port), "")
+            if not port_name.startswith("ens"):
+                continue
+            dhcp_ip = redis.get(f"dhcp:bind:{mac}") or ""
+            if mac not in guests and not dhcp_ip:
+                continue
+            guest = guests.setdefault(mac, {"mac": mac, "ip": dhcp_ip, "name": guest_names.get(mac, ""), "online": guest_is_online(mac)})
+            raw_dpid = raw_dpid_from(dpid)
+            guest.update({
+                "dpid": str(dpid),
+                "in_port": str(in_port),
+                "port_name": port_name,
+                "node_name": node_names.get(raw_dpid, ""),
+                "online": guest_is_online(mac),
+                "kind": "guest",
+            })
+
+    meter_ips = set()
+    for key in redis.scan_iter("meter:latest:*"):
+        source_ip = (redis.hget(key, "source_ip") or "").strip()
+        if source_ip:
+            meter_ips.add(source_ip)
+    for device in registry.list_devices(redis):
+        mac = registry.normalize_mac(device.get("mac", ""))
+        if not mac or mac in guests or mac in worker_macs:
+            continue
+        ip = device.get("ip", "")
+        guests[mac] = {
+            "mac": mac,
+            "ip": ip,
+            "name": device.get("device_id", ""),
+            "dpid": device.get("dpid", ""),
+            "in_port": device.get("in_port", ""),
+            "port_name": "registered",
+            "node_name": "",
+            "online": ip in meter_ips or guest_is_online(mac),
+            "kind": "guest",
+        }
+    return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
+
+
+def with_security_state(redis, guest):
+    if guest.get("kind") == "worker":
+        guest["registered"] = True
+        guest["security_status"] = "worker"
+        guest["validation"] = {"allowed": True, "reason": "worker_auto_allowed"}
+        guest["device"] = None
+        return guest
+    device = registry.get_by_index(redis, registry.KEY_MAC_TO_DEVICE, registry.normalize_mac(guest["mac"]))
+    if not device:
+        guest["registered"] = False
+        guest["security_status"] = "unregistered"
+        guest["device"] = None
+        return guest
+    allowed, reason, _ = registry.validate_observed_device(redis, guest["mac"], guest.get("ip", ""), guest.get("dpid", ""), guest.get("in_port", ""))
+    guest["registered"] = True
+    guest["security_status"] = device.get("status", "unknown")
+    guest["validation"] = {"allowed": allowed, "reason": reason}
+    guest["device"] = device
+    return guest
 
 
 def get_device_secrets(device_id: str) -> list[str]:
@@ -585,6 +758,86 @@ def api_stats():
         "devices": device_stats,
         "server_time": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@app.route("/api/guests")
+def api_guests():
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        workers = [with_security_state(redis, worker) for worker in observed_workers(redis)]
+        guests = [with_security_state(redis, guest) for guest in observed_guests(redis)]
+        registered = registry.list_devices(redis)
+        observed_macs = {item["mac"] for item in workers + guests}
+        offline_registered = [device for device in registered if device["mac"] not in observed_macs]
+        return jsonify({"guests": guests, "workers": workers, "offline_registered": offline_registered})
+    except Exception as e:
+        log.exception("No se pudo listar estado de seguridad")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/telemetry-security")
+def api_telemetry_security():
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        counters = {
+            "accepted_total": int(redis.get("meter:hmac:accepted_total") or 0),
+            "invalid_total": int(redis.get("meter:hmac:invalid_total") or 0),
+            "by_reason": {},
+            "recent_events": [],
+        }
+        for key in redis.scan_iter("meter:hmac:invalid_total:*"):
+            counters["by_reason"][key.rsplit(":", 1)[-1]] = int(redis.get(key) or 0)
+        for raw in redis.lrange("meter:hmac:events", 0, 9):
+            try:
+                counters["recent_events"].append(json.loads(raw))
+            except Exception:
+                continue
+        return jsonify(counters)
+    except Exception as e:
+        log.exception("No se pudo leer seguridad de telemetria")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/devices", methods=["POST"])
+def api_register_device():
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        device = registry.save_device(redis, request.get_json(force=True))
+        return jsonify(device), 201
+    except Exception as e:
+        log.exception("No se pudo registrar dispositivo")
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/devices/<device_id>/status", methods=["PATCH"])
+def api_set_device_status(device_id):
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        device = registry.update_status(redis, device_id, request.get_json(force=True).get("status"))
+        return jsonify(device)
+    except Exception as e:
+        log.exception("No se pudo cambiar estado de %s", device_id)
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/devices/<device_id>", methods=["DELETE"])
+def api_delete_device(device_id):
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        return jsonify({"deleted": registry.delete_device(redis, device_id)})
+    except Exception as e:
+        log.exception("No se pudo eliminar dispositivo %s", device_id)
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/health")
