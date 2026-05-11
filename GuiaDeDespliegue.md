@@ -256,6 +256,45 @@ No subas este token al repositorio.
 
 Ejecuta esto en `master` después de instalar K3s.
 
+Primero crea el ServiceAccount y permisos de leader election para `kube-vip`:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-vip
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:kube-vip-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "endpoints", "configmaps"]
+    verbs: ["list", "get", "watch", "update", "create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "get", "watch", "update", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:kube-vip-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:kube-vip-role
+subjects:
+  - kind: ServiceAccount
+    name: kube-vip
+    namespace: kube-system
+EOF
+```
+
+Crea el manifiesto del VIP del API Server. No habilites `--services`; este laboratorio solo necesita que `kube-vip` anuncie `192.168.122.10` para el control-plane.
+
 ```bash
 export VIP=192.168.122.10
 export INTERFACE=br0
@@ -267,10 +306,12 @@ sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vi
   --interface ${INTERFACE} \
   --address ${VIP} \
   --controlplane \
-  --services \
   --arp \
   --leaderElection \
   | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+
+sudo sed -i '/^  hostNetwork: true/i\  serviceAccountName: kube-vip' \
+  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
 ```
 
 `kube-vip` crea el endpoint estable `192.168.122.10:6443`. Los workers deben usar ese endpoint, no la IP fija del primer servidor.
@@ -426,10 +467,12 @@ sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vi
   --interface ${INTERFACE} \
   --address ${VIP} \
   --controlplane \
-  --services \
   --arp \
   --leaderElection \
   | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+
+sudo sed -i '/^  hostNetwork: true/i\  serviceAccountName: kube-vip' \
+  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
 ```
 
 Los tres servidores deben quedar como miembros etcd/control-plane antes de arrancar workers.
