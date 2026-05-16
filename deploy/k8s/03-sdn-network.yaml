@@ -123,7 +123,16 @@ spec:
           refresh_table_miss() {
             ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=0,actions=CONTROLLER:65535" > /dev/null 2>&1 || true
           }
+
+          refresh_gateway_flows() {
+            # Keep local gateway/collector traffic available even while Ryu is
+            # reconverging or busy processing Packet-In bursts.
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_tpa=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_spa=10.0.0.1,actions=FLOOD" > /dev/null 2>&1 || true
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,ip,nw_dst=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
+          }
           refresh_table_miss
+          refresh_gateway_flows
           
           echo "Obteniendo IP del Redis Master vía Sentinel..."
           MY_IP=$(get_br0_ip)
@@ -142,6 +151,8 @@ spec:
           echo "Evaluando mapa físico mediante LLDP Point-to-Point asíncrono..."
           mkdir -p /run/ryu-vx-stale
           while true; do
+            refresh_gateway_flows
+
             # Identificar MgmtIP capturadas por LLDP en interfaces físicas puras (ej. lldp.ens4.chassis.mgmt-ip=192.168.122.101)
             MY_IP=$(get_br0_ip)
             if [ -z "$MY_IP" ]; then
@@ -177,6 +188,7 @@ spec:
                   > /dev/null 2>&1 || true
                 ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
                 refresh_table_miss
+                refresh_gateway_flows
               fi
               rm -f "/run/ryu-vx-stale/${PORT_NAME}" 2>/dev/null || true
             done
@@ -198,6 +210,7 @@ spec:
                 ovs-vsctl --if-exists del-port br-sdn "$vx_port" > /dev/null 2>&1 || true
                 ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
                 refresh_table_miss
+                refresh_gateway_flows
                 rm -f "$miss_file" 2>/dev/null || true
               fi
             done
@@ -333,7 +346,7 @@ spec:
       containers:
       - name: dhcp
         image: arturoalvarez/ryu-dhcp:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
         env:

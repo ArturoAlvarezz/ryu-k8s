@@ -1334,9 +1334,17 @@ data:
         },
         {
           "type": "timeseries",
-          "title": "Nodos con mas trafico",
+          "title": "Trafico por nodo (MB/s)",
           "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8},
-          "targets": [{"expr": "topk(5, sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])))", "legendFormat": "{{node}}"}]
+          "fieldConfig": {
+            "defaults": {
+              "unit": "MBs",
+              "decimals": 2,
+              "min": 0
+            },
+            "overrides": []
+          },
+          "targets": [{"expr": "sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])) / 1024 / 1024", "legendFormat": "{{node}}"}]
         },
         {
           "type": "timeseries",

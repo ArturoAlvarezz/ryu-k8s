@@ -12,6 +12,37 @@ SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
 sentinel = Sentinel([(SENTINEL_HOST, SENTINEL_PORT)], socket_timeout=0.5)
 r = sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
 
+
+def active_switches():
+    switches = set(r.smembers('topology:switches') or set())
+    for key in r.keys('switch:alive:*') or []:
+        raw_dpid = str(key).split('switch:alive:', 1)[-1]
+        try:
+            switches.add(str(int(raw_dpid, 16)))
+        except Exception:
+            switches.add(raw_dpid)
+    return switches
+
+
+def normalize_mac(mac):
+    return str(mac or '').strip().lower()
+
+
+def device_id_for_mac(mac):
+    device_id = r.get(f"security:mac_to_device:{normalize_mac(mac)}")
+    return device_id or ""
+
+
+def meter_device_ids_by_ip():
+    meters = {}
+    for key in r.scan_iter('meter:latest:*'):
+        source_ip = (r.hget(key, 'source_ip') or '').strip()
+        device_id = (r.hget(key, 'device_id') or '').strip()
+        if source_ip and device_id:
+            meters[source_ip] = device_id
+    return meters
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -19,7 +50,7 @@ def index():
 @app.route('/api/topology')
 def get_topology():
     try:
-        switches = r.smembers('topology:switches')
+        switches = active_switches()
         node_names = r.hgetall('topology:node_names')
 
         nodes = []
@@ -86,6 +117,7 @@ def get_topology():
             
             # Obtener el mapa global de IPs asignadas por el DHCP
             guest_ips = r.hgetall('topology:guest_ips')
+            telemetry_device_ids = meter_device_ids_by_ip()
             
             # Extraer mapeo de puertos de este switch
             switch_ports_map = r.hgetall(f"switch_ports:{dpid}")
@@ -110,9 +142,11 @@ def get_topology():
                     guest_id = mac
                     if guest_id not in [g['id'] for g in guests]:
                         ip_text = guest_ips.get(guest_id, "Desconocida / DHCP Pendiente")
+                        device_id = telemetry_device_ids.get(ip_text) or device_id_for_mac(guest_id)
+                        device_text = f"\nDevice: {device_id}" if device_id else ""
                         guests.append({
                             "id": guest_id,
-                            "label": f"{guest_id}\nIP: {ip_text}",
+                            "label": f"{guest_id}{device_text}\nIP: {ip_text}",
                             "group": "guest",
                             "switch": dpid
                         })
@@ -221,7 +255,7 @@ def get_topology():
 def trace_path(src_guest, dst_guest):
     try:
         # Encontrar los switches origen y destino
-        switches = r.smembers('topology:switches')
+        switches = active_switches()
         src_switch = None
         dst_switch = None
         

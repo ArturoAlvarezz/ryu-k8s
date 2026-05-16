@@ -30,7 +30,7 @@ spec:
       containers:
       - name: dashboard
         image: arturoalvarez/ryu-topology:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         env:
         - name: REDIS_SENTINEL_HOST
           value: "redis-sentinel.sdn-controller.svc.cluster.local"

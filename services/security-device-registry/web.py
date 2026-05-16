@@ -34,7 +34,7 @@ def normalize_dpid(dpid):
 
 def looks_like_worker_name(name):
     value = (name or "").lower()
-    return value.startswith("worker") or value.startswith("master") or value.startswith("maestro")
+    return value.startswith(("worker", "master", "maestro", "control-"))
 
 
 def observed_workers(r):
@@ -72,15 +72,16 @@ def observed_guests(r):
     worker_macs = registry.known_worker_macs(r)
     guests = {}
 
-    def live_meter_ips():
-        ips = set()
+    def live_meters_by_ip():
+        meters = {}
         for key in r.scan_iter("meter:latest:*"):
             source_ip = (r.hget(key, "source_ip") or "").strip()
+            device_id = (r.hget(key, "device_id") or "").strip()
             if source_ip:
-                ips.add(source_ip)
-        return ips
+                meters[source_ip] = device_id
+        return meters
 
-    meter_ips = live_meter_ips()
+    meter_by_ip = live_meters_by_ip()
 
     def guest_is_online(mac):
         if r.exists(f"health:{mac}"):
@@ -179,9 +180,11 @@ def observed_guests(r):
             "in_port": device.get("in_port", ""),
             "port_name": "registered",
             "node_name": "",
-            "online": ip in meter_ips or guest_is_online(mac),
+            "online": ip in meter_by_ip or guest_is_online(mac),
             "kind": "guest",
         }
+    for guest in guests.values():
+        guest["telemetry_device_id"] = meter_by_ip.get(guest.get("ip", ""), "")
 
     return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
 
@@ -212,6 +215,7 @@ def with_security_state(r, guest):
     guest["security_status"] = device.get("status", "unknown")
     guest["validation"] = {"allowed": allowed, "reason": reason}
     guest["device"] = device
+    guest["device_id"] = guest.get("telemetry_device_id") or device.get("device_id", "")
     return guest
 
 

@@ -154,6 +154,49 @@ def telemetry_source_allowed(source_ip: str) -> bool:
         return True
 
 
+def sync_security_identity(device_id: str, source_ip: str):
+    if not device_id or not source_ip:
+        return
+    redis = get_redis()
+    if redis is None:
+        return
+    try:
+        current_id = redis.get(f"security:ip_to_device:{source_ip}")
+        raw = None
+        if current_id == device_id:
+            raw = redis.get(f"security:device:{device_id}")
+        elif current_id:
+            raw = redis.get(f"security:device:{current_id}")
+        else:
+            raw = redis.get(f"security:device:{device_id}")
+
+        if not raw:
+            return
+        device = json.loads(raw)
+        if device.get("role") != "smart_meter":
+            return
+        old_id = device.get("device_id", current_id or device_id)
+        old_ip = device.get("ip", "")
+        device["device_id"] = device_id
+        device["ip"] = source_ip
+        mac = registry.normalize_mac(device.get("mac", ""))
+        pipe = redis.pipeline()
+        pipe.set(f"security:device:{device_id}", json.dumps(device, sort_keys=True))
+        pipe.sadd("security:devices", device_id)
+        pipe.srem("security:devices", old_id)
+        pipe.set(f"security:ip_to_device:{source_ip}", device_id)
+        if old_ip and old_ip != source_ip:
+            pipe.delete(f"security:ip_to_device:{old_ip}")
+        if mac:
+            pipe.set(f"security:mac_to_device:{mac}", device_id)
+        if old_id != device_id:
+            pipe.delete(f"security:device:{old_id}")
+        pipe.execute()
+        log.info("Registro AMI sincronizado source=%s old_device=%s device=%s", source_ip, old_id, device_id)
+    except Exception as e:
+        log.warning("No se pudo sincronizar identidad AMI source=%s device=%s: %s", source_ip, device_id, e)
+
+
 def normalize_dpid(dpid):
     if not dpid:
         return ""
@@ -168,7 +211,7 @@ def normalize_dpid(dpid):
 
 def looks_like_worker_name(name):
     value = (name or "").lower()
-    return value.startswith("worker") or value.startswith("master") or value.startswith("maestro")
+    return value.startswith(("worker", "master", "maestro", "control-"))
 
 
 def observed_workers(redis):
@@ -280,11 +323,12 @@ def observed_guests(redis):
                 "kind": "guest",
             })
 
-    meter_ips = set()
+    meter_by_ip = {}
     for key in redis.scan_iter("meter:latest:*"):
         source_ip = (redis.hget(key, "source_ip") or "").strip()
+        device_id = (redis.hget(key, "device_id") or "").strip()
         if source_ip:
-            meter_ips.add(source_ip)
+            meter_by_ip[source_ip] = device_id
     for device in registry.list_devices(redis):
         mac = registry.normalize_mac(device.get("mac", ""))
         if not mac or mac in guests or mac in worker_macs:
@@ -298,9 +342,11 @@ def observed_guests(redis):
             "in_port": device.get("in_port", ""),
             "port_name": "registered",
             "node_name": "",
-            "online": ip in meter_ips or guest_is_online(mac),
+            "online": ip in meter_by_ip or guest_is_online(mac),
             "kind": "guest",
         }
+    for guest in guests.values():
+        guest["telemetry_device_id"] = meter_by_ip.get(guest.get("ip", ""), "")
     return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
 
 
@@ -322,6 +368,7 @@ def with_security_state(redis, guest):
     guest["security_status"] = device.get("status", "unknown")
     guest["validation"] = {"allowed": allowed, "reason": reason}
     guest["device"] = device
+    guest["device_id"] = guest.get("telemetry_device_id") or device.get("device_id", "")
     return guest
 
 
@@ -644,12 +691,13 @@ def udp_listener():
             reading = json.loads(data.decode("utf-8"))
             if not verify_hmac(reading, addr[0]):
                 continue
-            if not telemetry_source_allowed(addr[0]):
-                _record_invalid_event("security_status_blocked", str(reading.get("device_id", "")), addr[0])
-                continue
             reading = normalize_reading(reading)
             reading["source_ip"] = addr[0]
             device_id = reading.get("device_id", "unknown")
+            sync_security_identity(str(device_id), addr[0])
+            if not telemetry_source_allowed(addr[0]):
+                _record_invalid_event("security_status_blocked", str(device_id), addr[0])
+                continue
             seq = reading.get("seq", "?")
             log.info("UDP [%s] seq=%s device=%s P=%.3fkW",
                      addr[0], seq, device_id,
@@ -744,6 +792,7 @@ def api_stats():
             total_power += power
             device_stats.append({
                 "device_id": dev,
+                "source_ip": latest.get("source_ip", ""),
                 "energy_kwh": round(energy, 4),
                 "active_power_kw": round(power, 3),
                 "last_seen": latest.get("timestamp", ""),

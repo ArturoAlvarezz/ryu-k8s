@@ -49,13 +49,46 @@ data:
         - localhost:9090
 
     - job_name: ryu
-      scrape_interval: 2s
+      scrape_interval: 10s
+      scrape_timeout: 9s
       kubernetes_sd_configs:
       - role: pod
         namespaces:
           names:
           - sdn-controller
       relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: ryu
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+);(\d+)
+        replacement: ${1}:${2}
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        target_label: node
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+
+    - job_name: meter-collector
+      scrape_interval: 10s
+      scrape_timeout: 9s
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - sdn-controller
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: meter-collector
       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
         action: keep
         regex: "true"
@@ -609,9 +642,17 @@ data:
         },
         {
           "type": "timeseries",
-          "title": "Nodos con mas trafico",
+          "title": "Trafico por nodo (MB/s)",
           "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8},
-          "targets": [{"expr": "topk(5, sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])))", "legendFormat": "{{node}}"}]
+          "fieldConfig": {
+            "defaults": {
+              "unit": "MBs",
+              "decimals": 2,
+              "min": 0
+            },
+            "overrides": []
+          },
+          "targets": [{"expr": "sum by (node) (rate(node_network_receive_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m]) + rate(node_network_transmit_bytes_total{device!~\"lo|cni.*|flannel.*|veth.*\"}[1m])) / 1024 / 1024", "legendFormat": "{{node}}"}]
         },
         {
           "type": "timeseries",
@@ -670,31 +711,31 @@ data:
           "type": "timeseries",
           "title": "Telemetria AMI rechazada por HMAC/replay",
           "gridPos": {"x": 0, "y": 60, "w": 18, "h": 8},
-          "targets": [{"expr": "max by (reason) (rate(meter_hmac_invalid_by_reason_total[1m]))", "legendFormat": "{{reason}}"}]
+          "targets": [{"expr": "max by (reason) (rate(meter_hmac_invalid_by_reason_total{job=\"meter-collector\"}[1m]))", "legendFormat": "{{reason}}"}]
         },
         {
           "type": "stat",
           "title": "Paquetes AMI validos",
           "gridPos": {"x": 18, "y": 60, "w": 6, "h": 4},
-          "targets": [{"expr": "max(meter_hmac_accepted_total)", "legendFormat": "aceptados"}]
+          "targets": [{"expr": "max(meter_hmac_accepted_total{job=\"meter-collector\"})", "legendFormat": "aceptados"}]
         },
         {
           "type": "stat",
           "title": "Paquetes AMI invalidos",
           "gridPos": {"x": 18, "y": 64, "w": 6, "h": 4},
-          "targets": [{"expr": "max(meter_hmac_invalid_total)", "legendFormat": "rechazados"}]
+          "targets": [{"expr": "max(meter_hmac_invalid_total{job=\"meter-collector\"})", "legendFormat": "rechazados"}]
         },
         {
           "type": "timeseries",
           "title": "Potencia por Smart Meter",
           "gridPos": {"x": 0, "y": 68, "w": 18, "h": 8},
-          "targets": [{"expr": "max by (device_id, source_ip) (meter_latest_power_kw)", "legendFormat": "{{device_id}} {{source_ip}}"}]
+          "targets": [{"expr": "max by (device_id, source_ip) (meter_latest_power_kw{job=\"meter-collector\"})", "legendFormat": "{{device_id}} {{source_ip}}"}]
         },
         {
           "type": "stat",
           "title": "Smart Meters con telemetria",
           "gridPos": {"x": 18, "y": 68, "w": 6, "h": 8},
-          "targets": [{"expr": "count(count by (device_id) (meter_latest_info))", "legendFormat": "meters"}]
+          "targets": [{"expr": "count(count by (device_id) (meter_latest_info{job=\"meter-collector\"}))", "legendFormat": "meters"}]
         }
       ]
     }

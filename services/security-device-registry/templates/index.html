@@ -115,7 +115,7 @@
 
     function renderGuest(guest) {
       const status = guest.security_status || 'unregistered';
-      const deviceId = guest.device?.device_id || '';
+      const deviceId = guest.device_id || guest.telemetry_device_id || guest.device?.device_id || '';
       const actions = guest.kind === 'worker'
         ? '<span class="badge">trafico permitido automaticamente</span>'
         : guest.registered
@@ -124,13 +124,13 @@
       return `<article class="card ${status}">
         <div class="title"><div><div class="mac">${guest.mac}</div><p>${guest.kind === 'worker' ? 'Worker SDN' : (guest.name || guest.node_name || 'Guest SDN')}</p></div><span class="badge">${status}</span></div>
         <dl>
-          <dt>IP</dt><dd>${guest.ip || 'DHCP pendiente'}</dd>
+          <dt>IP</dt><dd>${guest.ip ? `${guest.ip}${deviceId ? ` (${deviceId})` : ''}` : 'DHCP pendiente'}</dd>
           <dt>Tipo</dt><dd>${guest.kind || 'guest'}</dd>
           <dt>DPID</dt><dd>${guest.dpid || 'sin observar'}</dd>
           <dt>Puerto</dt><dd>${guest.in_port || '-'} ${guest.port_name ? `(${guest.port_name})` : ''}</dd>
           <dt>Online</dt><dd>${guest.online ? 'si' : 'no'}</dd>
           <dt>Validacion</dt><dd>${guest.validation ? `${guest.validation.allowed ? 'permitido' : 'rechazado'}: ${guest.validation.reason}` : 'sin registro'}</dd>
-          <dt>Device ID</dt><dd>${guest.kind === 'worker' ? 'worker auto-permitido' : (deviceId || 'no registrado')}</dd>
+          <dt>Device ID</dt><dd>${guest.kind === 'worker' ? 'worker auto-permitido' : (deviceId ? `${deviceId}${guest.ip ? ` (${guest.ip})` : ''}` : 'no registrado')}</dd>
         </dl>
         <div class="actions">${actions}</div>
       </article>`;
@@ -139,7 +139,7 @@
     function renderOffline(device) {
       return `<article class="card ${device.status} offline">
         <div class="title"><div><div class="mac">${device.mac}</div><p>${device.device_id}</p></div><span class="badge">${device.status}</span></div>
-        <dl><dt>IP</dt><dd>${device.ip}</dd><dt>DPID</dt><dd>${device.dpid || '-'}</dd><dt>Puerto</dt><dd>${device.in_port || '-'}</dd></dl>
+        <dl><dt>IP</dt><dd>${device.ip} (${device.device_id})</dd><dt>Device ID</dt><dd>${device.device_id} (${device.ip})</dd><dt>DPID</dt><dd>${device.dpid || '-'}</dd><dt>Puerto</dt><dd>${device.in_port || '-'}</dd></dl>
         <div class="actions">${renderStatusButtons(device)}</div>
       </article>`;
     }

@@ -312,6 +312,8 @@ sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vi
 
 sudo sed -i '/^  hostNetwork: true/i\  serviceAccountName: kube-vip' \
   /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+sudo sed -i 's#/etc/kubernetes/admin.conf#/etc/rancher/k3s/k3s.yaml#g' \
+  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
 ```
 
 `kube-vip` crea el endpoint estable `192.168.122.10:6443`. Los workers deben usar ese endpoint, no la IP fija del primer servidor.
@@ -472,6 +474,8 @@ sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vi
   | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
 
 sudo sed -i '/^  hostNetwork: true/i\  serviceAccountName: kube-vip' \
+  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+sudo sed -i 's#/etc/kubernetes/admin.conf#/etc/rancher/k3s/k3s.yaml#g' \
   /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
 ```
 
@@ -807,6 +811,32 @@ kubectl -n kube-system get pods -o wide
 
 Los pods base de K3s deben estar `Running` o `Completed`.
 
+Comprueba qué nodo control-plane está anunciando el VIP HA `192.168.122.10`:
+
+```bash
+kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
+```
+
+El valor devuelto es el nodo que tiene el mando actual del VIP. Para ver el pod de `kube-vip` y su ubicación:
+
+```bash
+kubectl -n kube-system get pod kube-vip -o wide
+```
+
+Para revisar los cambios de liderazgo o errores recientes de `kube-vip`:
+
+```bash
+kubectl -n kube-system logs kube-vip --tail=50
+```
+
+Desde la máquina local del repositorio también puedes consultarlo por SSH contra el master:
+
+```bash
+python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{\"\n\"}'"
+python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system get pod kube-vip -o wide"
+python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system logs kube-vip --tail=50"
+```
+
 ## 16. Verificación de servicios SDN
 
 ```bash
@@ -913,9 +943,12 @@ En cada control-plane:
 
 ```bash
 sudo ls -l /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+kubectl -n kube-system get lease plndr-cp-lock -o yaml
 kubectl -n kube-system get pods -o wide | grep kube-vip
 kubectl -n kube-system logs <kube-vip-pod-name> --tail=120
 ```
+
+En el lease, `spec.holderIdentity` indica qué control-plane está anunciando el VIP.
 
 Comprueba que el manifiesto use `br0` y `192.168.122.10`:
 
@@ -1059,3 +1092,7 @@ Resultado esperado:
 - Redis Sentinel mantiene o elige un master.
 - Los DaemonSets críticos siguen activos en los nodos vivos.
 - Los Deployments se recrean fuera del nodo apagado si tenían réplicas allí.
+
+
+
+kubectl -n kube-system get lease plndr-cp-lock -o yaml
