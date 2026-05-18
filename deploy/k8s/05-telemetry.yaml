@@ -111,6 +111,7 @@ metadata:
     app: meter-collector
 spec:
   type: LoadBalancer
+  externalTrafficPolicy: Local
   sessionAffinity: ClientIP
   sessionAffinityConfig:
     clientIP:

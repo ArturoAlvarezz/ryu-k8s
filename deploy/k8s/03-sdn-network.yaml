@@ -87,6 +87,30 @@ spec:
             redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1
           }
 
+          get_static_br0_neighbor_ip() {
+            # LLDP does not cross Linux bridge ports blocked by STP. Keep the
+            # GNS3 management cabling as a fallback so blocked links remain
+            # visible in Redis/Grafana while only BPDUs traverse the wire.
+            case "${NODE_NAME}:$1" in
+              master:ens4) echo "192.168.122.148" ;;
+              master:ens5) echo "192.168.122.235" ;;
+              control-2:ens4) echo "192.168.122.148" ;;
+              control-3:ens4) echo "192.168.122.141" ;;
+              worker-0e5d07:ens3) echo "192.168.122.100" ;;
+              worker-0e5d07:ens4) echo "192.168.122.88" ;;
+              worker-0e5d07:ens5) echo "192.168.122.141" ;;
+              worker-0e5d07:ens6) echo "192.168.122.235" ;;
+              worker-546cce:ens3) echo "192.168.122.201" ;;
+              worker-546cce:ens4) echo "192.168.122.148" ;;
+              worker-546cce:ens5) echo "192.168.122.100" ;;
+              worker-4f508e:ens3) echo "192.168.122.236" ;;
+              worker-4f508e:ens4) echo "192.168.122.148" ;;
+              worker-4f508e:ens5) echo "192.168.122.201" ;;
+              worker-6a9f84:ens3) echo "192.168.122.235" ;;
+              worker-6a9f84:ens4) echo "192.168.122.141" ;;
+            esac
+          }
+
           wait_for_management_plane
           
           echo "Cargando módulo del kernel..."
@@ -262,6 +286,9 @@ spec:
                   *) STP_STATE="unknown" ;;
                 esac
                 REMOTE_IP=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
+                if [ -z "$REMOTE_IP" ]; then
+                  REMOTE_IP=$(get_static_br0_neighbor_ip "$stp_intf")
+                fi
                 if [ -n "$REMOTE_IP" ]; then
                   redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
                 fi

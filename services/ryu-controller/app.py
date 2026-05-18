@@ -549,6 +549,7 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _monitor_datapaths(self):
         while True:
+            self.logger.info("Ryu monitor heartbeat: datapaths=%d", len(self.datapaths))
             for datapath in list(self.datapaths.values()):
                 try:
                     parser = datapath.ofproto_parser
@@ -732,7 +733,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                         })
                         edge["details"].append("%s:%s=active" % (dpid, port_name))
 
-            for mac, port_no in mac_table.items():
+        for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
                 if mac in guest_locations:
@@ -749,6 +750,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                 )
                 if not is_local_guest_port and not is_non_tunnel_port:
                     continue
+                self._add_guest_node_edge(guests, edges, mac, dpid, port_no, guest_ips)
 
         worker_macs = self._known_worker_macs()
         for mac, location in guest_locations.items():
@@ -831,9 +833,9 @@ class DistributedL2Switch(app_manager.RyuApp):
                 "details": [],
             })
             edge["details"].append("%s:%s=%s" % (local_dpid, intf, state))
-            if state == "blocking":
+            if state != "forwarding":
                 edge.update({
-                    "mainstat": "br0 STP blocked",
+                    "mainstat": "br0 STP blocked" if state == "blocking" else "br0 disabled",
                     "color": "#ef4444",
                     "strokeDasharray": "",
                     "thickness": "6",
@@ -848,7 +850,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             if edge["type"] == "br0_stp_blocked":
                 # Reemplazar VXLAN si existe para el mismo par — STP bloqueado tiene prioridad visual
                 edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
-                edges.append(edge)
+            edges.append(edge)
 
         nodes.extend(guests.values())
         return nodes, edges, guests, ip_to_dpid

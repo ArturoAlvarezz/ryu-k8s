@@ -136,22 +136,29 @@ def redis_is_ready() -> bool:
         return False
 
 
-def telemetry_source_allowed(source_ip: str) -> bool:
+def telemetry_source_authorization(source_ip: str) -> tuple[bool, str]:
     redis = get_redis()
     if redis is None or not source_ip:
-        return True
+        return False, "security_unavailable"
     try:
         device_id = redis.get(f"security:ip_to_device:{source_ip}")
         if not device_id:
-            return True
+            return False, "unregistered_source"
         payload = redis.get(f"security:device:{device_id}")
         if not payload:
-            return True
+            return False, "missing_security_device"
         device = json.loads(payload)
-        return device.get("status") in ("authorized", "learning")
+        status = device.get("status", "unknown")
+        if status != "authorized":
+            return False, f"status_{status}"
+        return True, "authorized"
     except Exception as e:
         log.warning("No se pudo validar estado de seguridad para source=%s: %s", source_ip, e)
-        return True
+        return False, "security_error"
+
+
+def telemetry_source_allowed(source_ip: str) -> bool:
+    return telemetry_source_authorization(source_ip)[0]
 
 
 def sync_security_identity(device_id: str, source_ip: str):
@@ -245,14 +252,17 @@ def observed_guests(redis):
     node_names = redis.hgetall("topology:node_names")
     worker_macs = registry.known_worker_macs(redis)
     guests = {}
+    active_mac_locations = {}
+
+    for key in redis.scan_iter("active_mac:*"):
+        parts = key.split(":", 2)
+        if len(parts) == 3:
+            active_mac_locations[registry.normalize_mac(parts[2])] = parts[1]
 
     def guest_is_online(mac):
         if redis.exists(f"health:{mac}"):
             return True
-        for key in redis.scan_iter(f"active_mac:*:{mac}"):
-            if redis.exists(key):
-                return True
-        return False
+        return mac in active_mac_locations
 
     def raw_dpid_from(dpid):
         return "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else str(dpid)
@@ -273,12 +283,7 @@ def observed_guests(redis):
             "kind": "guest",
         }
 
-    for key in redis.scan_iter("active_mac:*"):
-        parts = key.split(":", 2)
-        if len(parts) != 3:
-            continue
-        dpid = parts[1]
-        mac = registry.normalize_mac(parts[2])
+    for mac, dpid in active_mac_locations.items():
         if mac in guests or mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
             continue
         ip = redis.get(f"dhcp:bind:{mac}") or ""
@@ -293,9 +298,40 @@ def observed_guests(redis):
             "in_port": "",
             "port_name": "active_mac",
             "node_name": node_names.get(raw_dpid, ""),
-            "online": bool(redis.exists(key)) or bool(redis.exists(f"health:{mac}")),
+            "online": guest_is_online(mac),
             "kind": "guest",
         }
+
+    for mac, location in redis.hgetall("topology:guest_locations").items():
+        mac = registry.normalize_mac(mac)
+        if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
+            continue
+        dpid, _, in_port = str(location).partition(":")
+        if not dpid or not in_port:
+            continue
+        ports = redis.hgetall(f"switch_ports:{dpid}")
+        port_name = ports.get(str(in_port), "")
+        if port_name.startswith("vx") or port_name == "br-sdn" or str(in_port) == "4294967294":
+            continue
+        dhcp_ip = redis.get(f"dhcp:bind:{mac}") or guest_ips.get(mac, "")
+        raw_dpid = raw_dpid_from(dpid)
+        guest = guests.setdefault(mac, {
+            "mac": mac,
+            "ip": dhcp_ip,
+            "name": guest_names.get(mac, ""),
+            "online": guest_is_online(mac),
+            "kind": "guest",
+        })
+        if dhcp_ip and not guest.get("ip"):
+            guest["ip"] = dhcp_ip
+        guest.update({
+            "dpid": str(dpid),
+            "in_port": str(in_port),
+            "port_name": port_name,
+            "node_name": node_names.get(raw_dpid, ""),
+            "online": guest_is_online(mac),
+            "kind": "guest",
+        })
 
     for key in redis.scan_iter("mac_to_port:*"):
         dpid = key.split(":", 1)[1]
@@ -347,7 +383,13 @@ def observed_guests(redis):
         }
     for guest in guests.values():
         guest["telemetry_device_id"] = meter_by_ip.get(guest.get("ip", ""), "")
-    return sorted(guests.values(), key=lambda item: (item.get("ip") or "", item["mac"]))
+        if guest.get("ip") in meter_by_ip:
+            guest["online"] = True
+    current_guests = [
+        guest for guest in guests.values()
+        if guest.get("online") or guest.get("telemetry_device_id") or guest.get("port_name") == "registered"
+    ]
+    return sorted(current_guests, key=lambda item: (item.get("ip") or "", item["mac"]))
 
 
 def with_security_state(redis, guest):
@@ -503,7 +545,6 @@ def verify_hmac(reading: dict, source_ip: str) -> bool:
         _record_invalid_event("replay_nonce", device_id, source_ip)
         return False
 
-    record_hmac_accept(device_id)
     return True
 
 
@@ -642,6 +683,8 @@ def get_all_latest() -> list[dict]:
                 data = redis.hgetall(f"meter:latest:{dev}")
                 if data:
                     if not telemetry_source_allowed(data.get("source_ip", "")):
+                        redis.delete(f"meter:latest:{dev}")
+                        redis.srem("meter:devices", dev)
                         continue
                     result.append(data)
                 else:
@@ -695,9 +738,12 @@ def udp_listener():
             reading["source_ip"] = addr[0]
             device_id = reading.get("device_id", "unknown")
             sync_security_identity(str(device_id), addr[0])
-            if not telemetry_source_allowed(addr[0]):
-                _record_invalid_event("security_status_blocked", str(device_id), addr[0])
+            allowed, reason = telemetry_source_authorization(addr[0])
+            if not allowed:
+                _record_invalid_event(reason, str(device_id), addr[0])
                 continue
+            if HMAC_ENABLED:
+                record_hmac_accept(str(device_id))
             seq = reading.get("seq", "?")
             log.info("UDP [%s] seq=%s device=%s P=%.3fkW",
                      addr[0], seq, device_id,

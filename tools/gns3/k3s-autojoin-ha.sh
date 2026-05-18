@@ -5,6 +5,10 @@ set -euo pipefail
 K3S_NODE_TOKEN="${K3S_NODE_TOKEN:-}"
 K3S_API_ENDPOINT="${K3S_API_ENDPOINT:-192.168.122.10}"
 
+if [ -x /usr/local/bin/configure-br0-tree.sh ]; then
+  /usr/local/bin/configure-br0-tree.sh || true
+fi
+
 if [ -z "$K3S_NODE_TOKEN" ] || echo "$K3S_NODE_TOKEN" | grep -q '^<'; then
   echo "[autojoin] ERROR: define K3S_NODE_TOKEN con el token real del cluster HA."
   exit 1
@@ -56,5 +60,13 @@ curl -sfL https://get.k3s.io | \
   K3S_URL="https://${K3S_API_ENDPOINT}:6443" \
   K3S_TOKEN="$K3S_NODE_TOKEN" \
   sh -
+
+mkdir -p /etc/systemd/system/k3s-agent.service.d
+cat >/etc/systemd/system/k3s-agent.service.d/10-gns3-br0-tree.conf <<'EOF'
+[Unit]
+Requires=gns3-br0-tree.service
+After=gns3-br0-tree.service
+EOF
+systemctl daemon-reload
 
 echo "[autojoin] Nodo $NEW_HOSTNAME unido al cluster HA."
