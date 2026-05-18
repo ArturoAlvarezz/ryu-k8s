@@ -61,12 +61,14 @@ curl -sfL https://get.k3s.io | \
   K3S_TOKEN="$K3S_NODE_TOKEN" \
   sh -
 
-mkdir -p /etc/systemd/system/k3s-agent.service.d
-cat >/etc/systemd/system/k3s-agent.service.d/10-gns3-br0-tree.conf <<'EOF'
+if [ -f /etc/systemd/system/gns3-br0-tree.service ]; then
+  mkdir -p /etc/systemd/system/k3s-agent.service.d
+  cat >/etc/systemd/system/k3s-agent.service.d/10-gns3-br0-tree.conf <<'EOF'
 [Unit]
 Requires=gns3-br0-tree.service
 After=gns3-br0-tree.service
 EOF
-systemctl daemon-reload
+  systemctl daemon-reload
+fi
 
 echo "[autojoin] Nodo $NEW_HOSTNAME unido al cluster HA."

@@ -102,7 +102,7 @@ K3s y Flannel deben usar siempre `br0`:
 
 Si tu topología GNS3 tiene enlaces redundantes en la red de gestión/fabric, el segmento compartido debe usar STP. El `Ethernet switch` básico de GNS3 no es suficiente porque no participa en STP real; reemplázalo por un nodo Docker Open vSwitch y úsalo como raíz del árbol.
 
-`configure-br0-tree.sh` sigue siendo necesario cuando quieres que cada nodo reconstruya `br0` de forma repetible después de apagar/encender la topología completa. No es obligatorio para una topología simple sin enlaces redundantes, pero sí es la forma recomendada para un fabric HA: evita depender de cambios manuales de `ip link`, fija la IP de `br0`, activa STP antes de K3s y deja un modo `tree` de emergencia.
+`configure-br0-tree.sh` sigue siendo necesario cuando quieres que cada nodo reconstruya `br0` de forma repetible después de apagar/encender la topología completa. No es obligatorio para una topología simple sin enlaces redundantes, pero sí es la forma recomendada para un fabric HA: evita depender de cambios manuales de `ip link`, fija la IP de `br0` y activa STP antes de K3s.
 
 #### 3.1.1 Configurar el switch STP de gestión
 
@@ -176,7 +176,6 @@ Antes de instalar el servicio, define estos valores para cada nodo. No copies pe
 | `ALL_PORTS` | Interfaces físicas que el script puede administrar en `br0` |
 | `STP_PORTS` | Subconjunto de `ALL_PORTS` que queda activo en modo `stp` |
 | `PREFERRED_STP_PORTS` | Puertos preferidos con coste bajo |
-| `TREE_PORTS` | Puertos que quedarían activos en modo manual de emergencia `tree` |
 | `BR_PRIORITY` | Prioridad STP del bridge Linux; menor valor significa mayor prioridad |
 | `STP_LOW_COST` | Coste para puertos preferidos, por ejemplo `10` |
 | `STP_HIGH_COST` | Coste para puertos de respaldo, por ejemplo `200` |
@@ -329,36 +328,40 @@ sudo systemctl enable --now k3s-iptables.service
 
 Ejecuta esta subsección solo si tu topología de gestión tiene enlaces redundantes y quieres que `br0` se reconstruya automáticamente con STP tras cada arranque. En una topología simple sin redundancia puedes omitirla.
 
-Crea el perfil local de esta VM. Ajusta los valores según tu diseño; no reutilices este archivo en otros nodos sin cambiar IP, MAC, puertos y prioridad.
+Crea el perfil local de esta VM. Este bloque es para el primer control-plane `master` con IP `192.168.122.100`; en otros nodos debes cambiar `NODE_IP`, `STP_PORTS`, `PREFERRED_STP_PORTS` y `BR_PRIORITY` antes de pegarlo.
 
 ```bash
+set -euo pipefail
+
 sudo tee /etc/default/gns3-br0-tree > /dev/null <<'EOF'
-NODE_IP=<IP_BR0_DE_ESTA_VM>
+NODE_IP=192.168.122.100
 NODE_PREFIX=24
 NODE_GATEWAY=192.168.122.1
-BR0_MAC=<MAC_ESTABLE_PARA_BR0>
-
 ALL_PORTS="ens3 ens4 ens5 ens6"
-STP_PORTS="ens3 ens4 ens5"
+STP_PORTS="ens3 ens4 ens5 ens6"
 PREFERRED_STP_PORTS="ens3"
-TREE_PORTS="ens3"
-
 BR_PRIORITY=32768
 STP_LOW_COST=10
 STP_HIGH_COST=200
-BR0_MODE=stp
 EOF
+
+sudo test -r /etc/default/gns3-br0-tree
+sudo grep -q '^NODE_IP=192\.168\.122\.100$' /etc/default/gns3-br0-tree
 ```
 
 Instala el script y el servicio systemd:
 
 ```bash
+set -euo pipefail
+
 cd ~/ryu-k8s
-if [ ! -f tools/gns3/configure-br0-tree.sh ]; then
-  printf '%s\n' 'ERROR: falta tools/gns3/configure-br0-tree.sh. Actualiza el repositorio antes de crear el servicio.' >&2
-else
-  sudo install -m 0755 tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-  sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
+test -f tools/gns3/configure-br0-tree.sh
+sudo test -r /etc/default/gns3-br0-tree
+
+sudo install -m 0755 tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
+sudo /usr/local/bin/configure-br0-tree.sh
+
+sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
 [Unit]
 Description=Configure GNS3 br0 management bridge
 Before=network-online.target k3s.service k3s-agent.service
@@ -373,12 +376,12 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now gns3-br0-tree.service
-fi
+
+sudo systemctl daemon-reload
+sudo systemctl enable gns3-br0-tree.service
 ```
 
-Si aparece el error de archivo faltante, la VM no tiene una versión del repositorio que incluya ese script. Actualiza el repositorio o copia primero el archivo correcto; no crees ni habilites el servicio mientras `/usr/local/bin/configure-br0-tree.sh` no exista.
+Si `test -f tools/gns3/configure-br0-tree.sh` falla, la VM no tiene una versión del repositorio que incluya ese script. Actualiza el repositorio antes de crear el servicio.
 
 Si ya ejecutaste una versión anterior de la guía y quedó un servicio roto con `status=203/EXEC`, elimínalo antes de repetir el bloque corregido:
 
@@ -395,12 +398,6 @@ systemctl status gns3-br0-tree.service --no-pager
 ip -br addr show br0
 bridge link | grep 'master br0'
 cat /sys/class/net/br0/bridge/stp_state
-```
-
-El modo de emergencia `tree` queda disponible si necesitas forzar una topología fija sin reconvergencia automática:
-
-```bash
-sudo /usr/local/bin/configure-br0-tree.sh tree
 ```
 
 ## 5. Instalar K3s en el primer servidor
@@ -617,7 +614,7 @@ sudo systemctl enable --now k3s-iptables.service
 
 ### 7.7 Configurar `gns3-br0-tree.service` si usarás enlaces redundantes
 
-Si este servidor adicional participa en una topología de gestión redundante, repite la sección 4.7 en esta VM antes de unirla al cluster. Crea un `/etc/default/gns3-br0-tree` propio para este nodo; no reutilices el archivo del primer servidor.
+Si este servidor adicional participa en una topología de gestión redundante, repite la sección 4.7 en esta VM antes de unirla al cluster, pero cambia `NODE_IP`, `STP_PORTS`, `PREFERRED_STP_PORTS` y `BR_PRIORITY` según el cableado de este nodo. No reutilices literalmente el perfil del primer servidor.
 
 ## 8. Unir los servidores adicionales al cluster
 
@@ -818,12 +815,13 @@ sudo systemctl enable --now k3s-iptables.service
 Si los workers usarán una red de gestión redundante, instala el script en la Golden Image, pero no crees un perfil definitivo en `/etc/default/gns3-br0-tree` dentro de la imagen base salvo que todos los clones vayan a compartir exactamente el mismo diseño, cosa que normalmente no ocurre. Cada clon debe tener su propio `NODE_IP`, `BR0_MAC`, puertos y prioridad.
 
 ```bash
+set -euo pipefail
+
 cd ~/ryu-k8s
-if [ ! -f tools/gns3/configure-br0-tree.sh ]; then
-  printf '%s\n' 'ERROR: falta tools/gns3/configure-br0-tree.sh. Actualiza el repositorio antes de crear el servicio.' >&2
-else
-  sudo install -m 0755 tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-  sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
+test -f tools/gns3/configure-br0-tree.sh
+sudo install -m 0755 tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
+
+sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
 [Unit]
 Description=Configure GNS3 br0 management bridge
 Before=network-online.target k3s-agent.service
@@ -838,9 +836,9 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-  sudo systemctl daemon-reload
-  sudo systemctl enable gns3-br0-tree.service
-fi
+
+sudo systemctl daemon-reload
+sudo systemctl enable gns3-br0-tree.service
 ```
 
 El servicio no reconfigura `br0` si `/etc/default/gns3-br0-tree` no existe. Después de crear cada clon en GNS3, si ese worker necesita STP gestionado por este script, entra en la VM, crea su perfil propio siguiendo la sección 4.7 y arranca el servicio antes de unirlo al cluster:
