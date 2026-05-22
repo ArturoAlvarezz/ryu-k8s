@@ -17,7 +17,7 @@
 
 4. [Preparar el primer servidor control-plane](#4-preparar-el-primer-servidor-control-plane)
 5. [Instalar K3s en el primer servidor](#5-instalar-k3s-en-el-primer-servidor)
-6. [Configurar kube-vip en el primer servidor](#6-configurar-kube-vip-en-el-primer-servidor)
+6. [Preparar permisos de kube-vip](#6-preparar-permisos-de-kube-vip)
 7. [Preparar los dos servidores control-plane adicionales](#7-preparar-los-dos-servidores-control-plane-adicionales)
 8. [Unir los servidores adicionales al cluster](#8-unir-los-servidores-adicionales-al-cluster)
 9. [Configurar kubeconfig](#9-configurar-kubeconfig)
@@ -51,15 +51,15 @@ Sigue este orden sin saltarte pasos:
 
 1. Configura el primer servidor control-plane con IP fija `192.168.122.100`.
 2. Instala K3s server en el primer servidor con `--cluster-init`.
-3. Configura `kube-vip` para crear el VIP `192.168.122.10`.
+3. Crea los permisos de `kube-vip`, pero no arranques workers todavía.
 4. Prepara dos nodos adicionales como K3s `server`, no como workers.
-5. Une esos dos nodos adicionales al cluster como `control-plane,etcd`.
-6. Configura `kube-vip` también en los dos servidores adicionales.
+5. Une esos dos nodos adicionales al cluster como `control-plane,etcd` usando `192.168.122.100` como primer miembro etcd.
+6. Despliega `kube-vip` como DaemonSet para crear el VIP `192.168.122.10` en los 3 control-plane.
 7. Solo después de tener 3 control-plane y el VIP activo, arranca workers/agents.
 8. Despliega los manifiestos SDN en Kubernetes.
 9. Ejecuta verificación y debugging únicamente después de terminar el despliegue.
 
-No arranques workers apuntando a `192.168.122.10` antes de configurar `kube-vip`. Si el VIP no existe, los workers se quedarán esperando el API Server.
+No arranques workers apuntando a `192.168.122.10` antes de configurar y verificar `kube-vip`. Si el VIP no existe, los workers se quedarán esperando el API Server.
 
 No conviertas un worker que ya se unió como `agent` en control-plane. Para usar una VM como control-plane, prepárala como servidor antes de instalar `k3s-agent`. Si un nodo ya se unió como worker, recrea la VM o desinstala el agent antes de instalarlo como server.
 
@@ -80,6 +80,34 @@ https://192.168.122.10:6443
 
 El primer servidor `192.168.122.100` se usa solo para inicializar el cluster y para que los servidores adicionales encuentren el primer miembro etcd durante el join.
 
+Recursos mínimos validados para las VMs control-plane:
+
+| Recurso | Valor |
+| --- | --- |
+| RAM | 3 GB o más |
+| CPU | 2 hilos recomendados |
+| Disco | 20 GB o más |
+| Adaptadores | 8 tipo `virtio` |
+
+Un disco de 2-3 GB no alcanza para Ubuntu, Docker y K3s. Si importas un template cloud pequeño, redimensiona el disco antes de instalar K3s.
+
+En GNS3, cambiar RAM/CPU/adaptadores del nodo no redimensiona automáticamente el disco del clon. Antes de arrancar cada control-plane, verifica el `hda_disk.qcow2` del nodo y redimensiónalo si sigue pequeño:
+
+```bash
+DISK=/home/artulita/GNS3/projects/ProyectoMemoria/project-files/qemu/NODE_ID/hda_disk.qcow2
+qemu-img info "$DISK"
+qemu-img resize "$DISK" 20G
+```
+
+Reemplaza `NODE_ID` por el directorio real del nodo QEMU. No copies el comando con `NODE_ID` sin cambiarlo.
+
+Ejecuta `qemu-img resize` con la VM apagada. Después de arrancar, valida dentro de Ubuntu que la partición raíz creció:
+
+```bash
+lsblk
+df -h /
+```
+
 ## 3. Mapa de interfaces
 
 | Interfaz | Uso |
@@ -91,6 +119,19 @@ El primer servidor `192.168.122.100` se usa solo para inicializar el cluster y p
 | `br-sdn` | Bridge Open vSwitch creado por el DaemonSet SDN |
 
 No agregues `br0` dentro de `br-sdn`. `br0` es gestión/fabric; `br-sdn` es dataplane SDN.
+
+Para validar solo Parte I/II con una topología simple, conecta un único cable de gestión por control-plane: `ens3` de cada servidor hacia `Mgmt-STP-Switch`. Mantén `ens4`-`ens6` sin cable o como puertos opcionales en `br0`; no instales `gns3-br0-tree.service` salvo que agregues enlaces redundantes. `ens7` y `ens8` quedan reservadas para guests SDN y no deben entrar a `br0`.
+
+Con nombres GNS3 típicos, la topología mínima para Parte I/II queda así:
+
+| Enlace | Uso |
+| --- | --- |
+| `NAT1:nat0` ↔ `Mgmt-STP-Switch:eth0` | Salida de gestión a `virbr0` |
+| `Master:e0` ↔ `Mgmt-STP-Switch:eth1` | Primer control-plane |
+| `Master2:e0` ↔ `Mgmt-STP-Switch:eth2` | Segundo control-plane |
+| `Master3:e0` ↔ `Mgmt-STP-Switch:eth3` | Tercer control-plane |
+
+No conectes más cables para esta validación simple. Si hay enlaces antiguos o VMs sobrantes de una prueba anterior, elimínalos antes de empezar para no mezclar direcciones DHCP ni estados K3s viejos.
 
 K3s y Flannel deben usar siempre `br0`:
 
@@ -283,6 +324,15 @@ sudo chmod 600 /etc/netplan/50-cloud-init.yaml
 sudo netplan apply
 ```
 
+La sesión SSH puede cortarse cuando `ens3` pasa a formar parte de `br0`. Eso es esperado. Reconecta a `192.168.122.100` y valida antes de seguir:
+
+```bash
+hostname
+ip -br addr show br0
+df -h /
+```
+
+
 ### 4.5 Configurar espera de red
 
 ```bash
@@ -365,8 +415,8 @@ sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
 [Unit]
 Description=Configure GNS3 br0 management bridge
 Before=network-online.target k3s.service k3s-agent.service
-After=network-online.target systemd-udev-settle.service
-Wants=network-online.target
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
@@ -409,10 +459,20 @@ Si estás usando la topología redundante con STP, antes de ejecutar el instalad
 ```bash
 cd ~/ryu-k8s
 
-sudo K3S_CLUSTER_INIT=true \
-  K3S_API_ENDPOINT=192.168.122.10 \
-  K3S_NODE_IP=192.168.122.100 \
+sudo RYU_K3S_CLUSTER_INIT=true \
+  RYU_K3S_API_ENDPOINT=192.168.122.10 \
+  RYU_K3S_NODE_IP=192.168.122.100 \
   ./tools/gns3/k3s-server-ha-install.sh
+```
+
+Espera a que el nodo aparezca estable antes de seguir. Justo después de instalar K3s puede aparecer `Ready` con rol `<none>` durante unos segundos.
+
+```bash
+for i in $(seq 1 30); do
+  sudo kubectl get nodes -o wide
+  sudo kubectl get node master -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}{"\n"}' 2>/dev/null | grep -q true && break
+  sleep 5
+done
 ```
 
 Guarda el token del cluster. Lo usarás en los dos servidores adicionales y en la Golden Image de workers.
@@ -423,11 +483,11 @@ sudo cat /var/lib/rancher/k3s/server/node-token
 
 No subas este token al repositorio.
 
-## 6. Configurar kube-vip en el primer servidor
+## 6. Preparar permisos de kube-vip
 
-Ejecuta esto en `master` después de instalar K3s.
+Ejecuta esto en `master` después de instalar K3s. En esta sección solo se crean los permisos. El VIP se desplegará como DaemonSet después de unir los 3 servidores control-plane.
 
-Primero crea el ServiceAccount y permisos de leader election para `kube-vip`. En K3s, `/etc/rancher/k3s/k3s.yaml` suele quedar legible solo por `root`, por lo que este primer `kubectl apply` debe ejecutarse con `sudo` si todavía no configuraste kubeconfig para el usuario `ubuntu`:
+Crea el ServiceAccount y permisos de leader election para `kube-vip`. En K3s, `/etc/rancher/k3s/k3s.yaml` suele quedar legible solo por `root`, por lo que este primer `kubectl apply` debe ejecutarse con `sudo` si todavía no configuraste kubeconfig para el usuario `ubuntu`:
 
 ```bash
 sudo kubectl apply -f - <<'EOF'
@@ -464,30 +524,7 @@ subjects:
 EOF
 ```
 
-Crea el manifiesto del VIP del API Server. No habilites `--services`; este laboratorio solo necesita que `kube-vip` anuncie `192.168.122.10` para el control-plane.
-
-```bash
-export VIP=192.168.122.10
-export INTERFACE=br0
-export KVVERSION=v0.8.7
-
-sudo mkdir -p /var/lib/rancher/k3s/server/manifests
-sudo ctr image pull ghcr.io/kube-vip/kube-vip:${KVVERSION}
-sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vip manifest pod \
-  --interface ${INTERFACE} \
-  --address ${VIP} \
-  --controlplane \
-  --arp \
-  --leaderElection \
-  | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
-
-sudo sed -i '/^  hostNetwork: true/i\  serviceAccountName: kube-vip' \
-  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
-sudo sed -i 's#/etc/kubernetes/admin.conf#/etc/rancher/k3s/k3s.yaml#g' \
-  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
-```
-
-`kube-vip` crea el endpoint estable `192.168.122.10:6443`. Los workers deben usar ese endpoint, no la IP fija del primer servidor.
+No escribas todavía `/var/lib/rancher/k3s/server/manifests/kube-vip.yaml`: si K3s aplica un YAML incompleto mientras lo estás parcheando, `kube-vip` puede quedar con `serviceAccountName: default` o con el kubeconfig equivocado. En esta guía se usa un DaemonSet aplicado una vez cuando ya existen los 3 control-plane.
 
 ## 7. Preparar los dos servidores control-plane adicionales
 
@@ -568,6 +605,16 @@ sudo chmod 600 /etc/netplan/50-cloud-init.yaml
 sudo netplan apply
 ```
 
+Después de `netplan apply`, la IP DHCP de la VM puede cambiar porque la dirección pasa de `ens3` a `br0`. Si pierdes la sesión SSH, busca la nueva IP en la consola de GNS3, en la tabla DHCP/NAT o con un escaneo de `192.168.122.0/24`, y continúa desde esa IP.
+
+No ejecutes la sección 7.5 hasta haber reconectado a la IP nueva y validado `br0`:
+
+```bash
+hostname
+ip -br addr show br0
+df -h /
+```
+
 ### 7.5 Configurar hostname único
 
 En el segundo servidor usa `control-2`. En el tercer servidor usa `control-3`.
@@ -627,36 +674,122 @@ Si el servidor adicional forma parte de una topología redundante, completa prim
 ```bash
 cd ~/ryu-k8s
 
-sudo K3S_NODE_TOKEN='<TOKEN_REAL_DEL_CLUSTER_HA>' \
-  K3S_API_ENDPOINT=192.168.122.10 \
-  K3S_FIRST_SERVER_IP=192.168.122.100 \
+sudo RYU_K3S_NODE_TOKEN='<TOKEN_REAL_DEL_CLUSTER_HA>' \
+  RYU_K3S_API_ENDPOINT=192.168.122.10 \
+  RYU_K3S_FIRST_SERVER_IP=192.168.122.100 \
   ./tools/gns3/k3s-server-ha-install.sh
 ```
 
-Después de unir cada servidor adicional, instala `kube-vip` también en ese servidor:
+No uses `K3S_NODE_TOKEN` como variable de entorno directa al unir servidores. K3s persiste variables `K3S_*` en anotaciones internas del Node; el script acepta `RYU_K3S_NODE_TOKEN` y limpia el entorno antes de llamar al instalador.
+
+Después de unir los dos servidores adicionales, valida desde cualquier control-plane que los 3 nodos estén listos:
 
 ```bash
-export VIP=192.168.122.10
-export INTERFACE=br0
-export KVVERSION=v0.8.7
-
-sudo mkdir -p /var/lib/rancher/k3s/server/manifests
-sudo ctr image pull ghcr.io/kube-vip/kube-vip:${KVVERSION}
-sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:${KVVERSION} vip /kube-vip manifest pod \
-  --interface ${INTERFACE} \
-  --address ${VIP} \
-  --controlplane \
-  --arp \
-  --leaderElection \
-  | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
-
-sudo sed -i '/^  hostNetwork: true/i\  serviceAccountName: kube-vip' \
-  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
-sudo sed -i 's#/etc/kubernetes/admin.conf#/etc/rancher/k3s/k3s.yaml#g' \
-  /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+sudo kubectl get nodes -o wide
 ```
 
 Los tres servidores deben quedar como miembros etcd/control-plane antes de arrancar workers.
+
+Despliega `kube-vip` una sola vez como DaemonSet. No habilites `services`; este laboratorio solo necesita que `kube-vip` anuncie `192.168.122.10` para el API Server.
+
+```bash
+sudo kubectl apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-vip-ds
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kube-vip-ds
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-vip-ds
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-vip-ds
+    spec:
+      serviceAccountName: kube-vip
+      hostNetwork: true
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames:
+            - kubernetes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: kube-vip
+          image: ghcr.io/kube-vip/kube-vip:v0.8.7
+          imagePullPolicy: IfNotPresent
+          args:
+            - manager
+          env:
+            - name: vip_arp
+              value: "true"
+            - name: port
+              value: "6443"
+            - name: vip_nodename
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: vip_interface
+              value: br0
+            - name: vip_cidr
+              value: "32"
+            - name: dns_mode
+              value: first
+            - name: cp_enable
+              value: "true"
+            - name: cp_namespace
+              value: kube-system
+            - name: vip_leaderelection
+              value: "true"
+            - name: vip_leasename
+              value: plndr-cp-lock
+            - name: vip_leaseduration
+              value: "5"
+            - name: vip_renewdeadline
+              value: "3"
+            - name: vip_retryperiod
+              value: "1"
+            - name: address
+              value: 192.168.122.10
+            - name: prometheus_server
+              value: :2112
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          volumeMounts:
+            - mountPath: /etc/kubernetes/admin.conf
+              name: kubeconfig
+      volumes:
+        - name: kubeconfig
+          hostPath:
+            path: /etc/rancher/k3s/k3s.yaml
+EOF
+
+sudo kubectl -n kube-system rollout status daemonset/kube-vip-ds --timeout=240s
+sudo kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide
+sudo kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
+curl -k https://192.168.122.10:6443/readyz
+```
+
+El bloque `hostAliases` es intencional: fuerza a cada pod de `kube-vip` a hablar con el API local en `127.0.0.1`. Sin eso, los pods de `control-2` y `control-3` pueden intentar renovar o adquirir el lease a través del Service `kubernetes` y quedarse sin failover cuando cae `master`.
 
 ## 9. Configurar kubeconfig
 
@@ -672,8 +805,12 @@ chmod 600 ~/.kube/config
 sed -i 's#https://127.0.0.1:6443#https://192.168.122.10:6443#g' ~/.kube/config
 sed -i 's#https://192.168.122.100:6443#https://192.168.122.10:6443#g' ~/.kube/config
 grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.bashrc || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.bashrc
+grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.profile || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.profile
 export KUBECONFIG=$HOME/.kube/config
+kubectl get nodes -o wide
 ```
+
+Si abres una sesión no interactiva o ejecutas comandos remotos que no cargan `~/.bashrc`, antepone `KUBECONFIG=$HOME/.kube/config` o usa `sudo kubectl`. Sin esa variable, el wrapper de K3s puede intentar leer `/etc/rancher/k3s/k3s.yaml` y fallar por permisos.
 
 Si ves este error, el cluster puede estar sano; solo falta configurar permisos para el usuario actual:
 
@@ -704,6 +841,17 @@ Recursos recomendados:
 | CPU | 1 hilo |
 | Disco | 10 GB |
 | Adaptadores | 6 tipo `virtio` |
+
+Si usas un template QEMU con linked clones, GNS3 puede crear el archivo `hda_disk.qcow2` recién al primer arranque del nodo. Si el archivo aún no existe, arranca la VM una vez, apágala inmediatamente desde GNS3 o con `sudo poweroff`, y redimensiona el disco con la VM apagada antes de instalar paquetes:
+
+```bash
+DISK=/home/artulita/GNS3/projects/ProyectoMemoria/project-files/qemu/NODE_ID/hda_disk.qcow2
+qemu-img info "$DISK"
+qemu-img resize "$DISK" 10G
+qemu-img info "$DISK"
+```
+
+Reemplaza `NODE_ID` por el directorio real del nodo QEMU. No copies el comando con `NODE_ID` sin cambiarlo.
 
 Ejecuta las siguientes secciones solo en la VM base del worker.
 
@@ -780,6 +928,14 @@ sudo chmod 600 /etc/netplan/50-cloud-init.yaml
 sudo netplan apply
 ```
 
+Después de `netplan apply`, la IP DHCP puede cambiar porque la dirección pasa de `ens3` a `br0`. Si se corta SSH, busca la nueva IP en la tabla DHCP/NAT o en la consola de GNS3 y continúa desde esa IP. Valida antes de seguir:
+
+```bash
+ip -br addr show br0
+bridge link | grep 'master br0'
+df -h /
+```
+
 ### 10.5 Configurar espera de red y forwarding
 
 ```bash
@@ -825,8 +981,8 @@ sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
 [Unit]
 Description=Configure GNS3 br0 management bridge
 Before=network-online.target k3s-agent.service
-After=network-online.target systemd-udev-settle.service
-Wants=network-online.target
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
@@ -893,14 +1049,20 @@ Crea el drop-in con el token real y el VIP del API Server:
 sudo mkdir -p /etc/systemd/system/k3s-autojoin.service.d
 sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service.d/token.conf << EOF
 [Service]
-Environment=K3S_NODE_TOKEN=<TOKEN_REAL_DEL_CLUSTER_HA>
-Environment=K3S_API_ENDPOINT=192.168.122.10
+Environment=RYU_K3S_NODE_TOKEN=<TOKEN_REAL_DEL_CLUSTER_HA>
+Environment=RYU_K3S_API_ENDPOINT=192.168.122.10
 EOF'
 sudo chmod 600 /etc/systemd/system/k3s-autojoin.service.d/token.conf
 
 sudo systemctl daemon-reload
 sudo systemctl enable k3s-autojoin.service
+sudo systemd-analyze verify \
+  /etc/systemd/system/k3s-autojoin.service \
+  /etc/systemd/system/gns3-br0-tree.service \
+  /etc/systemd/system/k3s-iptables.service
 ```
+
+No uses `K3S_NODE_TOKEN` como variable del drop-in del worker. K3s persiste variables `K3S_*` en la anotación `k3s.io/node-env` del objeto Node; `RYU_K3S_NODE_TOKEN` evita exponer el token en Kubernetes y el script limpia el entorno antes de invocar el instalador.
 
 No ejecutes `systemctl start k3s-autojoin.service` en la VM base. El servicio debe quedar solo habilitado para que corra en cada clon al primer arranque.
 
@@ -939,11 +1101,29 @@ Exporta el disco `.qcow2` desde el hipervisor y úsalo como appliance de worker 
 1. Mantén encendidos los 3 servidores control-plane.
 2. Mantén activo el VIP `192.168.122.10`.
 3. Arrastra la appliance `SDN-Worker` al canvas tantas veces como necesites.
-4. Conecta `ens3`-`ens6` a la red de gestión/fabric.
+4. Conecta los workers solo a puertos libres de nodos control-plane. No conectes ningún worker al `Mgmt-STP-Switch`, al switch básico de GNS3 ni a `NAT1`.
 5. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN.
 6. Enciende los workers.
 
+Cableado válido mínimo para un worker con un solo enlace:
+
+| Worker | Control-plane |
+| --- | --- |
+| `SDN-Worker-1:e0` (`ens3`) | `Master-1:e1` (`ens4`) |
+| `SDN-Worker-2:e0` (`ens3`) | `Master-2:e1` (`ens4`) |
+| `SDN-Worker-3:e0` (`ens3`) | `Master-3:e1` (`ens4`) |
+
+Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master-1:e1`, `Master-2:e1` y `Master-3:e1`, y crea un perfil `gns3-br0-tree` específico para ese clon antes de unirlo. No uses el switch de gestión como punto de conexión de workers.
+
 Cada worker obtiene IP por DHCP en `br0`, genera hostname `worker-<mac>`, instala `k3s-agent` y se une al cluster usando `https://192.168.122.10:6443`.
+
+Valida desde un control-plane:
+
+```bash
+kubectl get nodes -o wide
+kubectl get node <worker-name> -o jsonpath='{.metadata.annotations.k3s\.io/node-args}{"\n"}'
+kubectl get node <worker-name> -o jsonpath='{.metadata.annotations.k3s\.io/node-env}{"\n"}' | grep -q 'K3S_NODE_TOKEN' && echo ERROR_TOKEN_EXPOSED || echo TOKEN_NOT_EXPOSED
+```
 
 ---
 
@@ -1047,24 +1227,24 @@ Comprueba qué nodo control-plane está anunciando el VIP HA `192.168.122.10`:
 kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
 ```
 
-El valor devuelto es el nodo que tiene el mando actual del VIP. Para ver el pod de `kube-vip` y su ubicación:
+El valor devuelto es el nodo que tiene el mando actual del VIP. Para ver los pods de `kube-vip` y su ubicación:
 
 ```bash
-kubectl -n kube-system get pod kube-vip -o wide
+kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide
 ```
 
 Para revisar los cambios de liderazgo o errores recientes de `kube-vip`:
 
 ```bash
-kubectl -n kube-system logs kube-vip --tail=50
+kubectl -n kube-system logs -l app.kubernetes.io/name=kube-vip-ds --tail=50 --prefix
 ```
 
 Desde la máquina local del repositorio también puedes consultarlo por SSH contra el master:
 
 ```bash
 python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{\"\n\"}'"
-python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system get pod kube-vip -o wide"
-python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system logs kube-vip --tail=50"
+python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide"
+python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system logs -l app.kubernetes.io/name=kube-vip-ds --tail=50 --prefix"
 ```
 
 ## 16. Verificación de servicios SDN
@@ -1152,13 +1332,19 @@ journalctl -u k3s-agent -n 120 --no-pager
 Comprueba que el endpoint configurado sea el VIP:
 
 ```bash
-sudo grep K3S_API_ENDPOINT /etc/systemd/system/k3s-autojoin.service.d/token.conf
+sudo grep RYU_K3S_API_ENDPOINT /etc/systemd/system/k3s-autojoin.service.d/token.conf
 ```
 
 Debe ser:
 
 ```text
-Environment=K3S_API_ENDPOINT=192.168.122.10
+Environment=RYU_K3S_API_ENDPOINT=192.168.122.10
+```
+
+El archivo no debe contener `K3S_NODE_TOKEN`:
+
+```bash
+sudo grep -q K3S_NODE_TOKEN /etc/systemd/system/k3s-autojoin.service.d/token.conf && echo ERROR_TOKEN_ENV || echo OK
 ```
 
 Comprueba conectividad al API Server:
@@ -1184,19 +1370,21 @@ sudo systemctl restart k3s-autojoin.service
 En cada control-plane:
 
 ```bash
-sudo ls -l /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
 kubectl -n kube-system get lease plndr-cp-lock -o yaml
-kubectl -n kube-system get pods -o wide | grep kube-vip
+kubectl -n kube-system get daemonset kube-vip-ds -o wide
+kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide
 kubectl -n kube-system logs <kube-vip-pod-name> --tail=120
 ```
 
 En el lease, `spec.holderIdentity` indica qué control-plane está anunciando el VIP.
 
-Comprueba que el manifiesto use `br0` y `192.168.122.10`:
+Comprueba que el DaemonSet use `br0`, `192.168.122.10`, el kubeconfig de K3s y el alias local del API:
 
 ```bash
-sudo grep -E 'vip_interface|address|192.168.122.10|br0' /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+kubectl -n kube-system get daemonset kube-vip-ds -o yaml | grep -E 'vip_interface|address:|192.168.122.10|br0|/etc/rancher/k3s/k3s.yaml|hostAliases|127.0.0.1'
 ```
+
+Si `control-2` o `control-3` muestran `context deadline exceeded` al intentar leer el lease, revisa que exista `hostAliases` con `kubernetes -> 127.0.0.1` en el DaemonSet. Sin ese alias, el failover puede no ocurrir cuando cae `master`.
 
 ### 18.3 IP interna y Flannel no coinciden
 
@@ -1326,8 +1514,12 @@ Apaga el nodo `master` en GNS3.
 Desde otro control-plane:
 
 ```bash
-kubectl get nodes
-curl -k https://192.168.122.10:6443/readyz
+for i in $(seq 1 30); do
+  curl -k --max-time 3 https://192.168.122.10:6443/readyz && break
+  sleep 2
+done
+KUBECONFIG=$HOME/.kube/config kubectl get nodes
+KUBECONFIG=$HOME/.kube/config kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
 curl http://192.168.122.10:8080/api/topology
 curl http://192.168.122.10:8081/api/health
 ```
@@ -1335,6 +1527,7 @@ curl http://192.168.122.10:8081/api/health
 Resultado esperado:
 
 - `kubectl` sigue funcionando contra `192.168.122.10`.
+- El lease `plndr-cp-lock` cambia a un control-plane vivo. En GNS3 puede tardar 30-60 segundos mientras convergen ARP, kube-vip y etcd.
 - Redis Sentinel mantiene o elige un master.
 - Los DaemonSets críticos siguen activos en los nodos vivos.
 - Los Deployments se recrean fuera del nodo apagado si tenían réplicas allí.

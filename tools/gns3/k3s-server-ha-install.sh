@@ -2,11 +2,11 @@
 # Instala o une un nodo K3s server HA usando embedded etcd y VIP estable.
 set -euo pipefail
 
-K3S_NODE_TOKEN="${K3S_NODE_TOKEN:-}"
-K3S_API_ENDPOINT="${K3S_API_ENDPOINT:-192.168.122.10}"
-K3S_FIRST_SERVER_IP="${K3S_FIRST_SERVER_IP:-192.168.122.100}"
-K3S_NODE_IP="${K3S_NODE_IP:-}"
-K3S_CLUSTER_INIT="${K3S_CLUSTER_INIT:-false}"
+JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-}}"
+API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-192.168.122.10}}"
+FIRST_SERVER_IP="${RYU_K3S_FIRST_SERVER_IP:-${K3S_FIRST_SERVER_IP:-192.168.122.100}}"
+NODE_IP="${RYU_K3S_NODE_IP:-${K3S_NODE_IP:-}}"
+CLUSTER_INIT="${RYU_K3S_CLUSTER_INIT:-${K3S_CLUSTER_INIT:-false}}"
 
 install_br0_tree_guard() {
   if [ ! -r /etc/default/gns3-br0-tree ]; then
@@ -101,8 +101,8 @@ EOF
 [Unit]
 Description=Configure loop-free br0 tree for GNS3 SDN lab
 Before=network-online.target k3s.service k3s-agent.service
-After=network-online.target systemd-udev-settle.service
-Wants=network-online.target
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
@@ -119,29 +119,41 @@ EOF
 
 install_br0_tree_guard
 
-if [ -z "$K3S_NODE_IP" ]; then
-  K3S_NODE_IP=$(ip -4 addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
+if [ -z "$NODE_IP" ]; then
+  NODE_IP=$(ip -4 addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
 fi
 
-if [ -z "$K3S_NODE_IP" ]; then
-  echo "ERROR: no se pudo detectar K3S_NODE_IP en br0" >&2
+if [ -z "$NODE_IP" ]; then
+  echo "ERROR: no se pudo detectar RYU_K3S_NODE_IP en br0" >&2
   exit 1
 fi
 
-if [ "$K3S_CLUSTER_INIT" != "true" ] && [ -z "$K3S_NODE_TOKEN" ]; then
-  echo "ERROR: define K3S_NODE_TOKEN para unir servidores adicionales" >&2
+if [ "$CLUSTER_INIT" != "true" ] && [ -z "$JOIN_TOKEN" ]; then
+  echo "ERROR: define RYU_K3S_NODE_TOKEN para unir servidores adicionales" >&2
   exit 1
 fi
 
-COMMON_ARGS="server --node-ip=${K3S_NODE_IP} --advertise-address=${K3S_NODE_IP} --flannel-iface=br0 --tls-san=${K3S_API_ENDPOINT} --tls-san=${K3S_NODE_IP} --etcd-arg=heartbeat-interval=500 --etcd-arg=election-timeout=5000"
+COMMON_ARGS="server --node-ip=${NODE_IP} --advertise-address=${NODE_IP} --flannel-iface=br0 --tls-san=${API_ENDPOINT} --tls-san=${NODE_IP} --etcd-arg=heartbeat-interval=500 --etcd-arg=election-timeout=5000"
 
-if [ "$K3S_CLUSTER_INIT" = "true" ]; then
-  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="${COMMON_ARGS} --cluster-init" sh -
+if [ "$CLUSTER_INIT" = "true" ]; then
+  curl -sfL https://get.k3s.io | \
+    env -u RYU_K3S_NODE_TOKEN -u K3S_NODE_TOKEN \
+      -u RYU_K3S_API_ENDPOINT -u K3S_API_ENDPOINT \
+      -u RYU_K3S_FIRST_SERVER_IP -u K3S_FIRST_SERVER_IP \
+      -u RYU_K3S_NODE_IP -u K3S_NODE_IP \
+      -u RYU_K3S_CLUSTER_INIT -u K3S_CLUSTER_INIT \
+      INSTALL_K3S_EXEC="${COMMON_ARGS} --cluster-init" \
+      sh -
 else
   curl -sfL https://get.k3s.io | \
+    env -u RYU_K3S_NODE_TOKEN -u K3S_NODE_TOKEN \
+      -u RYU_K3S_API_ENDPOINT -u K3S_API_ENDPOINT \
+      -u RYU_K3S_FIRST_SERVER_IP -u K3S_FIRST_SERVER_IP \
+      -u RYU_K3S_NODE_IP -u K3S_NODE_IP \
+      -u RYU_K3S_CLUSTER_INIT -u K3S_CLUSTER_INIT \
     INSTALL_K3S_EXEC="${COMMON_ARGS}" \
-    K3S_URL="https://${K3S_FIRST_SERVER_IP}:6443" \
-    K3S_TOKEN="$K3S_NODE_TOKEN" \
+    K3S_URL="https://${FIRST_SERVER_IP}:6443" \
+    K3S_TOKEN="$JOIN_TOKEN" \
     sh -
 fi
 
@@ -194,5 +206,5 @@ ln -sf /etc/rancher/k3s/k3s.yaml /etc/kubernetes/admin.conf
 mkdir -p /root/.kube /home/ubuntu/.kube
 cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
 cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
-sed -i "s#https://127.0.0.1:6443#https://${K3S_API_ENDPOINT}:6443#g; s#https://${K3S_NODE_IP}:6443#https://${K3S_API_ENDPOINT}:6443#g" /root/.kube/config /home/ubuntu/.kube/config
+sed -i "s#https://127.0.0.1:6443#https://${API_ENDPOINT}:6443#g; s#https://${NODE_IP}:6443#https://${API_ENDPOINT}:6443#g" /root/.kube/config /home/ubuntu/.kube/config
 chown -R ubuntu:ubuntu /home/ubuntu/.kube

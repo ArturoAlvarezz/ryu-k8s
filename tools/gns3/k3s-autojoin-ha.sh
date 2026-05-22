@@ -2,15 +2,15 @@
 # Auto-join de nodos K3s agent contra el VIP HA del API Server.
 set -euo pipefail
 
-K3S_NODE_TOKEN="${K3S_NODE_TOKEN:-}"
-K3S_API_ENDPOINT="${K3S_API_ENDPOINT:-192.168.122.10}"
+JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-}}"
+API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-192.168.122.10}}"
 
 if [ -x /usr/local/bin/configure-br0-tree.sh ]; then
   /usr/local/bin/configure-br0-tree.sh || true
 fi
 
-if [ -z "$K3S_NODE_TOKEN" ] || echo "$K3S_NODE_TOKEN" | grep -q '^<'; then
-  echo "[autojoin] ERROR: define K3S_NODE_TOKEN con el token real del cluster HA."
+if [ -z "$JOIN_TOKEN" ] || echo "$JOIN_TOKEN" | grep -q '^<'; then
+  echo "[autojoin] ERROR: define RYU_K3S_NODE_TOKEN con el token real del cluster HA."
   exit 1
 fi
 
@@ -41,9 +41,9 @@ hostnamectl set-hostname "$NEW_HOSTNAME"
 sed -i '/127.0.1.1/d' /etc/hosts
 echo "127.0.1.1 $NEW_HOSTNAME" >> /etc/hosts
 
-echo "[autojoin] Esperando API Server HA en ${K3S_API_ENDPOINT}:6443..."
+echo "[autojoin] Esperando API Server HA en ${API_ENDPOINT}:6443..."
 for _ in $(seq 1 60); do
-  if timeout 2 bash -c "</dev/tcp/${K3S_API_ENDPOINT}/6443" >/dev/null 2>&1; then
+  if timeout 2 bash -c "</dev/tcp/${API_ENDPOINT}/6443" >/dev/null 2>&1; then
     API_READY=true
     break
   fi
@@ -51,14 +51,16 @@ for _ in $(seq 1 60); do
 done
 
 if [ "${API_READY:-false}" != true ]; then
-  echo "[autojoin] ERROR: API Server HA no responde en ${K3S_API_ENDPOINT}:6443."
+  echo "[autojoin] ERROR: API Server HA no responde en ${API_ENDPOINT}:6443."
   exit 1
 fi
 
 curl -sfL https://get.k3s.io | \
+  env -u RYU_K3S_NODE_TOKEN -u K3S_NODE_TOKEN \
+    -u RYU_K3S_API_ENDPOINT -u K3S_API_ENDPOINT \
   INSTALL_K3S_EXEC="--node-ip=$MY_IP --flannel-iface=br0" \
-  K3S_URL="https://${K3S_API_ENDPOINT}:6443" \
-  K3S_TOKEN="$K3S_NODE_TOKEN" \
+  K3S_URL="https://${API_ENDPOINT}:6443" \
+  K3S_TOKEN="$JOIN_TOKEN" \
   sh -
 
 if [ -f /etc/systemd/system/gns3-br0-tree.service ]; then
