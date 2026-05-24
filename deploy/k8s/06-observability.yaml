@@ -546,7 +546,7 @@ data:
             "label": "Guest origen",
             "type": "query",
             "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "query": "query_result(max by (id) (ryu_topology_node_info{type=\"guest\"}))",
+            "query": "query_result(max by (id) (last_over_time(ryu_topology_node_info{type=\"guest\"}[30s])))",
             "regex": "/id=\"([^\"]+)\"/",
             "refresh": 1,
             "sort": 1,
@@ -558,7 +558,7 @@ data:
             "label": "Guest destino",
             "type": "query",
             "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "query": "query_result(max by (id) (ryu_topology_node_info{type=\"guest\",id!=\"$src_guest\"}))",
+            "query": "query_result(max by (id) (last_over_time(ryu_topology_node_info{type=\"guest\",id!=\"$src_guest\"}[30s])))",
             "regex": "/id=\"([^\"]+)\"/",
             "refresh": 1,
             "sort": 1,
@@ -592,13 +592,13 @@ data:
           "targets": [
             {
               "refId": "nodes",
-              "expr": "max by (id, title, subtitle, mainstat, color, icon, type) (ryu_topology_node_info)",
+              "expr": "topk by (id) (1, last_over_time(ryu_topology_node_info[30s]))",
               "format": "table",
               "instant": true
             },
             {
               "refId": "edges",
-              "expr": "max by (id, source, target, link, mainstat, secondarystat, color, strokeDasharray, thickness, type) (((ryu_topology_edge_info{link!=\"\"} unless on (link) ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}) or ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}))",
+              "expr": "topk by (link) (1, ((last_over_time(ryu_topology_edge_info{link!=\"\"}[30s]) unless on (link) last_over_time(ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}[30s])) or last_over_time(ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}[30s])))",
               "format": "table",
               "instant": true
             }

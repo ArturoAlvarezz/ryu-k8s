@@ -5,6 +5,11 @@ set -euo pipefail
 JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-}}"
 API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-192.168.122.10}}"
 
+if systemctl list-unit-files k3s.service 2>/dev/null | grep -q '^k3s.service'; then
+  echo "[autojoin] k3s server detectado; no se instala k3s-agent ni se cambia hostname."
+  exit 0
+fi
+
 if [ -x /usr/local/bin/configure-br0-tree.sh ]; then
   /usr/local/bin/configure-br0-tree.sh || true
 fi
@@ -58,19 +63,9 @@ fi
 curl -sfL https://get.k3s.io | \
   env -u RYU_K3S_NODE_TOKEN -u K3S_NODE_TOKEN \
     -u RYU_K3S_API_ENDPOINT -u K3S_API_ENDPOINT \
-  INSTALL_K3S_EXEC="--node-ip=$MY_IP --flannel-iface=br0" \
+  INSTALL_K3S_EXEC="--node-name=$NEW_HOSTNAME --node-ip=$MY_IP --flannel-iface=br0" \
   K3S_URL="https://${API_ENDPOINT}:6443" \
   K3S_TOKEN="$JOIN_TOKEN" \
   sh -
-
-if [ -f /etc/systemd/system/gns3-br0-tree.service ]; then
-  mkdir -p /etc/systemd/system/k3s-agent.service.d
-  cat >/etc/systemd/system/k3s-agent.service.d/10-gns3-br0-tree.conf <<'EOF'
-[Unit]
-Requires=gns3-br0-tree.service
-After=gns3-br0-tree.service
-EOF
-  systemctl daemon-reload
-fi
 
 echo "[autojoin] Nodo $NEW_HOSTNAME unido al cluster HA."

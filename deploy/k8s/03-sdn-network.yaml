@@ -289,6 +289,13 @@ spec:
                 if [ -z "$REMOTE_IP" ]; then
                   REMOTE_IP=$(get_static_br0_neighbor_ip "$stp_intf")
                 fi
+                if [ -z "$REMOTE_IP" ]; then
+                  case "${NODE_NAME}:${stp_intf}" in
+                    master:ens3|control-*:ens3)
+                      REMOTE_IP="mgmt-switch"
+                      ;;
+                  esac
+                fi
                 if [ -n "$REMOTE_IP" ]; then
                   redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
                 fi

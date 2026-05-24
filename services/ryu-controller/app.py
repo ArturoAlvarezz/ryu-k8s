@@ -22,6 +22,7 @@ from ryu.topology import event, switches
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
+MGMT_SWITCH_ID = "mgmt-stp-switch"
 
 
 def _escape_label(value):
@@ -688,6 +689,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         vxlan_edges = {}
         br0_edges = {}
         guests = {}
+        has_mgmt_switch = False
 
         ip_to_dpid = {}
         for raw_dpid, ip in node_ips.items():
@@ -803,8 +805,6 @@ class DistributedL2Switch(app_manager.RyuApp):
             })
 
         for edge in vxlan_edges.values():
-            if edge["details"]:
-                edge["secondarystat"] = " | ".join(sorted(edge["details"]))
             edge.pop("details", None)
             edges.append(edge)
 
@@ -814,6 +814,26 @@ class DistributedL2Switch(app_manager.RyuApp):
             raw_dpid, intf = key.split(":", 1)
             local_dpid = self._raw_dpid_to_decimal(raw_dpid)
             state, _, remote_ip = str(status).partition(":")
+            if remote_ip == "mgmt-switch":
+                if local_dpid not in dpids:
+                    continue
+                has_mgmt_switch = True
+                edge_id = "br0:%s:%s" % (local_dpid, MGMT_SWITCH_ID)
+                edge = br0_edges.setdefault(edge_id, {
+                    "id": edge_id,
+                    "source": local_dpid,
+                    "target": MGMT_SWITCH_ID,
+                    "mainstat": "br0 switch",
+                    "secondarystat": "mgmt uplink",
+                    "color": "#22c55e" if state == "forwarding" else "#f59e0b",
+                    "strokeDasharray": "" if state == "forwarding" else "5 5",
+                    "thickness": "2" if state == "forwarding" else "1",
+                    "type": "br0_mgmt_switch",
+                    "details": [],
+                })
+                edge["details"].append("%s:%s=%s" % (local_dpid, intf, state))
+                continue
+
             remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
             if not remote_dpid or local_dpid not in dpids or remote_dpid not in dpids:
                 continue
@@ -836,6 +856,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             if state != "forwarding":
                 edge.update({
                     "mainstat": "br0 STP blocked" if state == "blocking" else "br0 disabled",
+                    "secondarystat": "STP blocked" if state == "blocking" else "STP disabled",
                     "color": "#ef4444",
                     "strokeDasharray": "",
                     "thickness": "6",
@@ -843,14 +864,23 @@ class DistributedL2Switch(app_manager.RyuApp):
                 })
 
         for edge in br0_edges.values():
-            if edge["details"]:
-                edge["secondarystat"] = " | ".join(sorted(edge["details"]))
             edge.pop("details", None)
             link = _edge_link_id(edge["source"], edge["target"])
-            if edge["type"] == "br0_stp_blocked":
-                # Reemplazar VXLAN si existe para el mismo par — STP bloqueado tiene prioridad visual
-                edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
+            # Grafana debe recibir una sola arista por par de nodos. Si hay
+            # enlace físico br0, este reemplaza la arista VXLAN conceptual.
+            edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
             edges.append(edge)
+
+        if has_mgmt_switch:
+            nodes.append({
+                "id": MGMT_SWITCH_ID,
+                "title": "Mgmt-STP-Switch",
+                "subtitle": "br0 STP root",
+                "mainstat": "mgmt switch",
+                "color": "#22c55e",
+                "icon": "server",
+                "type": "switch",
+            })
 
         nodes.extend(guests.values())
         return nodes, edges, guests, ip_to_dpid
@@ -950,6 +980,7 @@ class DistributedL2Switch(app_manager.RyuApp):
     def _append_topology_metrics(self, lines):
         nodes, edges, guests, ip_to_dpid = self._build_topology_snapshot()
         dpids = {node["id"] for node in nodes if node["type"] == "switch"}
+        sample_value = str(datetime.utcnow().timestamp())
 
         lines.extend([
             "# HELP ryu_topology_node_info SDN topology nodes for Grafana node graph.",
@@ -968,7 +999,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     _escape_label(node["type"]),
                 )
             )
-            lines.append("ryu_topology_node_info{%s} 1" % labels)
+            lines.append("ryu_topology_node_info{%s} %s" % (labels, sample_value))
 
         lines.extend([
             "# HELP ryu_topology_edge_info SDN topology edges for Grafana node graph.",
@@ -990,7 +1021,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     _escape_label(edge["type"]),
                 )
             )
-            lines.append("ryu_topology_edge_info{%s} 1" % labels)
+            lines.append("ryu_topology_edge_info{%s} %s" % (labels, sample_value))
 
         lines.extend([
             "# HELP ryu_trace_path_edge_info Highlighted guest-to-guest path edges for Grafana node graph.",
@@ -1019,7 +1050,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                             "path",
                         )
                     )
-                    lines.append("ryu_trace_path_edge_info{%s} 1" % labels)
+                    lines.append("ryu_trace_path_edge_info{%s} %s" % (labels, sample_value))
 
     def _render_prometheus_metrics(self):
         redis_counts = self._redis_metric_counts()

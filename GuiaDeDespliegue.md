@@ -45,24 +45,6 @@
 
 # Parte I — Reglas de Despliegue
 
-## 1. Orden obligatorio
-
-Sigue este orden sin saltarte pasos:
-
-1. Configura el primer servidor control-plane con IP fija `192.168.122.100`.
-2. Instala K3s server en el primer servidor con `--cluster-init`.
-3. Crea los permisos de `kube-vip`, pero no arranques workers todavía.
-4. Prepara dos nodos adicionales como K3s `server`, no como workers.
-5. Une esos dos nodos adicionales al cluster como `control-plane,etcd` usando `192.168.122.100` como primer miembro etcd.
-6. Despliega `kube-vip` como DaemonSet para crear el VIP `192.168.122.10` en los 3 control-plane.
-7. Solo después de tener 3 control-plane y el VIP activo, arranca workers/agents.
-8. Despliega los manifiestos SDN en Kubernetes.
-9. Ejecuta verificación y debugging únicamente después de terminar el despliegue.
-
-No arranques workers apuntando a `192.168.122.10` antes de configurar y verificar `kube-vip`. Si el VIP no existe, los workers se quedarán esperando el API Server.
-
-No conviertas un worker que ya se unió como `agent` en control-plane. Para usar una VM como control-plane, prepárala como servidor antes de instalar `k3s-agent`. Si un nodo ya se unió como worker, recrea la VM o desinstala el agent antes de instalarlo como server.
-
 ## 2. Roles de nodos
 
 | Rol | Cantidad | IP | Instalación K3s |
@@ -87,26 +69,7 @@ Recursos mínimos validados para las VMs control-plane:
 | RAM | 3 GB o más |
 | CPU | 2 hilos recomendados |
 | Disco | 20 GB o más |
-| Adaptadores | 8 tipo `virtio` |
-
-Un disco de 2-3 GB no alcanza para Ubuntu, Docker y K3s. Si importas un template cloud pequeño, redimensiona el disco antes de instalar K3s.
-
-En GNS3, cambiar RAM/CPU/adaptadores del nodo no redimensiona automáticamente el disco del clon. Antes de arrancar cada control-plane, verifica el `hda_disk.qcow2` del nodo y redimensiónalo si sigue pequeño:
-
-```bash
-DISK=/home/artulita/GNS3/projects/ProyectoMemoria/project-files/qemu/NODE_ID/hda_disk.qcow2
-qemu-img info "$DISK"
-qemu-img resize "$DISK" 20G
-```
-
-Reemplaza `NODE_ID` por el directorio real del nodo QEMU. No copies el comando con `NODE_ID` sin cambiarlo.
-
-Ejecuta `qemu-img resize` con la VM apagada. Después de arrancar, valida dentro de Ubuntu que la partición raíz creció:
-
-```bash
-lsblk
-df -h /
-```
+| Adaptadores | 6 tipo `virtio` |
 
 ## 3. Mapa de interfaces
 
@@ -118,38 +81,11 @@ df -h /
 | `br0` | Bridge Linux de gestión/fabric `192.168.122.0/24` |
 | `br-sdn` | Bridge Open vSwitch creado por el DaemonSet SDN |
 
-No agregues `br0` dentro de `br-sdn`. `br0` es gestión/fabric; `br-sdn` es dataplane SDN.
-
-Para validar solo Parte I/II con una topología simple, conecta un único cable de gestión por control-plane: `ens3` de cada servidor hacia `Mgmt-STP-Switch`. Mantén `ens4`-`ens6` sin cable o como puertos opcionales en `br0`; no instales `gns3-br0-tree.service` salvo que agregues enlaces redundantes. `ens7` y `ens8` quedan reservadas para guests SDN y no deben entrar a `br0`.
-
-Con nombres GNS3 típicos, la topología mínima para Parte I/II queda así:
-
-| Enlace | Uso |
-| --- | --- |
-| `NAT1:nat0` ↔ `Mgmt-STP-Switch:eth0` | Salida de gestión a `virbr0` |
-| `Master:e0` ↔ `Mgmt-STP-Switch:eth1` | Primer control-plane |
-| `Master2:e0` ↔ `Mgmt-STP-Switch:eth2` | Segundo control-plane |
-| `Master3:e0` ↔ `Mgmt-STP-Switch:eth3` | Tercer control-plane |
-
-No conectes más cables para esta validación simple. Si hay enlaces antiguos o VMs sobrantes de una prueba anterior, elimínalos antes de empezar para no mezclar direcciones DHCP ni estados K3s viejos.
-
-K3s y Flannel deben usar siempre `br0`:
-
-```text
---flannel-iface=br0
-```
-
 ### 3.1 Arranque completo de una topología GNS3 con enlaces redundantes
-
-Si tu topología GNS3 tiene enlaces redundantes en la red de gestión/fabric, el segmento compartido debe usar STP. El `Ethernet switch` básico de GNS3 no es suficiente porque no participa en STP real; reemplázalo por un nodo Docker Open vSwitch y úsalo como raíz del árbol.
-
-`configure-br0-tree.sh` sigue siendo necesario cuando quieres que cada nodo reconstruya `br0` de forma repetible después de apagar/encender la topología completa. No es obligatorio para una topología simple sin enlaces redundantes, pero sí es la forma recomendada para un fabric HA: evita depender de cambios manuales de `ip link`, fija la IP de `br0` y activa STP antes de K3s.
 
 #### 3.1.1 Configurar el switch STP de gestión
 
-Si la topología todavía usa el `Ethernet switch` básico de GNS3 para la red de gestión, elimínalo o déjalo apagado y reemplázalo por un nodo Docker Open vSwitch.
-
-Configuración del nodo nuevo en GNS3:
+Configuración del nodo en GNS3:
 
 | Campo | Valor |
 | --- | --- |
@@ -159,78 +95,22 @@ Configuración del nodo nuevo en GNS3:
 | Adaptadores | 16 Ethernet adapters, o al menos tantos como enlaces de gestión vayas a conectar |
 | Consola | Telnet o none |
 
-Conecta al switch OVS todos los enlaces del segmento de gestión/fabric que antes llegaban al switch básico. Como mínimo debe conectar la salida NAT o uplink de gestión y los nodos que necesitan acceso inicial al API. Los enlaces redundantes directos entre nodos K3s también pueden quedar conectados; STP bloqueará o habilitará cada enlace según corresponda.
-
-Ejemplo de asignación de puertos del switch OVS:
-
-| Puerto del switch OVS | Conecta a |
-| --- | --- |
-| `eth0` | NAT/uplink de gestión |
-| `eth1` | Primer control-plane |
-| `eth2` | Segundo control-plane, si existe |
-| `eth3` | Tercer control-plane, si existe |
-| `eth4`-`ethN` | Otros enlaces de gestión/fabric según tu diseño |
-
-Arranca el nodo y activa STP en su bridge `br0`. El ID del contenedor cambia si recreas el nodo, así que resuélvelo antes de ejecutar `ovs-vsctl`:
-
 ```bash
-docker ps --filter ancestor=gns3/openvswitch:latest --format '{{.ID}} {{.Names}}'
+
+ovs-vsctl --may-exist add-br br0
+for port in $(ls /sys/class/net | grep -E "^eth[0-9]+$"); do
+  ovs-vsctl --may-exist add-port br0 "$port"
+  ip link set "$port" up
+done
+ip link set br0 up
+ovs-vsctl set Bridge br0 stp_enable=true other_config:stp-priority=0
+
+ovs-vsctl get Bridge br0 stp_enable
+
+ovs-vsctl get Bridge br0 other_config:stp-priority
+
+ovs-appctl stp/show br0
 ```
-
-Usa el contenedor que corresponda a tu switch de gestión:
-
-```bash
-docker exec <contenedor-mgmt-stp-switch> sh -lc '
-  ovs-vsctl --may-exist add-br br0
-  for port in $(ls /sys/class/net | grep -E "^eth[0-9]+$"); do
-    ovs-vsctl --may-exist add-port br0 "$port"
-    ip link set "$port" up
-  done
-  ip link set br0 up
-  ovs-vsctl set Bridge br0 stp_enable=true other_config:stp-priority=0
-'
-
-docker exec <contenedor-mgmt-stp-switch> \
-  ovs-vsctl get Bridge br0 stp_enable
-
-docker exec <contenedor-mgmt-stp-switch> \
-  ovs-vsctl get Bridge br0 other_config:stp-priority
-
-docker exec <contenedor-mgmt-stp-switch> \
-  ovs-appctl stp/show br0
-```
-
-El resultado esperado en `ovs-appctl stp/show br0` es `This bridge is the root`.
-
-Si reinicias o recreas el nodo Docker y pierde la configuración, repite el bloque anterior. No guardes el ID del contenedor en el repositorio: resuélvelo siempre con `docker ps`.
-
-#### 3.1.2 Planificar el perfil `br0` de cada nodo
-
-Antes de instalar el servicio, define estos valores para cada nodo. No copies perfiles de otra topología: cada VM debe declarar solo las interfaces que realmente pertenecen a su red de gestión.
-
-| Campo | Significado |
-| --- | --- |
-| `NODE_IP` | IP fija que tendrá `br0` en ese nodo |
-| `NODE_PREFIX` | Prefijo de red, normalmente `24` en `192.168.122.0/24` |
-| `NODE_GATEWAY` | Gateway de gestión, o vacío si ese nodo no debe instalar ruta por defecto |
-| `BR0_MAC` | MAC estable para `br0`; recomendable si quieres DPID estable en `br-sdn` |
-| `ALL_PORTS` | Interfaces físicas que el script puede administrar en `br0` |
-| `STP_PORTS` | Subconjunto de `ALL_PORTS` que queda activo en modo `stp` |
-| `PREFERRED_STP_PORTS` | Puertos preferidos con coste bajo |
-| `BR_PRIORITY` | Prioridad STP del bridge Linux; menor valor significa mayor prioridad |
-| `STP_LOW_COST` | Coste para puertos preferidos, por ejemplo `10` |
-| `STP_HIGH_COST` | Coste para puertos de respaldo, por ejemplo `200` |
-
-Reglas prácticas:
-
-- Incluye en `STP_PORTS` todos los enlaces de gestión que quieras mantener conectados y disponibles para failover.
-- Incluye en `PREFERRED_STP_PORTS` solo los enlaces que quieres favorecer como camino normal.
-- Usa coste alto para enlaces de respaldo que solo deben activarse si falla la ruta principal.
-- No incluyas `ens7` ni `ens8` si esos puertos estarán conectados a Smart Meters u otros guests SDN; deben quedar disponibles para `br-sdn`/OVS.
-
-Los enlaces bloqueados por STP siguen levantados y deben mostrar BPDUs 802.1d en Wireshark.
-
-La instalación de `configure-br0-tree.sh` no se hace en esta sección porque aquí todavía estás diseñando la topología. Crea el perfil y habilita el servicio más adelante, cuando cada VM ya exista, tenga hostname definitivo, interfaces conectadas y el repositorio clonado. En esta guía se hace en las secciones de preparación de control-plane y workers.
 
 ---
 
@@ -374,87 +254,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now k3s-iptables.service
 ```
 
-### 4.7 Configurar `gns3-br0-tree.service` si usarás enlaces redundantes
-
-Ejecuta esta subsección solo si tu topología de gestión tiene enlaces redundantes y quieres que `br0` se reconstruya automáticamente con STP tras cada arranque. En una topología simple sin redundancia puedes omitirla.
-
-Crea el perfil local de esta VM. Este bloque es para el primer control-plane `master` con IP `192.168.122.100`; en otros nodos debes cambiar `NODE_IP`, `STP_PORTS`, `PREFERRED_STP_PORTS` y `BR_PRIORITY` antes de pegarlo.
-
-```bash
-set -euo pipefail
-
-sudo tee /etc/default/gns3-br0-tree > /dev/null <<'EOF'
-NODE_IP=192.168.122.100
-NODE_PREFIX=24
-NODE_GATEWAY=192.168.122.1
-ALL_PORTS="ens3 ens4 ens5 ens6"
-STP_PORTS="ens3 ens4 ens5 ens6"
-PREFERRED_STP_PORTS="ens3"
-BR_PRIORITY=32768
-STP_LOW_COST=10
-STP_HIGH_COST=200
-EOF
-
-sudo test -r /etc/default/gns3-br0-tree
-sudo grep -q '^NODE_IP=192\.168\.122\.100$' /etc/default/gns3-br0-tree
-```
-
-Instala el script y el servicio systemd:
-
-```bash
-set -euo pipefail
-
-cd ~/ryu-k8s
-test -f tools/gns3/configure-br0-tree.sh
-sudo test -r /etc/default/gns3-br0-tree
-
-sudo install -m 0755 tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-sudo /usr/local/bin/configure-br0-tree.sh
-
-sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
-[Unit]
-Description=Configure GNS3 br0 management bridge
-Before=network-online.target k3s.service k3s-agent.service
-After=systemd-udev-settle.service
-Wants=systemd-udev-settle.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable gns3-br0-tree.service
-```
-
-Si `test -f tools/gns3/configure-br0-tree.sh` falla, la VM no tiene una versión del repositorio que incluya ese script. Actualiza el repositorio antes de crear el servicio.
-
-Si ya ejecutaste una versión anterior de la guía y quedó un servicio roto con `status=203/EXEC`, elimínalo antes de repetir el bloque corregido:
-
-```bash
-sudo systemctl disable --now gns3-br0-tree.service || true
-sudo rm -f /etc/systemd/system/gns3-br0-tree.service
-sudo systemctl daemon-reload
-```
-
-Verifica el resultado en esta VM:
-
-```bash
-systemctl status gns3-br0-tree.service --no-pager
-ip -br addr show br0
-bridge link | grep 'master br0'
-cat /sys/class/net/br0/bridge/stp_state
-```
-
 ## 5. Instalar K3s en el primer servidor
 
 Ejecuta esto solo en `master` (`192.168.122.100`).
-
-Si estás usando la topología redundante con STP, antes de ejecutar el instalador asegúrate de haber completado la sección 4.7 en este nodo.
 
 ```bash
 cd ~/ryu-k8s
@@ -473,15 +275,8 @@ for i in $(seq 1 30); do
   sudo kubectl get node master -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}{"\n"}' 2>/dev/null | grep -q true && break
   sleep 5
 done
-```
-
-Guarda el token del cluster. Lo usarás en los dos servidores adicionales y en la Golden Image de workers.
-
-```bash
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
-
-No subas este token al repositorio.
 
 ## 6. Preparar permisos de kube-vip
 
@@ -524,13 +319,9 @@ subjects:
 EOF
 ```
 
-No escribas todavía `/var/lib/rancher/k3s/server/manifests/kube-vip.yaml`: si K3s aplica un YAML incompleto mientras lo estás parcheando, `kube-vip` puede quedar con `serviceAccountName: default` o con el kubeconfig equivocado. En esta guía se usa un DaemonSet aplicado una vez cuando ya existen los 3 control-plane.
-
 ## 7. Preparar los dos servidores control-plane adicionales
 
 Repite esta sección en dos VMs separadas que serán control-plane adicionales.
-
-Estas VMs pueden tener la misma forma de red que un worker, pero no deben tener `k3s-autojoin.service` habilitado ni deben instalarse como `agent`.
 
 ### 7.1 Instalar utilidades
 
@@ -659,17 +450,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now k3s-iptables.service
 ```
 
-### 7.7 Configurar `gns3-br0-tree.service` si usarás enlaces redundantes
-
-Si este servidor adicional participa en una topología de gestión redundante, repite la sección 4.7 en esta VM antes de unirla al cluster, pero cambia `NODE_IP`, `STP_PORTS`, `PREFERRED_STP_PORTS` y `BR_PRIORITY` según el cableado de este nodo. No reutilices literalmente el perfil del primer servidor.
-
 ## 8. Unir los servidores adicionales al cluster
 
 Ejecuta esta sección en cada uno de los dos servidores adicionales.
 
 Usa el token obtenido en el primer servidor. No uses el placeholder literalmente.
-
-Si el servidor adicional forma parte de una topología redundante, completa primero la sección 7.7.
 
 ```bash
 cd ~/ryu-k8s
@@ -679,8 +464,6 @@ sudo RYU_K3S_NODE_TOKEN='<TOKEN_REAL_DEL_CLUSTER_HA>' \
   RYU_K3S_FIRST_SERVER_IP=192.168.122.100 \
   ./tools/gns3/k3s-server-ha-install.sh
 ```
-
-No uses `K3S_NODE_TOKEN` como variable de entorno directa al unir servidores. K3s persiste variables `K3S_*` en anotaciones internas del Node; el script acepta `RYU_K3S_NODE_TOKEN` y limpia el entorno antes de llamar al instalador.
 
 Después de unir los dos servidores adicionales, valida desde cualquier control-plane que los 3 nodos estén listos:
 
@@ -808,21 +591,6 @@ grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.bashrc || echo 'export KUBEC
 grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.profile || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.profile
 export KUBECONFIG=$HOME/.kube/config
 kubectl get nodes -o wide
-```
-
-Si abres una sesión no interactiva o ejecutas comandos remotos que no cargan `~/.bashrc`, antepone `KUBECONFIG=$HOME/.kube/config` o usa `sudo kubectl`. Sin esa variable, el wrapper de K3s puede intentar leer `/etc/rancher/k3s/k3s.yaml` y fallar por permisos.
-
-Si ves este error, el cluster puede estar sano; solo falta configurar permisos para el usuario actual:
-
-```text
-WARN[0000] Unable to read /etc/rancher/k3s/k3s.yaml, please start server with --write-kubeconfig-mode or --write-kubeconfig-group to modify kube config permissions
-error: error loading config file "/etc/rancher/k3s/k3s.yaml": open /etc/rancher/k3s/k3s.yaml: permission denied
-```
-
-Solución rápida para validar mientras configuras `~/.kube/config`:
-
-```bash
-sudo kubectl get nodes
 ```
 
 ---
@@ -966,43 +734,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now k3s-iptables.service
 ```
 
-### 10.6 Preparar `configure-br0-tree.sh` para workers redundantes
-
-Si los workers usarán una red de gestión redundante, instala el script en la Golden Image, pero no crees un perfil definitivo en `/etc/default/gns3-br0-tree` dentro de la imagen base salvo que todos los clones vayan a compartir exactamente el mismo diseño, cosa que normalmente no ocurre. Cada clon debe tener su propio `NODE_IP`, `BR0_MAC`, puertos y prioridad.
-
-```bash
-set -euo pipefail
-
-cd ~/ryu-k8s
-test -f tools/gns3/configure-br0-tree.sh
-sudo install -m 0755 tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-
-sudo tee /etc/systemd/system/gns3-br0-tree.service > /dev/null <<'EOF'
-[Unit]
-Description=Configure GNS3 br0 management bridge
-Before=network-online.target k3s-agent.service
-After=systemd-udev-settle.service
-Wants=systemd-udev-settle.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable gns3-br0-tree.service
-```
-
-El servicio no reconfigura `br0` si `/etc/default/gns3-br0-tree` no existe. Después de crear cada clon en GNS3, si ese worker necesita STP gestionado por este script, entra en la VM, crea su perfil propio siguiendo la sección 4.7 y arranca el servicio antes de unirlo al cluster:
-
-```bash
-sudo systemctl start gns3-br0-tree.service
-```
-
 ## 11. Configurar auto-join del worker
 
 Esta sección deja preparado el servicio que se ejecutará automáticamente en cada clon.
@@ -1058,13 +789,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable k3s-autojoin.service
 sudo systemd-analyze verify \
   /etc/systemd/system/k3s-autojoin.service \
-  /etc/systemd/system/gns3-br0-tree.service \
   /etc/systemd/system/k3s-iptables.service
 ```
-
-No uses `K3S_NODE_TOKEN` como variable del drop-in del worker. K3s persiste variables `K3S_*` en la anotación `k3s.io/node-env` del objeto Node; `RYU_K3S_NODE_TOKEN` evita exponer el token en Kubernetes y el script limpia el entorno antes de invocar el instalador.
-
-No ejecutes `systemctl start k3s-autojoin.service` en la VM base. El servicio debe quedar solo habilitado para que corra en cada clon al primer arranque.
 
 ## 12. Sellar la Golden Image
 
