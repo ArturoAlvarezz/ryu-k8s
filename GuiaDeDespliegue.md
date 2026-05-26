@@ -119,9 +119,9 @@ ovs-appctl stp/show br0
 
 Ejecuta esta sección en la VM que será el primer control-plane. Esta VM conserva la IP fija `192.168.122.100`.
 
-### 4.1 Instalar utilidades
+### 4.1 Preparar disco y clonar el repositorio
 
-Si la VM viene de un template QEMU con disco cloud pequeño o linked clone, redimensiona el disco a 20 GB antes de instalar paquetes. Hazlo con la VM apagada desde el host GNS3:
+Si la VM viene de un template QEMU con disco cloud pequeño o linked clone, redimensiona el disco a 20 GB antes de arrancarla. Hazlo con la VM apagada desde el host GNS3:
 
 ```bash
 DISK=/home/artulita/GNS3/projects/ProyectoMemoria/project-files/qemu/NODE_ID/hda_disk.qcow2
@@ -130,136 +130,25 @@ qemu-img resize "$DISK" 20G
 qemu-img info "$DISK"
 ```
 
-Después arranca la VM y expande la partición dentro de Ubuntu:
+Después arranca la VM e instala lo mínimo para clonar el repositorio. El script de preparación intentará expandir la partición dentro de Ubuntu, pero valida el espacio antes de instalar K3s:
 
 ```bash
-sudo growpart /dev/vda 1
-sudo resize2fs /dev/vda1
-df -h /
-```
-
-No continúes si `/` sigue por debajo de 20 GB.
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y net-tools curl git ca-certificates
-```
-
-### 4.2 Clonar el repositorio
-
-```bash
+sudo apt update
+sudo apt install -y git ca-certificates
 git clone https://github.com/ArturoAlvarezz/ryu-k8s.git ~/ryu-k8s
 cd ~/ryu-k8s
 ```
 
-### 4.3 Instalar Docker
+### 4.2 Ejecutar preparación automática del primer control-plane
+
+El script `tools/gns3/prepare-k3s-control-plane.sh` automatiza la configuración inicial del servidor: expande `/dev/vda1` si es posible, instala utilidades y Docker, fija hostname, configura `netplan` con `br0`, instala `gns3-br0-tree.service`, ajusta la espera de red, habilita forwarding y deja persistentes las reglas necesarias para K3s.
 
 ```bash
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-  https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get update
-sudo apt-get install -y \
-  docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
-
-sudo usermod -aG docker $USER
+cd ~/ryu-k8s
+sudo ./tools/gns3/prepare-k3s-control-plane.sh first master 192.168.122.100
 ```
 
-### 4.4 Configurar hostname e IP fija
-
-```bash
-sudo hostnamectl set-hostname master
-echo "master" | sudo tee /etc/hostname
-sudo sed -i '/127.0.1.1/d' /etc/hosts
-echo "127.0.1.1 master" | sudo tee -a /etc/hosts
-printf 'preserve_hostname: true\n' | sudo tee /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
-
-sudo bash -c 'cat > /etc/netplan/50-cloud-init.yaml << EOF
-network:
-  version: 2
-  ethernets:
-    ens3:
-      dhcp4: false
-      optional: false
-    ens4:
-      dhcp4: false
-      optional: true
-    ens5:
-      dhcp4: false
-      optional: true
-    ens6:
-      dhcp4: false
-      optional: true
-    ens7:
-      dhcp4: false
-      optional: true
-    ens8:
-      dhcp4: false
-      optional: true
-  bridges:
-    br0:
-      interfaces: [ens3, ens4, ens5, ens6]
-      dhcp4: false
-      addresses:
-        - 192.168.122.100/24
-      routes:
-        - to: default
-          via: 192.168.122.1
-      nameservers:
-        addresses: [8.8.8.8, 1.1.1.1]
-      parameters:
-        stp: true
-EOF'
-sudo chmod 600 /etc/netplan/50-cloud-init.yaml
-sudo netplan apply
-```
-
-Instala el configurador persistente de `br0` también en el primer control-plane. Aunque `netplan` ya define la IP estática, este servicio garantiza que el bridge, STP, rutas y costes vuelvan al estado esperado antes de arrancar K3s después de un reinicio completo de GNS3.
-
-```bash
-sudo cp ~/ryu-k8s/tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-sudo chmod +x /usr/local/bin/configure-br0-tree.sh
-
-sudo bash -c 'cat > /etc/default/gns3-br0-tree << EOF
-NODE_IP=192.168.122.100
-NODE_PREFIX=24
-NODE_GATEWAY=192.168.122.1
-ALL_PORTS="ens3 ens4 ens5 ens6"
-STP_PORTS="ens3 ens4 ens5 ens6"
-PREFERRED_STP_PORTS="ens3 ens4"
-EOF'
-
-sudo bash -c 'cat > /etc/systemd/system/gns3-br0-tree.service << EOF
-[Unit]
-Description=Configurar br0 de gestion GNS3 con STP
-DefaultDependencies=no
-After=systemd-udev-settle.service systemd-networkd.service
-Before=network-online.target k3s.service
-Wants=systemd-udev-settle.service systemd-networkd.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF'
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now gns3-br0-tree.service
-```
+Si quieres evitar `apt upgrade` en una reinstalación rápida, ejecuta el mismo comando con `RYU_K3S_SKIP_APT_UPGRADE=true`.
 
 La sesión SSH puede cortarse cuando `ens3` pasa a formar parte de `br0`. Eso es esperado. Reconecta a `192.168.122.100` y valida antes de seguir:
 
@@ -268,48 +157,6 @@ hostname
 ip -br addr show br0
 systemctl is-active gns3-br0-tree.service
 df -h /
-```
-
-
-### 4.5 Configurar espera de red
-
-```bash
-sudo mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d/
-sudo bash -c 'cat > /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf << EOF
-[Service]
-ExecStart=
-ExecStart=/lib/systemd/systemd-networkd-wait-online --any --timeout=30
-EOF'
-sudo systemctl daemon-reload
-```
-
-### 4.6 Configurar forwarding
-
-```bash
-sudo bash -c 'cat > /etc/sysctl.d/99-sdn.conf << EOF
-net.ipv4.ip_forward=1
-net.bridge.bridge-nf-call-iptables=1
-net.bridge.bridge-nf-call-ip6tables=1
-EOF'
-sudo sysctl --system
-
-sudo bash -c 'cat > /etc/systemd/system/k3s-iptables.service << EOF
-[Unit]
-Description=Reglas iptables para SDN/K3s
-After=network-online.target k3s.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/bin/sleep 3
-ExecStart=/bin/bash -c "iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT; iptables -C FORWARD -i ens3 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ens3 -j ACCEPT; iptables -C FORWARD -o ens3 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o ens3 -j ACCEPT"
-
-[Install]
-WantedBy=multi-user.target
-EOF'
-sudo systemctl daemon-reload
-sudo systemctl enable --now k3s-iptables.service
 ```
 
 ## 5. Instalar K3s en el primer servidor
@@ -340,224 +187,57 @@ sudo cat /var/lib/rancher/k3s/server/node-token
 
 Ejecuta esto en `master` después de instalar K3s y antes de unir servidores adicionales. En esta sección solo se crean los permisos. El VIP se desplegará como DaemonSet después de unir los 3 servidores control-plane.
 
-Crea el ServiceAccount y permisos de leader election para `kube-vip`. En K3s, `/etc/rancher/k3s/k3s.yaml` suele quedar legible solo por `root`, por lo que este primer `kubectl apply` debe ejecutarse con `sudo` si todavía no configuraste kubeconfig para el usuario `ubuntu`:
+En K3s, `/etc/rancher/k3s/k3s.yaml` suele quedar legible solo por `root`, por lo que este primer paso debe ejecutarse con `sudo` si todavía no configuraste kubeconfig para el usuario `ubuntu`:
 
 ```bash
-sudo kubectl apply -f - <<'EOF'
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: kube-vip
-  namespace: kube-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: system:kube-vip-role
-rules:
-  - apiGroups: [""]
-    resources: ["nodes", "endpoints", "configmaps"]
-    verbs: ["list", "get", "watch", "update", "create", "patch"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["list", "get", "watch", "update", "create", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system:kube-vip-binding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:kube-vip-role
-subjects:
-  - kind: ServiceAccount
-    name: kube-vip
-    namespace: kube-system
-EOF
+cd ~/ryu-k8s
+sudo ./tools/gns3/deploy-kube-vip.sh rbac
 ```
 
 ## 7. Preparar los dos servidores control-plane adicionales
 
 Repite esta sección en dos VMs separadas que serán control-plane adicionales.
 
-### 7.1 Instalar utilidades
+### 7.1 Preparar disco y clonar el repositorio
 
-Antes de instalar paquetes, confirma que el disco del servidor adicional ya fue redimensionado a 20 GB. Si viene de un linked clone pequeño, haz el mismo procedimiento de redimensionado descrito en la sección 4.1.
-
-```bash
-sudo growpart /dev/vda 1
-sudo resize2fs /dev/vda1
-df -h /
-```
-
-No continúes si `/` sigue por debajo de 20 GB.
+Antes de instalar paquetes, confirma que el disco del servidor adicional ya fue redimensionado a 20 GB. Si viene de un linked clone pequeño, haz el mismo procedimiento de redimensionado descrito en la sección 4.1 desde el host GNS3.
 
 ```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y net-tools curl git ca-certificates
-```
-
-### 7.2 Clonar el repositorio
-
-```bash
+sudo apt update
+sudo apt install -y git ca-certificates
 git clone https://github.com/ArturoAlvarezz/ryu-k8s.git ~/ryu-k8s
 cd ~/ryu-k8s
 ```
 
-### 7.3 Instalar Docker
+### 7.2 Ejecutar preparación automática del control-plane adicional
+
+En el segundo servidor usa `control-2`. En el tercer servidor usa `control-3`. El script configura la red con DHCP temporal en `br0` y `gns3-br0-tree.service` captura esa IP como `NODE_IP` estática para reinicios posteriores, igual que en los workers clonables.
 
 ```bash
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-  https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get update
-sudo apt-get install -y \
-  docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
-
-sudo usermod -aG docker $USER
+cd ~/ryu-k8s
+sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-2
 ```
 
-### 7.4 Configurar red DHCP sobre `br0`
+Para el tercer servidor:
 
 ```bash
-sudo bash -c 'cat > /etc/netplan/50-cloud-init.yaml << EOF
-network:
-  version: 2
-  ethernets:
-    ens3:
-      dhcp4: false
-      optional: true
-    ens4:
-      dhcp4: false
-      optional: true
-    ens5:
-      dhcp4: false
-      optional: true
-    ens6:
-      dhcp4: false
-      optional: true
-    ens7:
-      dhcp4: false
-      optional: true
-    ens8:
-      dhcp4: false
-      optional: true
-  bridges:
-    br0:
-      interfaces: [ens3, ens4, ens5, ens6]
-      dhcp4: true
-      dhcp-identifier: mac
-      parameters:
-        stp: true
-EOF'
-sudo chmod 600 /etc/netplan/50-cloud-init.yaml
-sudo netplan apply
+cd ~/ryu-k8s
+sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-3
 ```
 
-Después de `netplan apply`, la IP DHCP de la VM puede cambiar porque la dirección pasa de `ens3` a `br0`. Si pierdes la sesión SSH, busca la nueva IP en la consola de GNS3, en la tabla DHCP/NAT o con un escaneo de `192.168.122.0/24`, y continúa desde esa IP.
-
-Instala el configurador persistente de `br0` y fija como `NODE_IP` la IP reservada que tendrá ese control-plane en reinicios posteriores. Para `control-2` y `control-3`, usa la IP que vayas a pasar después como `RYU_K3S_NODE_IP`.
+Si tienes una IP ya reservada y quieres fijarla explícitamente, pásala como tercer argumento:
 
 ```bash
-export NODE_IP=<IP_CONTROL_PLANE>
-
-sudo cp ~/ryu-k8s/tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-sudo chmod +x /usr/local/bin/configure-br0-tree.sh
-
-sudo bash -c "cat > /etc/default/gns3-br0-tree << EOF
-NODE_IP=$NODE_IP
-NODE_PREFIX=24
-NODE_GATEWAY=192.168.122.1
-ALL_PORTS=\"ens3 ens4 ens5 ens6\"
-STP_PORTS=\"ens3 ens4 ens5 ens6\"
-PREFERRED_STP_PORTS=\"ens3 ens4\"
-EOF"
-
-sudo bash -c 'cat > /etc/systemd/system/gns3-br0-tree.service << EOF
-[Unit]
-Description=Configurar br0 de gestion GNS3 con STP
-DefaultDependencies=no
-After=systemd-udev-settle.service systemd-networkd.service
-Before=network-online.target k3s.service
-Wants=systemd-udev-settle.service systemd-networkd.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF'
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now gns3-br0-tree.service
+sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-2 192.168.122.X
 ```
 
-No ejecutes la sección 7.5 hasta haber reconectado a la IP nueva y validado `br0`:
+Después de aplicar `netplan`, la IP de la VM puede cambiar porque la dirección pasa de `ens3` a `br0`. Si pierdes la sesión SSH, busca la nueva IP en la consola de GNS3, en la tabla DHCP/NAT o con un escaneo de `192.168.122.0/24`, y continúa desde esa IP. No ejecutes la sección 8 hasta haber reconectado a la IP nueva y validado `br0`:
 
 ```bash
 hostname
 ip -br addr show br0
 systemctl is-active gns3-br0-tree.service
 df -h /
-```
-
-### 7.5 Configurar hostname único
-
-En el segundo servidor usa `control-2`. En el tercer servidor usa `control-3`.
-
-```bash
-export NODE_NAME=control-2
-sudo hostnamectl set-hostname "$NODE_NAME"
-echo "$NODE_NAME" | sudo tee /etc/hostname
-sudo sed -i '/127.0.1.1/d' /etc/hosts
-echo "127.0.1.1 $NODE_NAME" | sudo tee -a /etc/hosts
-printf 'preserve_hostname: true\n' | sudo tee /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
-```
-
-No reutilices el mismo hostname en dos servidores K3s.
-
-### 7.6 Configurar espera de red y forwarding
-
-```bash
-sudo mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d/
-sudo bash -c 'cat > /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf << EOF
-[Service]
-ExecStart=
-ExecStart=/lib/systemd/systemd-networkd-wait-online --any --timeout=30
-EOF'
-sudo systemctl daemon-reload
-
-sudo bash -c 'cat > /etc/systemd/system/k3s-iptables.service << EOF
-[Unit]
-Description=Regla iptables de forwarding para br0
-After=network-online.target k3s.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/bin/sleep 5
-ExecStart=/bin/bash -c "iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT"
-
-[Install]
-WantedBy=multi-user.target
-EOF'
-sudo systemctl daemon-reload
-sudo systemctl enable --now k3s-iptables.service
 ```
 
 ## 8. Unir los servidores adicionales al cluster
@@ -598,99 +278,8 @@ sudo kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide
 Ahora sí, despliega `kube-vip` una sola vez como DaemonSet. No habilites `services`; este laboratorio solo necesita que `kube-vip` anuncie `192.168.122.10` para el API Server.
 
 ```bash
-sudo kubectl apply -f - <<'EOF'
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: kube-vip-ds
-  namespace: kube-system
-  labels:
-    app.kubernetes.io/name: kube-vip-ds
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: kube-vip-ds
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: kube-vip-ds
-    spec:
-      serviceAccountName: kube-vip
-      hostNetwork: true
-      hostAliases:
-        - ip: "127.0.0.1"
-          hostnames:
-            - kubernetes
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: node-role.kubernetes.io/control-plane
-                    operator: Exists
-      tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
-        - key: node-role.kubernetes.io/master
-          operator: Exists
-          effect: NoSchedule
-      containers:
-        - name: kube-vip
-          image: ghcr.io/kube-vip/kube-vip:v0.8.7
-          imagePullPolicy: IfNotPresent
-          args:
-            - manager
-          env:
-            - name: vip_arp
-              value: "true"
-            - name: port
-              value: "6443"
-            - name: vip_nodename
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: vip_interface
-              value: br0
-            - name: vip_cidr
-              value: "32"
-            - name: dns_mode
-              value: first
-            - name: cp_enable
-              value: "true"
-            - name: cp_namespace
-              value: kube-system
-            - name: vip_leaderelection
-              value: "true"
-            - name: vip_leasename
-              value: plndr-cp-lock
-            - name: vip_leaseduration
-              value: "5"
-            - name: vip_renewdeadline
-              value: "3"
-            - name: vip_retryperiod
-              value: "1"
-            - name: address
-              value: 192.168.122.10
-            - name: prometheus_server
-              value: :2112
-          securityContext:
-            capabilities:
-              add:
-                - NET_ADMIN
-                - NET_RAW
-          volumeMounts:
-            - mountPath: /etc/kubernetes/admin.conf
-              name: kubeconfig
-      volumes:
-        - name: kubeconfig
-          hostPath:
-            path: /etc/rancher/k3s/k3s.yaml
-EOF
-
-sudo kubectl -n kube-system rollout status daemonset/kube-vip-ds --timeout=240s
-sudo kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide
-sudo kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
+cd ~/ryu-k8s
+sudo ./tools/gns3/deploy-kube-vip.sh daemonset
 curl -k https://192.168.122.10:6443/readyz
 ```
 
