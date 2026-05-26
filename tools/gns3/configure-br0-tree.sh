@@ -4,14 +4,71 @@ set -eu
 
 CONFIG_FILE=${BR0_CONFIG_FILE:-/etc/default/gns3-br0-tree}
 
-if [ ! -r "$CONFIG_FILE" ]; then
-  echo "configure-br0-tree: $CONFIG_FILE not found" >&2
-  exit 1
-fi
+HOSTNAME=$(hostname)
+ALL_PORTS=${ALL_PORTS:-"ens3 ens4 ens5 ens6"}
+STP_PORTS=${STP_PORTS:-$ALL_PORTS}
+PREFERRED_STP_PORTS=${PREFERRED_STP_PORTS:-$STP_PORTS}
+BR_PRIORITY=${BR_PRIORITY:-32768}
+STP_LOW_COST=${STP_LOW_COST:-10}
+STP_HIGH_COST=${STP_HIGH_COST:-200}
+NODE_PREFIX=${NODE_PREFIX:-24}
+NODE_GATEWAY=${NODE_GATEWAY:-192.168.122.1}
+NODE_DNS=${NODE_DNS:-$NODE_GATEWAY}
+BOOTSTRAP_DHCP_WAIT_SECONDS=${BOOTSTRAP_DHCP_WAIT_SECONDS:-180}
 
+current_br0_ip() {
+  ip -o -4 addr show dev br0 scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}'
+}
+
+prepare_bridge_for_bootstrap() {
+  ip link show br0 >/dev/null 2>&1 || ip link add name br0 type bridge
+  ip link set br0 type bridge stp_state 1 priority "$BR_PRIORITY" || true
+  for iface in $ALL_PORTS; do
+    if ip link show "$iface" >/dev/null 2>&1; then
+      ip link set "$iface" master br0 2>/dev/null || true
+      ip link set "$iface" up || true
+    fi
+  done
+  ip link set br0 up
+}
+
+bootstrap_config_if_missing() {
+  [ ! -r "$CONFIG_FILE" ] || return 0
+
+  prepare_bridge_for_bootstrap
+  bootstrap_ip=${NODE_IP:-}
+  if [ -z "$bootstrap_ip" ]; then
+    elapsed=0
+    while [ "$elapsed" -lt "$BOOTSTRAP_DHCP_WAIT_SECONDS" ]; do
+      bootstrap_ip=$(current_br0_ip || true)
+      [ -n "$bootstrap_ip" ] && break
+      sleep 2
+      elapsed=$((elapsed + 2))
+    done
+  fi
+
+  if [ -z "$bootstrap_ip" ]; then
+    echo "configure-br0-tree: $CONFIG_FILE not found and br0 did not receive DHCP" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat >"$CONFIG_FILE" <<EOF
+NODE_IP=$bootstrap_ip
+NODE_PREFIX=$NODE_PREFIX
+NODE_GATEWAY=$NODE_GATEWAY
+NODE_DNS=$NODE_DNS
+ALL_PORTS="$ALL_PORTS"
+STP_PORTS="$STP_PORTS"
+PREFERRED_STP_PORTS="${BOOTSTRAP_PREFERRED_STP_PORTS:-ens3}"
+EOF
+  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+  echo "configure-br0-tree: bootstrapped $CONFIG_FILE with NODE_IP=$bootstrap_ip"
+}
+
+bootstrap_config_if_missing
 . "$CONFIG_FILE"
 
-HOSTNAME=$(hostname)
 ALL_PORTS=${ALL_PORTS:-"ens3 ens4 ens5 ens6"}
 STP_PORTS=${STP_PORTS:-$ALL_PORTS}
 PREFERRED_STP_PORTS=${PREFERRED_STP_PORTS:-$STP_PORTS}

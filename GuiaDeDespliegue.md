@@ -859,23 +859,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable gns3-br0-tree.service
 ```
 
-En la Golden Image no crees todavia `/etc/default/gns3-br0-tree`: cada clon debe tener un `NODE_IP` unico. Antes del primer join de cada worker, crea el perfil desde la consola de GNS3 con la IP reservada para ese nodo:
+En la Golden Image no crees `/etc/default/gns3-br0-tree`. Cada clon debe autogenerar ese perfil en su primer arranque: `gns3-br0-tree.service` espera una IP DHCP temporal en `br0`, crea `/etc/default/gns3-br0-tree` con esa IP como `NODE_IP`, desactiva DHCP para `br0` y deja la IP como estática para reinicios posteriores. Esto permite crear y eliminar workers sin entrar por consola a asignar IPs manualmente.
 
-```bash
-sudo bash -c 'cat > /etc/default/gns3-br0-tree << EOF
-NODE_IP=192.168.122.<IP_UNICA_DEL_WORKER>
-NODE_PREFIX=24
-NODE_GATEWAY=192.168.122.1
-ALL_PORTS="ens3 ens4 ens5 ens6"
-STP_PORTS="ens3 ens4 ens5 ens6"
-PREFERRED_STP_PORTS="ens3"
-EOF'
-
-sudo systemctl restart gns3-br0-tree.service
-ip -br addr show br0
-```
-
-Después de `netplan apply`, la IP DHCP temporal puede cambiar porque la dirección pasa de `ens3` a `br0`. Esa IP solo sirve para preparar la imagen; en los clones, la IP persistente debe venir del perfil `gns3-br0-tree`. Valida antes de seguir:
+Después de `netplan apply`, la IP DHCP temporal puede cambiar porque la dirección pasa de `ens3` a `br0`. Esa IP solo sirve para preparar la imagen; en los clones, el perfil `gns3-br0-tree` se creará automáticamente en el primer arranque. Valida antes de seguir:
 
 ```bash
 ip -br addr show br0
@@ -1030,7 +1016,7 @@ Exporta el disco `.qcow2` desde el hipervisor y úsalo como appliance de worker 
 4. Conecta los workers solo a puertos libres de nodos control-plane. No conectes ningún worker al `Mgmt-STP-Switch`, al switch básico de GNS3 ni a `NAT1`.
 5. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN.
 6. Enciende los workers.
-7. En cada clon, crea `/etc/default/gns3-br0-tree` con una IP unica antes de dejar que `k3s-autojoin.service` complete el join.
+7. No asignes IP manualmente a cada clon: `gns3-br0-tree.service` capturará la IP DHCP inicial de `br0` y la convertirá en perfil estático antes de que `k3s-autojoin.service` una el worker al cluster.
 
 Cableado válido mínimo para un worker con un solo enlace:
 
