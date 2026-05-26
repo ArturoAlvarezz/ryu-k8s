@@ -334,165 +334,21 @@ qemu-img info "$DISK"
 
 Reemplaza `NODE_ID` por el directorio real del nodo QEMU. No copies el comando con `NODE_ID` sin cambiarlo.
 
-Después arranca la VM base y expande la partición dentro de Ubuntu:
+Después arranca la VM base e instala lo mínimo para clonar el repositorio. El script de preparación intentará expandir `/dev/vda1`, pero valida el espacio antes de sellar:
 
 ```bash
-sudo growpart /dev/vda 1
-sudo resize2fs /dev/vda1
+sudo apt update
+sudo apt install -y git ca-certificates
+git clone https://github.com/ArturoAlvarezz/ryu-k8s.git ~/ryu-k8s
+cd ~/ryu-k8s
 df -h /
 ```
 
 No continúes si `/` sigue por debajo de 10 GB.
 
-Ejecuta las siguientes secciones solo en la VM base del worker.
-
-### 10.1 Instalar utilidades
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y net-tools curl git ca-certificates
-```
-
-### 10.2 Clonar el repositorio
-
-```bash
-git clone https://github.com/ArturoAlvarezz/ryu-k8s.git ~/ryu-k8s
-cd ~/ryu-k8s
-```
-
-### 10.3 Instalar Docker
-
-```bash
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-  https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get update
-sudo apt-get install -y \
-  docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
-
-sudo usermod -aG docker $USER
-```
-
-### 10.4 Configurar red de gestion reinicio-safe
-
-```bash
-sudo bash -c 'cat > /etc/netplan/50-cloud-init.yaml << EOF
-network:
-  version: 2
-  ethernets:
-    ens3:
-      dhcp4: false
-      optional: true
-    ens4:
-      dhcp4: false
-      optional: true
-    ens5:
-      dhcp4: false
-      optional: true
-    ens6:
-      dhcp4: false
-      optional: true
-    ens7:
-      dhcp4: false
-      optional: true
-    ens8:
-      dhcp4: false
-      optional: true
-  bridges:
-    br0:
-      interfaces: [ens3, ens4, ens5, ens6]
-      dhcp4: true
-      dhcp-identifier: mac
-      parameters:
-        stp: true
-EOF'
-sudo chmod 600 /etc/netplan/50-cloud-init.yaml
-sudo netplan apply
-```
-
-Instala el configurador persistente de `br0`. Este servicio es el mecanismo que hace que un worker ya unido al cluster recupere siempre su IP de gestion antes de arrancar `k3s-agent`, incluso después de apagar toda la topologia.
-
-```bash
-sudo cp ~/ryu-k8s/tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
-sudo chmod +x /usr/local/bin/configure-br0-tree.sh
-
-sudo bash -c 'cat > /etc/systemd/system/gns3-br0-tree.service << EOF
-[Unit]
-Description=Configurar br0 de gestion GNS3 con STP
-DefaultDependencies=no
-After=systemd-udev-settle.service systemd-networkd.service
-Before=network-online.target k3s-agent.service
-Wants=systemd-udev-settle.service systemd-networkd.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF'
-
-sudo systemctl daemon-reload
-sudo systemctl enable gns3-br0-tree.service
-```
-
-En la Golden Image no crees `/etc/default/gns3-br0-tree`. Cada clon debe autogenerar ese perfil en su primer arranque: `gns3-br0-tree.service` espera una IP DHCP temporal en `br0`, crea `/etc/default/gns3-br0-tree` con esa IP como `NODE_IP`, desactiva DHCP para `br0` y deja la IP como estática para reinicios posteriores. Esto permite crear y eliminar workers sin entrar por consola a asignar IPs manualmente.
-
-Después de `netplan apply`, la IP DHCP temporal puede cambiar porque la dirección pasa de `ens3` a `br0`. Esa IP solo sirve para preparar la imagen; en los clones, el perfil `gns3-br0-tree` se creará automáticamente en el primer arranque. Valida antes de seguir:
-
-```bash
-ip -br addr show br0
-bridge link | grep 'master br0'
-df -h /
-```
-
-El hostname definitivo del worker se generará automáticamente al primer arranque del clon con formato `worker-<mac>`. El script de auto-join también configura `preserve_hostname: true` para que cloud-init no lo revierta en reinicios posteriores.
-
-### 10.5 Configurar espera de red y forwarding
-
-```bash
-sudo mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d/
-sudo bash -c 'cat > /etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf << EOF
-[Service]
-ExecStart=
-ExecStart=/lib/systemd/systemd-networkd-wait-online --any --timeout=30
-EOF'
-sudo systemctl daemon-reload
-
-sudo bash -c 'cat > /etc/systemd/system/k3s-iptables.service << EOF
-[Unit]
-Description=Regla iptables de forwarding para br0
-After=network-online.target k3s-agent.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/bin/sleep 5
-ExecStart=/bin/bash -c "iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT"
-
-[Install]
-WantedBy=multi-user.target
-EOF'
-sudo systemctl daemon-reload
-sudo systemctl enable --now k3s-iptables.service
-```
-
 ## 11. Configurar auto-join del worker
 
-Esta sección deja preparado el servicio que se ejecutará automáticamente en cada clon.
+Esta sección deja preparada la VM base para que cada clon se una automáticamente al cluster. El script instala utilidades y Docker, configura `br0` por DHCP temporal, instala `gns3-br0-tree.service`, configura forwarding, crea `k3s-autojoin.service` y lo deja habilitado pero sin arrancarlo.
 
 Antes de tocar la Golden Image, asegúrate de que el VIP ya esté desplegado y responda desde la red de gestión:
 
@@ -508,78 +364,42 @@ Usa el token real del cluster HA obtenido en un servidor control-plane, normalme
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-Copia el script de auto-join:
+Ejecuta la preparación automática en la VM base del worker. No guardes el token en archivos del repositorio:
 
 ```bash
-sudo cp ~/ryu-k8s/tools/gns3/k3s-autojoin-ha.sh /usr/local/bin/k3s-autojoin.sh
-sudo chmod +x /usr/local/bin/k3s-autojoin.sh
+cd ~/ryu-k8s
+sudo RYU_K3S_NODE_TOKEN='<TOKEN_REAL_DEL_CLUSTER_HA>' \
+  ./tools/gns3/prepare-k3s-worker-golden-image.sh
 ```
 
-Crea el servicio systemd:
+Si quieres evitar `apt upgrade` en una reinstalación rápida, agrega `RYU_K3S_SKIP_APT_UPGRADE=true` al comando anterior.
+
+Durante `netplan apply`, la IP DHCP temporal puede cambiar porque la dirección pasa de `ens3` a `br0`. Esa IP solo sirve para preparar la imagen; en los clones, `gns3-br0-tree.service` creará `/etc/default/gns3-br0-tree` con la IP propia de cada clon como `NODE_IP`. Si pierdes la sesión SSH, reconecta a la IP nueva y valida:
 
 ```bash
-sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service << EOF
-[Unit]
-Description=Instalacion automatica de K3S Worker
-After=gns3-br0-tree.service network-online.target
-Requires=gns3-br0-tree.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/k3s-autojoin.sh
-Restart=on-failure
-RestartSec=15
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF'
+ip -br addr show br0
+bridge link | grep 'master br0'
+df -h /
+systemctl is-enabled gns3-br0-tree.service
+systemctl is-enabled k3s-autojoin.service
 ```
 
-Crea el drop-in con el token real y el VIP del API Server:
+No arranques `k3s-autojoin.service` en la Golden Image. Debe quedar habilitado para ejecutarse en cada clon después del sellado y arranque en GNS3. El hostname definitivo del worker se generará automáticamente al primer arranque del clon con formato `worker-<mac>`.
 
-```bash
-sudo mkdir -p /etc/systemd/system/k3s-autojoin.service.d
-sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service.d/token.conf << EOF
-[Service]
-Environment=RYU_K3S_NODE_TOKEN=<TOKEN_REAL_DEL_CLUSTER_HA>
-Environment=RYU_K3S_API_ENDPOINT=192.168.122.10
-EOF'
-sudo chmod 600 /etc/systemd/system/k3s-autojoin.service.d/token.conf
-
-sudo systemctl daemon-reload
-sudo systemctl enable k3s-autojoin.service
-sudo systemd-analyze verify \
-  /etc/systemd/system/gns3-br0-tree.service \
-  /etc/systemd/system/k3s-autojoin.service \
-  /etc/systemd/system/k3s-iptables.service
-```
-
-No arranques todavía `k3s-autojoin.service` en la Golden Image. Debe quedar habilitado para ejecutarse en cada clon después del sellado y arranque en GNS3.
-
-## 12. Sellar la Golden Image
-
-Ejecuta esto al final, antes de apagar y exportar el disco.
-
-Antes de sellar, valida que la unidad quedó habilitada pero no ejecutada con éxito en la VM base:
+Verifica que el servicio esté habilitado y no activo:
 
 ```bash
 systemctl is-enabled k3s-autojoin.service
 systemctl is-active k3s-autojoin.service || true
 ```
 
+## 12. Sellar la Golden Image
+
+Ejecuta esto al final, antes de apagar y exportar el disco.
+
 ```bash
-sudo truncate -s 0 /etc/machine-id
-sudo rm -f /var/lib/dbus/machine-id
-sudo ln -s /etc/machine-id /var/lib/dbus/machine-id
-
-sudo journalctl --vacuum-time=1s
-cat /dev/null > ~/.bash_history
-
-sudo poweroff
+cd ~/ryu-k8s
+sudo ./tools/gns3/seal-k3s-worker-golden-image.sh
 ```
 
 Exporta el disco `.qcow2` desde el hipervisor y úsalo como appliance de worker en GNS3.
