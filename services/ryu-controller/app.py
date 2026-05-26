@@ -52,8 +52,18 @@ class DistributedL2Switch(app_manager.RyuApp):
         from redis.sentinel import Sentinel
         sentinel_host = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
         sentinel_port = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
-        self.sentinel = Sentinel([(sentinel_host, sentinel_port)], socket_timeout=0.5)
-        self.redis = self.sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
+        redis_timeout = float(os.environ.get('REDIS_SOCKET_TIMEOUT', '5.0'))
+        self.sentinel = Sentinel(
+            [(sentinel_host, sentinel_port)],
+            socket_timeout=redis_timeout,
+            socket_connect_timeout=redis_timeout,
+        )
+        self.redis = self.sentinel.master_for(
+            'mymaster',
+            socket_timeout=redis_timeout,
+            socket_connect_timeout=redis_timeout,
+            decode_responses=True,
+        )
         self.logger.info("Connected to Redis Sentinel at %s:%d", sentinel_host, sentinel_port)
         self.datapaths = {}
         self.packet_in_total = {}
@@ -80,24 +90,31 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _known_worker_macs(self):
         worker_macs = set()
-        for known_dpid in self.redis.smembers("topology:switches") or []:
-            worker_mac = _mac_from_dpid(known_dpid)
-            if worker_mac:
-                worker_macs.add(worker_mac)
-        for raw_dpid in self.redis.hkeys("topology:node_names") or []:
-            if len(raw_dpid) >= 12:
-                raw_mac = raw_dpid[-12:]
-                worker_macs.add(":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower())
+        try:
+            for known_dpid in self.redis.smembers("topology:switches") or []:
+                worker_mac = _mac_from_dpid(known_dpid)
+                if worker_mac:
+                    worker_macs.add(worker_mac)
+            for raw_dpid in self.redis.hkeys("topology:node_names") or []:
+                if len(raw_dpid) >= 12:
+                    raw_mac = raw_dpid[-12:]
+                    worker_macs.add(":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower())
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading worker MACs: %s", e)
         return worker_macs
 
     def _get_security_device_by_mac(self, mac):
         import json
 
-        device_id = self.redis.get(f"security:mac_to_device:{mac}")
-        if not device_id:
+        try:
+            device_id = self.redis.get(f"security:mac_to_device:{mac}")
+            if not device_id:
+                return None
+            payload = self.redis.get(f"security:device:{device_id}")
+            return json.loads(payload) if payload else None
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading security device: %s", e)
             return None
-        payload = self.redis.get(f"security:device:{device_id}")
-        return json.loads(payload) if payload else None
 
     def _refresh_security_device_location(self, device, dpid, in_port):
         current_dpid = str(dpid)
@@ -108,7 +125,11 @@ class DistributedL2Switch(app_manager.RyuApp):
         import json
         device["dpid"] = current_dpid
         device["in_port"] = current_port
-        self.redis.set(f"security:device:{device['device_id']}", json.dumps(device, sort_keys=True))
+        try:
+            self.redis.set(f"security:device:{device['device_id']}", json.dumps(device, sort_keys=True))
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while updating security device location: %s", e)
+            return
         self.logger.info(
             "Security device location refreshed: device=%s mac=%s dpid=%s in_port=%s",
             device.get("device_id"), device.get("mac"), current_dpid, current_port,
@@ -132,19 +153,22 @@ class DistributedL2Switch(app_manager.RyuApp):
             "action": action,
             "timestamp": timestamp
         }
-        
-        self.redis.setex(f"security:event:{timestamp}:{event_id}", 86400 * 7, json.dumps(event_data))
-        self.redis.incr("security:events_total")
-        self.redis.incr(f"security:events:{threat_type}")
-        
-        if action in ["quarantine", "suspicious"]:
-            device_id = self.redis.get(f"security:mac_to_device:{mac}")
-            if device_id:
-                payload = self.redis.get(f"security:device:{device_id}")
-                if payload:
-                    dev = json.loads(payload)
-                    dev["status"] = action
-                    self.redis.set(f"security:device:{device_id}", json.dumps(dev))
+
+        try:
+            self.redis.setex(f"security:event:{timestamp}:{event_id}", 86400 * 7, json.dumps(event_data))
+            self.redis.incr("security:events_total")
+            self.redis.incr(f"security:events:{threat_type}")
+
+            if action in ["quarantine", "suspicious"]:
+                device_id = self.redis.get(f"security:mac_to_device:{mac}")
+                if device_id:
+                    payload = self.redis.get(f"security:device:{device_id}")
+                    if payload:
+                        dev = json.loads(payload)
+                        dev["status"] = action
+                        self.redis.set(f"security:device:{device_id}", json.dumps(dev))
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while recording security event: %s", e)
 
     def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name=""):
         mac = str(eth.src).lower()
@@ -182,7 +206,11 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if device and device.get("ip") and device.get("ip") != src_ip:
                     return False, "IP_SPOOFING", "ip_mismatch"
                 
-                owner_id = self.redis.get(f"security:ip_to_device:{src_ip}")
+                try:
+                    owner_id = self.redis.get(f"security:ip_to_device:{src_ip}")
+                except redis.RedisError as e:
+                    self.logger.warning("Redis unavailable while checking IP ownership: %s", e)
+                    owner_id = None
                 if owner_id and device and owner_id != device.get("device_id"):
                     return False, "IP_SPOOFING", "ip_in_use_by_other_device"
                 
@@ -248,8 +276,10 @@ class DistributedL2Switch(app_manager.RyuApp):
                         self._drop_guest_packet(datapath, in_port, mac, reason="status_%s" % device.get("status"), install_flow=True)
                     elif device.get("status") in ("authorized", "learning"):
                         self._delete_guest_drop_flow(datapath, in_port, mac)
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while syncing quarantine flows: %s", e)
             except Exception as e:
-                self.logger.warning("Error syncing quarantine flows: %s", e)
+                self.logger.warning("Unexpected quarantine flow sync failure: %s", e)
             hub.sleep(5)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -260,7 +290,10 @@ class DistributedL2Switch(app_manager.RyuApp):
         dpid = datapath.id
 
         # Externalize State: Register switch in the global Redis topology set
-        self.redis.sadd('topology:switches', dpid)
+        try:
+            self.redis.sadd('topology:switches', dpid)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while registering switch %s: %s", dpid, e)
         self.datapaths[dpid] = datapath
         self.installed_flows.setdefault(dpid, 0)
         self.logger.info("Switch connected and registered in Redis: dpid=%s", dpid)
@@ -291,20 +324,16 @@ class DistributedL2Switch(app_manager.RyuApp):
             }
             self.logger.info("Switch disconnected, removing from Redis: dpid=%s", dpid)
             
-            # Borrar de la lista global de switches
-            self.redis.srem('topology:switches', dpid)
-            
-            # Formatear el dpid a hexadecimal de 16 caracteres (formato raw_dpid de k8s)
             try:
-                raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12)
-                self.redis.hdel('topology:node_names', raw_dpid)
-                self.redis.hdel('topology:node_ips', raw_dpid)
-            except Exception as e:
-                self.logger.error("Error formatting dpid for deletion: %s", e)
-                
-            # Borrar tablas de puertos asociadas al switch fantasma
-            self.redis.delete(f"mac_to_port:{dpid}")
-            self.redis.delete(f"switch_ports:{dpid}")
+                # Borrar de la lista global de switches
+                self.redis.srem('topology:switches', dpid)
+
+                # Node metadata is owned by ovs-sdn-initializer heartbeats; do
+                # not delete it here on transient OpenFlow reconnects.
+                self.redis.delete(f"mac_to_port:{dpid}")
+                self.redis.delete(f"switch_ports:{dpid}")
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while removing switch %s: %s", dpid, e)
 
 
 
@@ -314,7 +343,11 @@ class DistributedL2Switch(app_manager.RyuApp):
         for p in ev.msg.body:
             port_no = p.port_no
             name = p.name.decode('utf-8')
-            self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+            try:
+                self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while registering port %s/%s: %s", dpid, port_no, e)
+                continue
             self.logger.debug("Port registered: DPID %s, Port %s, Name %s", dpid, port_no, name)
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
@@ -327,10 +360,18 @@ class DistributedL2Switch(app_manager.RyuApp):
         ofproto = msg.datapath.ofproto
 
         if reason == ofproto.OFPPR_ADD or reason == ofproto.OFPPR_MODIFY:
-            self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+            try:
+                self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while updating port %s/%s: %s", dpid, port_no, e)
+                return
             self.logger.info("Port status UPDATE: DPID %s, Port %s, Name %s", dpid, port_no, name)
         elif reason == ofproto.OFPPR_DELETE:
-            self.redis.hdel(f"switch_ports:{dpid}", port_no)
+            try:
+                self.redis.hdel(f"switch_ports:{dpid}", port_no)
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while deleting port %s/%s: %s", dpid, port_no, e)
+                return
             self.logger.info("Port status DELETE: DPID %s, Port %s", dpid, port_no)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -359,7 +400,11 @@ class DistributedL2Switch(app_manager.RyuApp):
         dst = ev.link.dst
         # Registrar link bidireccional L2 detectado por LLDP
         link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
-        self.redis.sadd("topology:links", link_str)
+        try:
+            self.redis.sadd("topology:links", link_str)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while adding LLDP link %s: %s", link_str, e)
+            return
         self.logger.info("LLDP Auto-Discovery: Enlace Agregado %s", link_str)
 
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
@@ -367,12 +412,20 @@ class DistributedL2Switch(app_manager.RyuApp):
         src = ev.link.src
         dst = ev.link.dst
         link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
-        self.redis.srem("topology:links", link_str)
+        try:
+            self.redis.srem("topology:links", link_str)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while deleting LLDP link %s: %s", link_str, e)
+            return
         self.logger.info("LLDP Auto-Discovery: Enlace Removido %s", link_str)
 
     def _get_switch_mac_map(self):
         """Devuelve un dict {mac_hex: dpid} de todos los switches registrados."""
-        switches = self.redis.smembers('topology:switches')
+        try:
+            switches = self.redis.smembers('topology:switches')
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading switch MAC map: %s", e)
+            return {}
         mac_map = {}
         for dpid in switches:
             try:
@@ -414,10 +467,12 @@ class DistributedL2Switch(app_manager.RyuApp):
         # Externalize State: Learn the mac address to avoid FLOOD next time.
         # Store the mac_to_port table for this dpid in Redis natively (Hash)
         mac_table_key = f"mac_to_port:{dpid}"
-        self.redis.hset(mac_table_key, src, in_port)
-        
-        # MAC Ageing (Auto Limpieza): mantener el mapa sensible a cambios STP.
-        self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=180)
+        try:
+            self.redis.hset(mac_table_key, src, in_port)
+            # MAC Ageing (Auto Limpieza): mantener el mapa sensible a cambios STP.
+            self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=180)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while learning MAC %s on %s: %s", src, dpid, e)
 
         # ─── TOPOLOGY INFERENCE ───────────────────────────────────────────────
         # Si el src MAC pertenece a otro switch conocido y llega por un puerto
@@ -428,15 +483,26 @@ class DistributedL2Switch(app_manager.RyuApp):
                 neighbor_dpid = switch_mac_map[src]
                 if str(neighbor_dpid) != str(dpid):
                     link_str = f"{dpid}:{in_port}-{neighbor_dpid}:0"
-                    self.redis.sadd("topology:links", link_str)
-                    self.redis.expire("topology:links", 300)  # TTL 5min para frescura
+                    try:
+                        self.redis.sadd("topology:links", link_str)
+                        self.redis.expire("topology:links", 300)  # TTL 5min para frescura
+                    except redis.RedisError as e:
+                        self.logger.warning("Redis unavailable while inferring link %s: %s", link_str, e)
         # ─────────────────────────────────────────────────────────────────────
 
         # Retrieve destination port from Redis
-        out_port_str = self.redis.hget(mac_table_key, dst)
+        try:
+            out_port_str = self.redis.hget(mac_table_key, dst)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading destination %s on %s: %s", dst, dpid, e)
+            out_port_str = None
         
         known_worker_macs = self._known_worker_macs()
-        ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        try:
+            ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading ports for %s: %s", dpid, e)
+            ports = {}
         in_port_name = str(ports.get(str(in_port), ""))
         if (
             src not in known_worker_macs and
@@ -444,7 +510,10 @@ class DistributedL2Switch(app_manager.RyuApp):
             not in_port_name.startswith("vx") and
             in_port_name != "br-sdn"
         ):
-            self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
+            try:
+                self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while updating guest location %s: %s", src, e)
 
         udp_pkt = pkt.get_protocol(udp.udp)
         arp_pkt = pkt.get_protocol(arp.arp)
@@ -523,9 +592,13 @@ class DistributedL2Switch(app_manager.RyuApp):
             # from attempting to write contradictory flow rules for the same 
             # Packet-In event. A lock unique to (dpid, src, dst) ensures safety.
             lock_name = f"lock:flow:{dpid}:{src}:{dst}"
-            lock = self.redis.lock(lock_name, timeout=5, blocking_timeout=1)
-            
-            acquired = lock.acquire()
+            lock = None
+            acquired = False
+            try:
+                lock = self.redis.lock(lock_name, timeout=5, blocking_timeout=1)
+                acquired = lock.acquire()
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while acquiring flow lock %s: %s", lock_name, e)
             if acquired:
                 try:
                     match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
@@ -536,7 +609,10 @@ class DistributedL2Switch(app_manager.RyuApp):
                     else:
                         self.add_flow(datapath, 1, match, actions)
                 finally:
-                    lock.release()
+                    try:
+                        lock.release()
+                    except redis.RedisError as e:
+                        self.logger.warning("Redis unavailable while releasing flow lock %s: %s", lock_name, e)
             else:
                 self.logger.info("Flow mod for %s->%s on %s is concurrently handled by another replica", src, dst, dpid)
 
@@ -570,7 +646,11 @@ class DistributedL2Switch(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
         dpid = ev.msg.datapath.id
-        ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        try:
+            ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading port stats names for %s: %s", dpid, e)
+            ports = {}
         for stat in ev.msg.body:
             if stat.port_no > 0xffffff00:
                 continue
@@ -593,13 +673,18 @@ class DistributedL2Switch(app_manager.RyuApp):
         }
         try:
             switches = self.redis.smembers("topology:switches") or set()
-            alive_switches = self.redis.keys("switch:alive:*") or []
-            counts["active_switches"] = len(alive_switches)
-            counts["active_nodes"] = len(alive_switches)
-            for dpid in switches:
+            node_ips = self.redis.hgetall("topology:node_ips") or {}
+            topology_dpids = self._get_topology_switch_dpids(node_ips)
+            if not topology_dpids:
+                topology_dpids.update(str(dpid) for dpid in switches)
+            counts["active_switches"] = len(topology_dpids)
+            counts["active_nodes"] = len(topology_dpids)
+            for dpid in topology_dpids:
                 counts["learned_macs"][dpid] = self.redis.hlen(f"mac_to_port:{dpid}")
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading Redis metrics: %s", e)
         except Exception as e:
-            self.logger.warning("Error reading Redis metrics: %s", e)
+            self.logger.warning("Unexpected Redis metrics failure: %s", e)
         return counts
 
     def _raw_dpid_to_decimal(self, raw_dpid):
@@ -620,6 +705,24 @@ class DistributedL2Switch(app_manager.RyuApp):
         for key in alive_keys:
             raw_dpid = str(key).split("switch:alive:", 1)[-1]
             dpids.add(self._raw_dpid_to_decimal(raw_dpid))
+        return dpids
+
+    def _get_topology_switch_dpids(self, node_ips):
+        import time
+
+        ttl = int(os.environ.get("TOPOLOGY_NODE_TTL_SECONDS", "180"))
+        now = int(time.time())
+        last_seen = self.redis.hgetall("topology:node_last_seen") or {}
+        dpids = set()
+        for raw_dpid, timestamp in last_seen.items():
+            try:
+                if now - int(float(timestamp)) <= ttl:
+                    dpids.add(self._raw_dpid_to_decimal(raw_dpid))
+            except (TypeError, ValueError):
+                continue
+        dpids.update(self._get_alive_switch_dpids())
+        if not dpids:
+            dpids.update(str(dpid) for dpid in self.redis.smembers("topology:switches") or set())
         return dpids
 
     def _get_blocked_br0_links(self, ip_to_dpid, dpids):
@@ -677,9 +780,9 @@ class DistributedL2Switch(app_manager.RyuApp):
         return True
 
     def _build_topology_snapshot(self):
-        dpids = self._get_alive_switch_dpids()
         node_names = self.redis.hgetall("topology:node_names") or {}
         node_ips = self.redis.hgetall("topology:node_ips") or {}
+        dpids = self._get_topology_switch_dpids(node_ips)
         guest_ips = self.redis.hgetall("topology:guest_ips") or {}
         guest_locations = self.redis.hgetall("topology:guest_locations") or {}
         br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
@@ -735,7 +838,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                         })
                         edge["details"].append("%s:%s=active" % (dpid, port_name))
 
-        for mac, port_no in mac_table.items():
+            for mac, port_no in mac_table.items():
                 if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
                     continue
                 if mac in guest_locations:
@@ -979,7 +1082,10 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _append_topology_metrics(self, lines):
         nodes, edges, guests, ip_to_dpid = self._build_topology_snapshot()
-        dpids = {node["id"] for node in nodes if node["type"] == "switch"}
+        dpids = {
+            node["id"] for node in nodes
+            if node["type"] == "switch" and node["id"] != MGMT_SWITCH_ID
+        }
         sample_value = str(datetime.utcnow().timestamp())
 
         lines.extend([
@@ -1054,10 +1160,14 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _render_prometheus_metrics(self):
         redis_counts = self._redis_metric_counts()
-        security_total = self.redis.get("security:events_total") or 0
-        mac_spoofing = self.redis.get("security:events:MAC_SPOOFING") or 0
-        ip_spoofing = self.redis.get("security:events:IP_SPOOFING") or 0
-        arp_poisoning = self.redis.get("security:events:ARP_POISONING") or 0
+        try:
+            security_total = self.redis.get("security:events_total") or 0
+            mac_spoofing = self.redis.get("security:events:MAC_SPOOFING") or 0
+            ip_spoofing = self.redis.get("security:events:IP_SPOOFING") or 0
+            arp_poisoning = self.redis.get("security:events:ARP_POISONING") or 0
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading security metrics: %s", e)
+            security_total = mac_spoofing = ip_spoofing = arp_poisoning = 0
 
         lines = [
             "# HELP ryu_security_events_total Total security events detected.",

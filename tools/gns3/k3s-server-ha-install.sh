@@ -9,6 +9,40 @@ NODE_IP="${RYU_K3S_NODE_IP:-${K3S_NODE_IP:-}}"
 CLUSTER_INIT="${RYU_K3S_CLUSTER_INIT:-${K3S_CLUSTER_INIT:-false}}"
 NODE_NAME="${RYU_K3S_NODE_NAME:-${K3S_NODE_NAME:-$(hostname)}}"
 
+install_br0_forwarding_service() {
+  cat >/usr/local/bin/k3s-br0-forwarding.sh <<'EOF'
+#!/bin/sh
+set -eu
+
+iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || \
+  iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT
+EOF
+  chmod +x /usr/local/bin/k3s-br0-forwarding.sh
+
+  cat >/etc/systemd/system/k3s-iptables.service <<'EOF'
+[Unit]
+Description=Regla iptables de forwarding para br0
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/local/bin/k3s-br0-forwarding.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now k3s-iptables.service
+}
+
+if [ -z "$NODE_IP" ] && [ -x /usr/local/bin/configure-br0-tree.sh ]; then
+  /usr/local/bin/configure-br0-tree.sh || true
+fi
+
 if [ -z "$NODE_IP" ]; then
   NODE_IP=$(ip -4 addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
 fi
@@ -73,6 +107,11 @@ EOF
 chmod +x /usr/local/bin/k3s-gns3-boot-guard.sh
 
 mkdir -p /etc/systemd/system/k3s.service.d
+if [ -f /etc/systemd/system/gns3-br0-tree.service ]; then
+  cat >/etc/systemd/system/k3s.service.d/10-gns3-boot-guard.conf <<'EOF'
+[Unit]
+Requires=gns3-br0-tree.service
+After=gns3-br0-tree.service
 
 [Service]
 ExecStartPre=/usr/local/bin/k3s-gns3-boot-guard.sh
@@ -86,6 +125,7 @@ RestartSec=15s
 EOF
 fi
 systemctl daemon-reload
+install_br0_forwarding_service
 
 mkdir -p /etc/kubernetes
 ln -sf /etc/rancher/k3s/k3s.yaml /etc/kubernetes/admin.conf

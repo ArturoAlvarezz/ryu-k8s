@@ -53,6 +53,9 @@ log = logging.getLogger(__name__)
 
 SENTINEL_HOST         = os.environ.get("REDIS_SENTINEL_HOST", "redis-sentinel.sdn-controller.svc.cluster.local")
 SENTINEL_PORT         = int(os.environ.get("REDIS_SENTINEL_PORT", 26379))
+REDIS_SOCKET_TIMEOUT = float(os.environ.get("REDIS_SOCKET_TIMEOUT", "1.0"))
+REDIS_RECONNECT_INTERVAL = float(os.environ.get("REDIS_RECONNECT_INTERVAL", "10.0"))
+REDIS_RECONNECT_ATTEMPTS = int(os.environ.get("REDIS_RECONNECT_ATTEMPTS", "2"))
 UDP_PORT              = int(os.environ.get("UDP_PORT", 5555))
 FLASK_PORT            = int(os.environ.get("FLASK_PORT", 5000))
 MAX_READINGS          = int(os.environ.get("MAX_READINGS_PER_DEVICE", 100))
@@ -80,48 +83,70 @@ def canonical_json(payload: dict) -> bytes:
 # ---------------------------------------------------------------------------
 # Redis
 # ---------------------------------------------------------------------------
-def connect_redis() -> redis_lib.Redis | None:
+def connect_redis(attempts: int | None = None, sleep_between: bool = True) -> redis_lib.Redis | None:
     """Conecta a Redis Sentinel con reintentos. Retorna None si falla."""
-    for attempt in range(1, 11):
+    attempts = attempts or REDIS_RECONNECT_ATTEMPTS
+    for attempt in range(1, attempts + 1):
         try:
-            sentinel = Sentinel([(SENTINEL_HOST, SENTINEL_PORT)], socket_timeout=1.0)
-            r = sentinel.master_for("mymaster", socket_timeout=1.0, decode_responses=True)
+            sentinel = Sentinel(
+                [(SENTINEL_HOST, SENTINEL_PORT)],
+                socket_timeout=REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=REDIS_SOCKET_TIMEOUT,
+            )
+            r = sentinel.master_for(
+                "mymaster",
+                socket_timeout=REDIS_SOCKET_TIMEOUT,
+                socket_connect_timeout=REDIS_SOCKET_TIMEOUT,
+                decode_responses=True,
+            )
             r.ping()
             log.info("Conexión a Redis Sentinel exitosa.")
             return r
         except Exception as e:
-            log.warning("Intento %d/10 — Redis no disponible: %s", attempt, e)
-            time.sleep(3)
+            log.warning("Intento %d/%d — Redis no disponible: %s", attempt, attempts, e)
+            if sleep_between and attempt < attempts:
+                time.sleep(1)
     log.error("No se pudo conectar a Redis. Operando en modo memoria.")
     return None
 
 
 r: redis_lib.Redis | None = None
 _last_redis_connect_attempt = 0.0
+_redis_lock = threading.Lock()
+_redis_last_ok = 0.0
+_redis_last_error = "not_connected"
 
 def get_redis() -> redis_lib.Redis | None:
     """Retorna la conexión Redis (reconecta si perdió el enlace)."""
-    global r, _last_redis_connect_attempt
+    global r, _last_redis_connect_attempt, _redis_last_ok, _redis_last_error
     if r is None:
         now = time.time()
-        if now - _last_redis_connect_attempt < 5:
+        if now - _last_redis_connect_attempt < REDIS_RECONNECT_INTERVAL:
+            return None
+        if not _redis_lock.acquire(False):
             return None
         _last_redis_connect_attempt = now
-        log.warning("Redis no está conectado. Intentando reconectar...")
         try:
-            r = connect_redis()
-        except Exception:
+            log.warning("Redis no está conectado. Intentando reconectar...")
+            r = connect_redis(attempts=1, sleep_between=False)
+            if r is not None:
+                _redis_last_ok = time.time()
+                _redis_last_error = ""
+        except Exception as e:
+            _redis_last_error = str(e)
             r = None
+        finally:
+            _redis_lock.release()
         return r
     try:
         r.ping()
+        _redis_last_ok = time.time()
+        _redis_last_error = ""
         return r
-    except Exception:
-        log.warning("Redis perdió conexión. Reconectando...")
-        try:
-            r = connect_redis()
-        except Exception:
-            r = None
+    except Exception as e:
+        _redis_last_error = str(e)
+        log.warning("Redis perdió conexión: %s", e)
+        r = None
         return r
 
 
@@ -134,6 +159,14 @@ def redis_is_ready() -> bool:
         return True
     except Exception:
         return False
+
+
+def redis_status_snapshot() -> dict:
+    return {
+        "connected": r is not None,
+        "last_ok_seconds_ago": round(time.time() - _redis_last_ok, 1) if _redis_last_ok else None,
+        "last_error": _redis_last_error,
+    }
 
 
 def telemetry_source_authorization(source_ip: str) -> tuple[bool, str]:
@@ -937,10 +970,11 @@ def api_delete_device(device_id):
 
 @app.route("/api/health")
 def health():
-    redis_ok = redis_is_ready()
+    redis_state = redis_status_snapshot()
     return jsonify({
         "status": "ok",
-        "redis": "connected" if redis_ok else "disconnected (memory mode)",
+        "redis": "connected" if redis_state["connected"] else "disconnected (memory mode)",
+        "redis_detail": redis_state,
         "udp_port": UDP_PORT,
     })
 
@@ -952,14 +986,11 @@ def metrics():
 
 @app.route("/api/ready")
 def ready():
-    if not redis_is_ready():
-        return jsonify({
-            "status": "not-ready",
-            "redis": "disconnected",
-        }), 503
+    redis_state = redis_status_snapshot()
     return jsonify({
         "status": "ready",
-        "redis": "connected",
+        "redis": "connected" if redis_state["connected"] else "disconnected (fail-closed)",
+        "redis_detail": redis_state,
     })
 
 
@@ -977,7 +1008,7 @@ if __name__ == "__main__":
     # Conectar Redis en background (no bloquear arranque)
     def _redis_init():
         global r
-        r = connect_redis()
+        r = connect_redis(attempts=10, sleep_between=True)
 
     threading.Thread(target=_redis_init, daemon=True).start()
 

@@ -87,28 +87,13 @@ spec:
             redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1
           }
 
-          get_static_br0_neighbor_ip() {
-            # LLDP does not cross Linux bridge ports blocked by STP. Keep the
-            # GNS3 management cabling as a fallback so blocked links remain
-            # visible in Redis/Grafana while only BPDUs traverse the wire.
-            case "${NODE_NAME}:$1" in
-              master:ens4) echo "192.168.122.148" ;;
-              master:ens5) echo "192.168.122.235" ;;
-              control-2:ens4) echo "192.168.122.148" ;;
-              control-3:ens4) echo "192.168.122.141" ;;
-              worker-0e5d07:ens3) echo "192.168.122.100" ;;
-              worker-0e5d07:ens4) echo "192.168.122.88" ;;
-              worker-0e5d07:ens5) echo "192.168.122.141" ;;
-              worker-0e5d07:ens6) echo "192.168.122.235" ;;
-              worker-546cce:ens3) echo "192.168.122.201" ;;
-              worker-546cce:ens4) echo "192.168.122.148" ;;
-              worker-546cce:ens5) echo "192.168.122.100" ;;
-              worker-4f508e:ens3) echo "192.168.122.236" ;;
-              worker-4f508e:ens4) echo "192.168.122.148" ;;
-              worker-4f508e:ens5) echo "192.168.122.201" ;;
-              worker-6a9f84:ens3) echo "192.168.122.235" ;;
-              worker-6a9f84:ens4) echo "192.168.122.141" ;;
-            esac
+          is_root_port() {
+            intf="$1"
+            root_port=$(cat /sys/class/net/br0/bridge/root_port 2>/dev/null || echo "")
+            port_id=$(cat "/sys/class/net/br0/brif/$intf/port_id" 2>/dev/null || echo "")
+            [ -n "$root_port" ] && [ -n "$port_id" ] || return 1
+            port_num=$((0x${port_id#0x} & 0xff))
+            [ "$port_num" = "$root_port" ]
           }
 
           wait_for_management_plane
@@ -287,20 +272,16 @@ spec:
                 esac
                 REMOTE_IP=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
                 if [ -z "$REMOTE_IP" ]; then
-                  REMOTE_IP=$(get_static_br0_neighbor_ip "$stp_intf")
-                fi
-                if [ -z "$REMOTE_IP" ]; then
-                  case "${NODE_NAME}:${stp_intf}" in
-                    master:ens3|control-*:ens3)
-                      REMOTE_IP="mgmt-switch"
-                      ;;
-                  esac
+                  if [ "$STP_STATE" = "forwarding" ] && is_root_port "$stp_intf"; then
+                    REMOTE_IP="mgmt-switch"
+                  fi
                 fi
                 if [ -n "$REMOTE_IP" ]; then
                   redis-cli -h $MASTER_IP HSET topology:br0_stp_ports "$DPID:$stp_intf" "$STP_STATE:$REMOTE_IP" > /dev/null 2>&1 || true
                 fi
               done
-              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 15 > /dev/null 2>&1 || true
+              redis-cli -h $MASTER_IP HSET topology:node_last_seen $DPID "$(date +%s)" > /dev/null 2>&1 || true
+              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 120 > /dev/null 2>&1 || true
             fi
             sleep 2
           done

@@ -89,7 +89,7 @@
 - Smart Meters must obtain a DHCP lease before starting telemetry; do not revert `services/smart-meter/entrypoint.sh` to a finite retry loop unless deployment ordering guarantees DHCP availability.
 - The meter collector must remain fail-closed: if Redis/security lookup is unavailable or a source IP is not registered as `authorized`, telemetry is rejected and counted under `/api/telemetry-security`.
 - Guest freshness matters. Avoid reintroducing stale guests into metrics/topology without checking live state such as `active_mac:*`, `health:*`, or current OVS FDB evidence.
-- `ovs-sdn-initializer` has a static GNS3 `br0` neighbor fallback because LLDP does not cross STP-blocked ports; keep this map in sync with the documented cabling and node IPs.
+- `ovs-sdn-initializer` must not hardcode GNS3 node names, worker IDs, or neighbor IPs. Topology data must come from runtime discovery such as LLDP, Linux bridge STP state, Kubernetes node metadata, and Redis heartbeats because lab nodes are frequently recreated.
 
 ## Roadmap Context
 - Completed: Smart Meter guest image and telemetry collector.

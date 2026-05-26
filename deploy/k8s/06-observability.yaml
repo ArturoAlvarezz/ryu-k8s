@@ -668,9 +668,17 @@ data:
         },
         {
           "type": "timeseries",
-          "title": "Trafico SDN por puerto OpenFlow",
+          "title": "Trafico SDN por puerto OpenFlow (MB/s)",
           "gridPos": {"x": 12, "y": 34, "w": 12, "h": 8},
-          "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m]))", "legendFormat": "{{dpid}} {{port_name}}"}]
+          "fieldConfig": {
+            "defaults": {
+              "unit": "MBs",
+              "decimals": 2,
+              "min": 0
+            },
+            "overrides": []
+          },
+          "targets": [{"expr": "sum by (dpid, port_name) (rate(ryu_port_rx_bytes_total[1m]) + rate(ryu_port_tx_bytes_total[1m])) / 1024 / 1024", "legendFormat": "{{dpid}} {{port_name}}"}]
         },
         {
           "type": "logs",
@@ -748,7 +756,7 @@ metadata:
   labels:
     app: grafana
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: grafana
@@ -769,6 +777,7 @@ spec:
       containers:
       - name: grafana
         image: grafana/grafana:11.1.4
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 3000
           name: http
@@ -789,7 +798,13 @@ spec:
         - name: GF_AUTH_ANONYMOUS_ENABLED
           value: "true"
         - name: GF_AUTH_ANONYMOUS_ORG_ROLE
-          value: Viewer
+          value: Admin
+        - name: GF_SERVER_ROOT_URL
+          value: http://192.168.122.10:3000/
+        - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+          value: "false"
+        - name: GF_ANALYTICS_REPORTING_ENABLED
+          value: "false"
         - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
           value: /var/lib/grafana/dashboards/sdn-observability.json
         volumeMounts:
@@ -806,12 +821,14 @@ spec:
             path: /api/health
             port: 3000
           initialDelaySeconds: 15
+          timeoutSeconds: 5
           periodSeconds: 10
         livenessProbe:
           httpGet:
             path: /api/health
             port: 3000
           initialDelaySeconds: 30
+          timeoutSeconds: 5
           periodSeconds: 30
       volumes:
       - name: provisioning

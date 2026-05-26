@@ -9,9 +9,8 @@
 
 ### Parte I — Reglas de Despliegue
 
-1. [Orden obligatorio](#1-orden-obligatorio)
-2. [Roles de nodos](#2-roles-de-nodos)
-3. [Mapa de interfaces](#3-mapa-de-interfaces)
+1. [Roles de nodos](#1-roles-de-nodos)
+2. [Mapa de interfaces](#2-mapa-de-interfaces)
 
 ### Parte II — Plano de Control HA
 
@@ -45,7 +44,7 @@
 
 # Parte I — Reglas de Despliegue
 
-## 2. Roles de nodos
+## 1. Roles de nodos
 
 | Rol | Cantidad | IP | Instalación K3s |
 | --- | --- | --- | --- |
@@ -71,7 +70,7 @@ Recursos mínimos validados para las VMs control-plane:
 | Disco | 20 GB o más |
 | Adaptadores | 6 tipo `virtio` |
 
-## 3. Mapa de interfaces
+## 2. Mapa de interfaces
 
 | Interfaz | Uso |
 | --- | --- |
@@ -81,9 +80,9 @@ Recursos mínimos validados para las VMs control-plane:
 | `br0` | Bridge Linux de gestión/fabric `192.168.122.0/24` |
 | `br-sdn` | Bridge Open vSwitch creado por el DaemonSet SDN |
 
-### 3.1 Arranque completo de una topología GNS3 con enlaces redundantes
+### 2.1 Arranque completo de una topología GNS3 con enlaces redundantes
 
-#### 3.1.1 Configurar el switch STP de gestión
+#### 2.1.1 Configurar el switch STP de gestión
 
 Configuración del nodo en GNS3:
 
@@ -121,6 +120,25 @@ ovs-appctl stp/show br0
 Ejecuta esta sección en la VM que será el primer control-plane. Esta VM conserva la IP fija `192.168.122.100`.
 
 ### 4.1 Instalar utilidades
+
+Si la VM viene de un template QEMU con disco cloud pequeño o linked clone, redimensiona el disco a 20 GB antes de instalar paquetes. Hazlo con la VM apagada desde el host GNS3:
+
+```bash
+DISK=/home/artulita/GNS3/projects/ProyectoMemoria/project-files/qemu/NODE_ID/hda_disk.qcow2
+qemu-img info "$DISK"
+qemu-img resize "$DISK" 20G
+qemu-img info "$DISK"
+```
+
+Después arranca la VM y expande la partición dentro de Ubuntu:
+
+```bash
+sudo growpart /dev/vda 1
+sudo resize2fs /dev/vda1
+df -h /
+```
+
+No continúes si `/` sigue por debajo de 20 GB.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
@@ -163,6 +181,7 @@ sudo hostnamectl set-hostname master
 echo "master" | sudo tee /etc/hostname
 sudo sed -i '/127.0.1.1/d' /etc/hosts
 echo "127.0.1.1 master" | sudo tee -a /etc/hosts
+printf 'preserve_hostname: true\n' | sudo tee /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
 
 sudo bash -c 'cat > /etc/netplan/50-cloud-init.yaml << EOF
 network:
@@ -204,11 +223,50 @@ sudo chmod 600 /etc/netplan/50-cloud-init.yaml
 sudo netplan apply
 ```
 
+Instala el configurador persistente de `br0` también en el primer control-plane. Aunque `netplan` ya define la IP estática, este servicio garantiza que el bridge, STP, rutas y costes vuelvan al estado esperado antes de arrancar K3s después de un reinicio completo de GNS3.
+
+```bash
+sudo cp ~/ryu-k8s/tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
+sudo chmod +x /usr/local/bin/configure-br0-tree.sh
+
+sudo bash -c 'cat > /etc/default/gns3-br0-tree << EOF
+NODE_IP=192.168.122.100
+NODE_PREFIX=24
+NODE_GATEWAY=192.168.122.1
+ALL_PORTS="ens3 ens4 ens5 ens6"
+STP_PORTS="ens3 ens4 ens5 ens6"
+PREFERRED_STP_PORTS="ens3 ens4"
+EOF'
+
+sudo bash -c 'cat > /etc/systemd/system/gns3-br0-tree.service << EOF
+[Unit]
+Description=Configurar br0 de gestion GNS3 con STP
+DefaultDependencies=no
+After=systemd-udev-settle.service systemd-networkd.service
+Before=network-online.target k3s.service
+Wants=systemd-udev-settle.service systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/configure-br0-tree.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now gns3-br0-tree.service
+```
+
 La sesión SSH puede cortarse cuando `ens3` pasa a formar parte de `br0`. Eso es esperado. Reconecta a `192.168.122.100` y valida antes de seguir:
 
 ```bash
 hostname
 ip -br addr show br0
+systemctl is-active gns3-br0-tree.service
 df -h /
 ```
 
@@ -238,14 +296,14 @@ sudo sysctl --system
 sudo bash -c 'cat > /etc/systemd/system/k3s-iptables.service << EOF
 [Unit]
 Description=Reglas iptables para SDN/K3s
-After=network-online.target
+After=network-online.target k3s.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/bin/sleep 3
-ExecStart=/bin/bash -c "iptables -I FORWARD -i br0 -o br0 -j ACCEPT; iptables -I FORWARD -i ens3 -j ACCEPT; iptables -I FORWARD -o ens3 -j ACCEPT"
+ExecStart=/bin/bash -c "iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT; iptables -C FORWARD -i ens3 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ens3 -j ACCEPT; iptables -C FORWARD -o ens3 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o ens3 -j ACCEPT"
 
 [Install]
 WantedBy=multi-user.target
@@ -280,7 +338,7 @@ sudo cat /var/lib/rancher/k3s/server/node-token
 
 ## 6. Preparar permisos de kube-vip
 
-Ejecuta esto en `master` después de instalar K3s. En esta sección solo se crean los permisos. El VIP se desplegará como DaemonSet después de unir los 3 servidores control-plane.
+Ejecuta esto en `master` después de instalar K3s y antes de unir servidores adicionales. En esta sección solo se crean los permisos. El VIP se desplegará como DaemonSet después de unir los 3 servidores control-plane.
 
 Crea el ServiceAccount y permisos de leader election para `kube-vip`. En K3s, `/etc/rancher/k3s/k3s.yaml` suele quedar legible solo por `root`, por lo que este primer `kubectl apply` debe ejecutarse con `sudo` si todavía no configuraste kubeconfig para el usuario `ubuntu`:
 
@@ -324,6 +382,16 @@ EOF
 Repite esta sección en dos VMs separadas que serán control-plane adicionales.
 
 ### 7.1 Instalar utilidades
+
+Antes de instalar paquetes, confirma que el disco del servidor adicional ya fue redimensionado a 20 GB. Si viene de un linked clone pequeño, haz el mismo procedimiento de redimensionado descrito en la sección 4.1.
+
+```bash
+sudo growpart /dev/vda 1
+sudo resize2fs /dev/vda1
+df -h /
+```
+
+No continúes si `/` sigue por debajo de 20 GB.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
@@ -398,11 +466,52 @@ sudo netplan apply
 
 Después de `netplan apply`, la IP DHCP de la VM puede cambiar porque la dirección pasa de `ens3` a `br0`. Si pierdes la sesión SSH, busca la nueva IP en la consola de GNS3, en la tabla DHCP/NAT o con un escaneo de `192.168.122.0/24`, y continúa desde esa IP.
 
+Instala el configurador persistente de `br0` y fija como `NODE_IP` la IP reservada que tendrá ese control-plane en reinicios posteriores. Para `control-2` y `control-3`, usa la IP que vayas a pasar después como `RYU_K3S_NODE_IP`.
+
+```bash
+export NODE_IP=<IP_CONTROL_PLANE>
+
+sudo cp ~/ryu-k8s/tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
+sudo chmod +x /usr/local/bin/configure-br0-tree.sh
+
+sudo bash -c "cat > /etc/default/gns3-br0-tree << EOF
+NODE_IP=$NODE_IP
+NODE_PREFIX=24
+NODE_GATEWAY=192.168.122.1
+ALL_PORTS=\"ens3 ens4 ens5 ens6\"
+STP_PORTS=\"ens3 ens4 ens5 ens6\"
+PREFERRED_STP_PORTS=\"ens3 ens4\"
+EOF"
+
+sudo bash -c 'cat > /etc/systemd/system/gns3-br0-tree.service << EOF
+[Unit]
+Description=Configurar br0 de gestion GNS3 con STP
+DefaultDependencies=no
+After=systemd-udev-settle.service systemd-networkd.service
+Before=network-online.target k3s.service
+Wants=systemd-udev-settle.service systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/configure-br0-tree.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now gns3-br0-tree.service
+```
+
 No ejecutes la sección 7.5 hasta haber reconectado a la IP nueva y validado `br0`:
 
 ```bash
 hostname
 ip -br addr show br0
+systemctl is-active gns3-br0-tree.service
 df -h /
 ```
 
@@ -416,6 +525,7 @@ sudo hostnamectl set-hostname "$NODE_NAME"
 echo "$NODE_NAME" | sudo tee /etc/hostname
 sudo sed -i '/127.0.1.1/d' /etc/hosts
 echo "127.0.1.1 $NODE_NAME" | sudo tee -a /etc/hosts
+printf 'preserve_hostname: true\n' | sudo tee /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
 ```
 
 No reutilices el mismo hostname en dos servidores K3s.
@@ -434,14 +544,14 @@ sudo systemctl daemon-reload
 sudo bash -c 'cat > /etc/systemd/system/k3s-iptables.service << EOF
 [Unit]
 Description=Regla iptables de forwarding para br0
-After=network-online.target
+After=network-online.target k3s.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/bin/sleep 5
-ExecStart=/sbin/iptables -I FORWARD -i br0 -o br0 -j ACCEPT
+ExecStart=/bin/bash -c "iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT"
 
 [Install]
 WantedBy=multi-user.target
@@ -455,6 +565,12 @@ sudo systemctl enable --now k3s-iptables.service
 Ejecuta esta sección en cada uno de los dos servidores adicionales.
 
 Usa el token obtenido en el primer servidor. No uses el placeholder literalmente.
+
+En `master`, obtén el token y guárdalo solo en tu sesión de terminal o gestor seguro. No lo escribas en archivos del repositorio:
+
+```bash
+sudo cat /var/lib/rancher/k3s/server/node-token
+```
 
 ```bash
 cd ~/ryu-k8s
@@ -471,9 +587,15 @@ Después de unir los dos servidores adicionales, valida desde cualquier control-
 sudo kubectl get nodes -o wide
 ```
 
-Los tres servidores deben quedar como miembros etcd/control-plane antes de arrancar workers.
+Los tres servidores deben quedar como miembros etcd/control-plane antes de desplegar `kube-vip` y antes de arrancar workers.
 
-Despliega `kube-vip` una sola vez como DaemonSet. No habilites `services`; este laboratorio solo necesita que `kube-vip` anuncie `192.168.122.10` para el API Server.
+Valida también que los 3 servidores tengan rol `control-plane,etcd`:
+
+```bash
+sudo kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide
+```
+
+Ahora sí, despliega `kube-vip` una sola vez como DaemonSet. No habilites `services`; este laboratorio solo necesita que `kube-vip` anuncie `192.168.122.10` para el API Server.
 
 ```bash
 sudo kubectl apply -f - <<'EOF'
@@ -572,6 +694,8 @@ sudo kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderId
 curl -k https://192.168.122.10:6443/readyz
 ```
 
+Si `curl` devuelve `ok`, estás consultando con credenciales locales válidas. Si devuelve `401 Unauthorized`, el VIP también está funcionando: el API Server respondió, pero la petición no llevaba credenciales. Lo que no debe ocurrir es timeout, conexión rechazada o ruta inalcanzable.
+
 El bloque `hostAliases` es intencional: fuerza a cada pod de `kube-vip` a hablar con el API local en `127.0.0.1`. Sin eso, los pods de `control-2` y `control-3` pueden intentar renovar o adquirir el lease a través del Service `kubernetes` y quedarse sin failover cuando cae `master`.
 
 ## 9. Configurar kubeconfig
@@ -621,6 +745,16 @@ qemu-img info "$DISK"
 
 Reemplaza `NODE_ID` por el directorio real del nodo QEMU. No copies el comando con `NODE_ID` sin cambiarlo.
 
+Después arranca la VM base y expande la partición dentro de Ubuntu:
+
+```bash
+sudo growpart /dev/vda 1
+sudo resize2fs /dev/vda1
+df -h /
+```
+
+No continúes si `/` sigue por debajo de 10 GB.
+
 Ejecuta las siguientes secciones solo en la VM base del worker.
 
 ### 10.1 Instalar utilidades
@@ -659,7 +793,7 @@ sudo apt-get install -y \
 sudo usermod -aG docker $USER
 ```
 
-### 10.4 Configurar red DHCP Zero-Touch
+### 10.4 Configurar red de gestion reinicio-safe
 
 ```bash
 sudo bash -c 'cat > /etc/netplan/50-cloud-init.yaml << EOF
@@ -696,13 +830,60 @@ sudo chmod 600 /etc/netplan/50-cloud-init.yaml
 sudo netplan apply
 ```
 
-Después de `netplan apply`, la IP DHCP puede cambiar porque la dirección pasa de `ens3` a `br0`. Si se corta SSH, busca la nueva IP en la tabla DHCP/NAT o en la consola de GNS3 y continúa desde esa IP. Valida antes de seguir:
+Instala el configurador persistente de `br0`. Este servicio es el mecanismo que hace que un worker ya unido al cluster recupere siempre su IP de gestion antes de arrancar `k3s-agent`, incluso después de apagar toda la topologia.
+
+```bash
+sudo cp ~/ryu-k8s/tools/gns3/configure-br0-tree.sh /usr/local/bin/configure-br0-tree.sh
+sudo chmod +x /usr/local/bin/configure-br0-tree.sh
+
+sudo bash -c 'cat > /etc/systemd/system/gns3-br0-tree.service << EOF
+[Unit]
+Description=Configurar br0 de gestion GNS3 con STP
+DefaultDependencies=no
+After=systemd-udev-settle.service systemd-networkd.service
+Before=network-online.target k3s-agent.service
+Wants=systemd-udev-settle.service systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/configure-br0-tree.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+
+sudo systemctl daemon-reload
+sudo systemctl enable gns3-br0-tree.service
+```
+
+En la Golden Image no crees todavia `/etc/default/gns3-br0-tree`: cada clon debe tener un `NODE_IP` unico. Antes del primer join de cada worker, crea el perfil desde la consola de GNS3 con la IP reservada para ese nodo:
+
+```bash
+sudo bash -c 'cat > /etc/default/gns3-br0-tree << EOF
+NODE_IP=192.168.122.<IP_UNICA_DEL_WORKER>
+NODE_PREFIX=24
+NODE_GATEWAY=192.168.122.1
+ALL_PORTS="ens3 ens4 ens5 ens6"
+STP_PORTS="ens3 ens4 ens5 ens6"
+PREFERRED_STP_PORTS="ens3"
+EOF'
+
+sudo systemctl restart gns3-br0-tree.service
+ip -br addr show br0
+```
+
+Después de `netplan apply`, la IP DHCP temporal puede cambiar porque la dirección pasa de `ens3` a `br0`. Esa IP solo sirve para preparar la imagen; en los clones, la IP persistente debe venir del perfil `gns3-br0-tree`. Valida antes de seguir:
 
 ```bash
 ip -br addr show br0
 bridge link | grep 'master br0'
 df -h /
 ```
+
+El hostname definitivo del worker se generará automáticamente al primer arranque del clon con formato `worker-<mac>`. El script de auto-join también configura `preserve_hostname: true` para que cloud-init no lo revierta en reinicios posteriores.
 
 ### 10.5 Configurar espera de red y forwarding
 
@@ -718,14 +899,14 @@ sudo systemctl daemon-reload
 sudo bash -c 'cat > /etc/systemd/system/k3s-iptables.service << EOF
 [Unit]
 Description=Regla iptables de forwarding para br0
-After=network-online.target
+After=network-online.target k3s-agent.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=/bin/sleep 5
-ExecStart=/sbin/iptables -I FORWARD -i br0 -o br0 -j ACCEPT
+ExecStart=/bin/bash -c "iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT"
 
 [Install]
 WantedBy=multi-user.target
@@ -738,7 +919,15 @@ sudo systemctl enable --now k3s-iptables.service
 
 Esta sección deja preparado el servicio que se ejecutará automáticamente en cada clon.
 
-Usa el token real del cluster HA obtenido en el primer servidor:
+Antes de tocar la Golden Image, asegúrate de que el VIP ya esté desplegado y responda desde la red de gestión:
+
+```bash
+curl -k https://192.168.122.10:6443/readyz
+```
+
+Un `401 Unauthorized` sin credenciales es válido porque confirma conectividad al API Server. Un timeout o conexión rechazada no es válido.
+
+Usa el token real del cluster HA obtenido en un servidor control-plane, normalmente `master`. No ejecutes este comando en la VM base del worker porque ahí no existe el token de servidor:
 
 ```bash
 sudo cat /var/lib/rancher/k3s/server/node-token
@@ -757,7 +946,8 @@ Crea el servicio systemd:
 sudo bash -c 'cat > /etc/systemd/system/k3s-autojoin.service << EOF
 [Unit]
 Description=Instalacion automatica de K3S Worker
-After=network-online.target
+After=gns3-br0-tree.service network-online.target
+Requires=gns3-br0-tree.service
 Wants=network-online.target
 
 [Service]
@@ -788,13 +978,23 @@ sudo chmod 600 /etc/systemd/system/k3s-autojoin.service.d/token.conf
 sudo systemctl daemon-reload
 sudo systemctl enable k3s-autojoin.service
 sudo systemd-analyze verify \
+  /etc/systemd/system/gns3-br0-tree.service \
   /etc/systemd/system/k3s-autojoin.service \
   /etc/systemd/system/k3s-iptables.service
 ```
 
+No arranques todavía `k3s-autojoin.service` en la Golden Image. Debe quedar habilitado para ejecutarse en cada clon después del sellado y arranque en GNS3.
+
 ## 12. Sellar la Golden Image
 
 Ejecuta esto al final, antes de apagar y exportar el disco.
+
+Antes de sellar, valida que la unidad quedó habilitada pero no ejecutada con éxito en la VM base:
+
+```bash
+systemctl is-enabled k3s-autojoin.service
+systemctl is-active k3s-autojoin.service || true
+```
 
 ```bash
 sudo truncate -s 0 /etc/machine-id
@@ -830,18 +1030,19 @@ Exporta el disco `.qcow2` desde el hipervisor y úsalo como appliance de worker 
 4. Conecta los workers solo a puertos libres de nodos control-plane. No conectes ningún worker al `Mgmt-STP-Switch`, al switch básico de GNS3 ni a `NAT1`.
 5. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN.
 6. Enciende los workers.
+7. En cada clon, crea `/etc/default/gns3-br0-tree` con una IP unica antes de dejar que `k3s-autojoin.service` complete el join.
 
 Cableado válido mínimo para un worker con un solo enlace:
 
 | Worker | Control-plane |
 | --- | --- |
-| `SDN-Worker-1:e0` (`ens3`) | `Master-1:e1` (`ens4`) |
-| `SDN-Worker-2:e0` (`ens3`) | `Master-2:e1` (`ens4`) |
-| `SDN-Worker-3:e0` (`ens3`) | `Master-3:e1` (`ens4`) |
+| `SDN-Worker-1:e0` (`ens3`) | `Master:e1` (`ens4`) |
+| `SDN-Worker-2:e0` (`ens3`) | `Master2:e1` (`ens4`) |
+| `SDN-Worker-3:e0` (`ens3`) | `Master3:e1` (`ens4`) |
 
-Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master-1:e1`, `Master-2:e1` y `Master-3:e1`, y crea un perfil `gns3-br0-tree` específico para ese clon antes de unirlo. No uses el switch de gestión como punto de conexión de workers.
+Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master:e1`, `Master2:e1` y `Master3:e1`, y crea un perfil `gns3-br0-tree` específico para ese clon antes de unirlo. No uses el switch de gestión como punto de conexión de workers.
 
-Cada worker obtiene IP por DHCP en `br0`, genera hostname `worker-<mac>`, instala `k3s-agent` y se une al cluster usando `https://192.168.122.10:6443`.
+Cada worker usa una IP persistente en `br0`, genera hostname `worker-<mac>`, instala `k3s-agent` y se une al cluster usando `https://192.168.122.10:6443`.
 
 Valida desde un control-plane:
 
@@ -858,6 +1059,8 @@ kubectl get node <worker-name> -o jsonpath='{.metadata.annotations.k3s\.io/node-
 ## 14. Desplegar servicios SDN en Kubernetes
 
 Ejecuta esta sección desde un control-plane con `kubectl` configurado contra `https://192.168.122.10:6443`.
+
+No despliegues servicios SDN hasta que `kubectl get nodes -o wide` muestre los 3 control-plane y los workers esperados en `Ready`. Si faltan workers, puedes desplegar el plano SDN igualmente, pero los DaemonSets solo correrán en los nodos existentes y tendrás que verificar los nuevos nodos cuando se unan.
 
 ```bash
 cd ~
@@ -898,16 +1101,30 @@ kubectl create configmap meter-collector-code \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Aplica los manifiestos por capa:
+Aplica los manifiestos por capa y espera las dependencias principales antes de pasar a la siguiente capa:
 
 ```bash
 kubectl apply -f deploy/k8s/01-database.yaml
+kubectl rollout status statefulset/redis -n sdn-controller --timeout=300s
+
 kubectl apply -f deploy/k8s/02-ryu-controller.yaml
 kubectl apply -f deploy/k8s/03-sdn-network.yaml
+kubectl rollout status daemonset/ovs-sdn-initializer -n sdn-controller --timeout=300s
+kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller --timeout=300s
+kubectl rollout status daemonset/ryu -n sdn-controller --timeout=300s
+
 kubectl apply -f deploy/k8s/04-topology-dashboard.yaml
+kubectl rollout status deployment/ryu-topology -n sdn-controller --timeout=300s
+
 kubectl apply -f deploy/k8s/05-telemetry.yaml
+kubectl rollout status daemonset/meter-collector -n sdn-controller --timeout=300s
+
 kubectl apply -f deploy/k8s/06-observability.yaml
+kubectl rollout status deployment/prometheus -n sdn-controller --timeout=300s
+kubectl rollout status deployment/grafana -n sdn-controller --timeout=300s
 ```
+
+Este orden evita errores transitorios difíciles de diagnosticar: Ryu, DHCP, topology-dashboard y meter-collector dependen de Redis; Ryu debe aplicarse antes de OVS para que OVS pueda apuntar al controlador local, pero no debes esperar el rollout de Ryu hasta que `ovs-sdn-initializer` haya creado `br-sdn`. Prometheus/Grafana deben desplegarse al final para descubrir servicios ya creados.
 
 Los manifiestos aplicados son:
 

@@ -67,6 +67,8 @@ spec:
           value: "redis-sentinel.sdn-controller.svc.cluster.local"
         - name: REDIS_SENTINEL_PORT
           value: "26379"
+        - name: REDIS_SOCKET_TIMEOUT
+          value: "5.0"
         - name: METRICS_PORT
           value: "8000"
         volumeMounts:

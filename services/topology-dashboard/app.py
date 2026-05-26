@@ -1,7 +1,7 @@
 import os
 import redis
 import json
-from flask import Flask, jsonify, render_template
+from flask import Flask, g, jsonify, render_template
 
 app = Flask(__name__)
 
@@ -10,7 +10,25 @@ from redis.sentinel import Sentinel
 SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
 SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
 sentinel = Sentinel([(SENTINEL_HOST, SENTINEL_PORT)], socket_timeout=0.5)
-r = sentinel.master_for('mymaster', socket_timeout=0.5, decode_responses=True)
+
+
+def redis_master():
+    return sentinel.master_for(
+        'mymaster',
+        socket_timeout=0.5,
+        socket_connect_timeout=0.5,
+        retry_on_timeout=True,
+        decode_responses=True,
+    )
+
+
+r = redis_master()
+
+
+def refresh_redis():
+    global r
+    r = redis_master()
+    return r
 
 
 def active_switches():
@@ -35,7 +53,7 @@ def device_id_for_mac(mac):
 
 def meter_device_ids_by_ip():
     meters = {}
-    for key in r.scan_iter('meter:latest:*'):
+    for key in r.scan_iter('meter:latest:*', count=1000):
         source_ip = (r.hget(key, 'source_ip') or '').strip()
         device_id = (r.hget(key, 'device_id') or '').strip()
         if source_ip and device_id:
@@ -49,6 +67,7 @@ def index():
 
 @app.route('/api/topology')
 def get_topology():
+    refresh_redis()
     try:
         switches = active_switches()
         node_names = r.hgetall('topology:node_names')
@@ -93,6 +112,8 @@ def get_topology():
         switches = valid_switches
 
         # Construir nodos físicos de switches (K3s Nodes)
+        guest_ips = r.hgetall('topology:guest_ips')
+        telemetry_device_ids = meter_device_ids_by_ip()
         for dpid in switches:
             raw_dpid = "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else dpid
             # Convertir el identificador decimal de vuelta a la MAC hexadecimal original para la UI
@@ -114,10 +135,6 @@ def get_topology():
                 "group": "maestro" if is_maestro else "worker",
                 "title": f"DPID Numérico: {dpid}"
             })
-            
-            # Obtener el mapa global de IPs asignadas por el DHCP
-            guest_ips = r.hgetall('topology:guest_ips')
-            telemetry_device_ids = meter_device_ids_by_ip()
             
             # Extraer mapeo de puertos de este switch
             switch_ports_map = r.hgetall(f"switch_ports:{dpid}")
@@ -248,11 +265,18 @@ def get_topology():
             "blocked_edges": blocked_edges,
             "maestro_dpid": maestro_dpid
         })
+    except redis.RedisError as e:
+        if getattr(g, 'topology_redis_retry', False):
+            return jsonify({"error": str(e)}), 500
+        g.topology_redis_retry = True
+        refresh_redis()
+        return get_topology()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/trace/<src_guest>/<dst_guest>')
 def trace_path(src_guest, dst_guest):
+    refresh_redis()
     try:
         # Encontrar los switches origen y destino
         switches = active_switches()
@@ -315,6 +339,12 @@ def trace_path(src_guest, dst_guest):
 
         return jsonify({"path": path})
 
+    except redis.RedisError as e:
+        if getattr(g, 'trace_redis_retry', False):
+            return jsonify({"error": str(e)}), 500
+        g.trace_redis_retry = True
+        refresh_redis()
+        return trace_path(src_guest, dst_guest)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

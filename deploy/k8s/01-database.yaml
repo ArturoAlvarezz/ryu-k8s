@@ -70,8 +70,8 @@ spec:
             
             echo "bind 0.0.0.0" > /data/sentinel.conf
             echo "sentinel monitor mymaster redis-0.redis-headless.sdn-controller.svc.cluster.local 6379 2" >> /data/sentinel.conf
-            echo "sentinel down-after-milliseconds mymaster 2000" >> /data/sentinel.conf
-            echo "sentinel failover-timeout mymaster 5000" >> /data/sentinel.conf
+            echo "sentinel down-after-milliseconds mymaster 10000" >> /data/sentinel.conf
+            echo "sentinel failover-timeout mymaster 30000" >> /data/sentinel.conf
             echo "sentinel parallel-syncs mymaster 1" >> /data/sentinel.conf
             echo "sentinel resolve-hostnames yes" >> /data/sentinel.conf
             echo "sentinel announce-hostnames yes" >> /data/sentinel.conf

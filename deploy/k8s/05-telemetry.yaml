@@ -54,6 +54,12 @@ spec:
           value: "redis-sentinel.sdn-controller.svc.cluster.local"
         - name: REDIS_SENTINEL_PORT
           value: "26379"
+        - name: REDIS_SOCKET_TIMEOUT
+          value: "1.0"
+        - name: REDIS_RECONNECT_INTERVAL
+          value: "10.0"
+        - name: REDIS_RECONNECT_ATTEMPTS
+          value: "2"
         - name: UDP_PORT
           value: "5555"
         - name: FLASK_PORT
@@ -71,6 +77,13 @@ spec:
           value: "60"
         - name: NONCE_TTL_SECONDS
           value: "300"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
         volumeMounts:
         - name: code-volume
           mountPath: /app/app.py
