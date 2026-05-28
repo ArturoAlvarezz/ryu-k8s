@@ -223,7 +223,8 @@ def sync_security_identity(device_id: str, source_ip: str):
         pipe = redis.pipeline()
         pipe.set(f"security:device:{device_id}", json.dumps(device, sort_keys=True))
         pipe.sadd("security:devices", device_id)
-        pipe.srem("security:devices", old_id)
+        if old_id != device_id:
+            pipe.srem("security:devices", old_id)
         pipe.set(f"security:ip_to_device:{source_ip}", device_id)
         if old_ip and old_ip != source_ip:
             pipe.delete(f"security:ip_to_device:{old_ip}")

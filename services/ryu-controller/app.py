@@ -536,29 +536,16 @@ class DistributedL2Switch(app_manager.RyuApp):
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
             raw_dpid = self._decimal_dpid_to_raw(dpid)
             gateway_mac = ":".join(raw_dpid[-12:][i:i + 2] for i in range(0, 12, 2))
-            reply = packet.Packet()
-            reply.add_protocol(ethernet.ethernet(
-                ethertype=ether_types.ETH_TYPE_ARP,
-                dst=src,
-                src=gateway_mac,
-            ))
-            reply.add_protocol(arp.arp(
-                opcode=arp.ARP_REPLY,
-                src_mac=gateway_mac,
-                src_ip="10.0.0.1",
-                dst_mac=src,
-                dst_ip=arp_pkt.src_ip,
-            ))
-            reply.serialize()
-            out = parser.OFPPacketOut(
-                datapath=datapath,
-                buffer_id=ofproto.OFP_NO_BUFFER,
-                in_port=ofproto.OFPP_CONTROLLER,
-                actions=[parser.OFPActionOutput(in_port)],
-                data=reply.data,
-            )
-            datapath.send_msg(out)
+            self._send_arp_reply(datapath, in_port, src, arp_pkt.src_ip,
+                                 gateway_mac, "10.0.0.1")
             return
+
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
+            guest_mac = self._guest_mac_for_ip(arp_pkt.dst_ip)
+            if guest_mac and guest_mac.lower() != src.lower():
+                self._send_arp_reply(datapath, in_port, src, arp_pkt.src_ip,
+                                     guest_mac, arp_pkt.dst_ip)
+                return
 
         if ip_pkt and ip_pkt.dst == "10.0.0.1":
             out_port = ofproto.OFPP_LOCAL
@@ -567,24 +554,29 @@ class DistributedL2Switch(app_manager.RyuApp):
             out_port = int(out_port_str)
             actions = [parser.OFPActionOutput(out_port)]
         else:
-            out_port = ofproto.OFPP_FLOOD
-            actions = []
-            for port_no, port_name in ports.items():
-                try:
-                    port_no_int = int(port_no)
-                except Exception:
-                    continue
-                if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
-                    continue
-                port_name = str(port_name)
-                if in_port_name.startswith("vx") and port_name.startswith("vx"):
-                    continue
-                actions.append(parser.OFPActionOutput(port_no_int))
+            guest_out_port = self._resolve_guest_out_port(dpid, dst)
+            if guest_out_port:
+                out_port = guest_out_port
+                actions = [parser.OFPActionOutput(out_port)]
+            else:
+                out_port = ofproto.OFPP_FLOOD
+                actions = []
+                for port_no, port_name in ports.items():
+                    try:
+                        port_no_int = int(port_no)
+                    except Exception:
+                        continue
+                    if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
+                        continue
+                    port_name = str(port_name)
+                    if in_port_name.startswith("vx") and port_name.startswith("vx"):
+                        continue
+                    actions.append(parser.OFPActionOutput(port_no_int))
 
-            # Inyectar una copia del trafico broadcast al stack Linux local
-            # para que servicios hostNetwork como DHCP puedan leerlo.
-            if in_port != ofproto.OFPP_LOCAL:
-                actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
+                # Inyectar una copia del trafico broadcast al stack Linux local
+                # para que servicios hostNetwork como DHCP puedan leerlo.
+                if in_port != ofproto.OFPP_LOCAL:
+                    actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
 
         # Install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
@@ -724,6 +716,100 @@ class DistributedL2Switch(app_manager.RyuApp):
         if not dpids:
             dpids.update(str(dpid) for dpid in self.redis.smembers("topology:switches") or set())
         return dpids
+
+    def _guest_mac_for_ip(self, ip_addr):
+        try:
+            guest_ips = self.redis.hgetall("topology:guest_ips") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while resolving guest IP %s: %s", ip_addr, e)
+            return None
+        for mac, guest_ip in guest_ips.items():
+            if guest_ip == ip_addr:
+                return mac
+        return None
+
+    def _send_arp_reply(self, datapath, in_port, dst_mac, dst_ip, src_mac, src_ip):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        reply = packet.Packet()
+        reply.add_protocol(ethernet.ethernet(
+            ethertype=ether_types.ETH_TYPE_ARP,
+            dst=dst_mac,
+            src=src_mac,
+        ))
+        reply.add_protocol(arp.arp(
+            opcode=arp.ARP_REPLY,
+            src_mac=src_mac,
+            src_ip=src_ip,
+            dst_mac=dst_mac,
+            dst_ip=dst_ip,
+        ))
+        reply.serialize()
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=ofproto.OFPP_CONTROLLER,
+            actions=[parser.OFPActionOutput(in_port)],
+            data=reply.data,
+        )
+        datapath.send_msg(out)
+
+    def _resolve_guest_out_port(self, current_dpid, dst_mac):
+        try:
+            guest_locations = self.redis.hgetall("topology:guest_locations") or {}
+            node_ips = self.redis.hgetall("topology:node_ips") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while resolving guest path to %s: %s", dst_mac, e)
+            return None
+
+        location = guest_locations.get(dst_mac)
+        if not location or ":" not in location:
+            return None
+        dst_dpid, dst_port = location.split(":", 1)
+        current_dpid = str(current_dpid)
+        if current_dpid == str(dst_dpid):
+            return int(dst_port)
+
+        dpids = self._get_topology_switch_dpids(node_ips)
+        dpids.update([current_dpid, str(dst_dpid)])
+        ip_to_dpid = {
+            str(ip).replace(".", ""): self._raw_dpid_to_decimal(raw_dpid)
+            for raw_dpid, ip in node_ips.items()
+        }
+        blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
+
+        switch_ports = {}
+        adjacency = {str(dpid): [] for dpid in dpids}
+        for dpid in dpids:
+            try:
+                ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while reading ports for path %s: %s", dpid, e)
+                ports = {}
+            switch_ports[str(dpid)] = ports
+            for port_no, port_name in ports.items():
+                port_name = str(port_name)
+                if not port_name.startswith("vx"):
+                    continue
+                next_dpid = ip_to_dpid.get(port_name[2:])
+                if not next_dpid or str(next_dpid) not in dpids:
+                    continue
+                if _edge_link_id(dpid, next_dpid) in blocked_br0_links:
+                    continue
+                adjacency.setdefault(str(dpid), []).append((str(next_dpid), int(port_no)))
+
+        queue = [(current_dpid, [])]
+        visited = {current_dpid}
+        while queue:
+            dpid, path_ports = queue.pop(0)
+            if dpid == str(dst_dpid):
+                return path_ports[0] if path_ports else int(dst_port)
+            for next_dpid, out_port in adjacency.get(dpid, []):
+                if next_dpid in visited:
+                    continue
+                visited.add(next_dpid)
+                queue.append((next_dpid, path_ports + [out_port]))
+        return None
 
     def _get_blocked_br0_links(self, ip_to_dpid, dpids):
         br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}

@@ -137,7 +137,6 @@ spec:
             # Keep local gateway/collector traffic available even while Ryu is
             # reconverging or busy processing Packet-In bursts.
             ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_tpa=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
-            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_spa=10.0.0.1,actions=FLOOD" > /dev/null 2>&1 || true
             ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,ip,nw_dst=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
           }
           refresh_table_miss

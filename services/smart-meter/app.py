@@ -13,6 +13,9 @@ Variables de entorno:
   REPORT_INTERVAL  Segundos entre reportes (default: 5)
   HMAC_ENABLED     Firma telemetría con HMAC-SHA256 (default: true)
   HMAC_SECRET      Secreto compartido del medidor
+  PEER_IPS         Lista opcional de smart meters pares, separada por coma
+  PEER_API_PORT    Puerto HTTP de diagnóstico (default: 8080)
+  PEER_ECHO_PORT   Puerto UDP echo para pruebas entre medidores (default: 5560)
 """
 
 from __future__ import annotations
@@ -29,6 +32,11 @@ import logging
 import hmac
 import hashlib
 import secrets
+import threading
+import subprocess
+import statistics
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -46,11 +54,233 @@ COLLECTOR_PORT  = int(os.environ.get("COLLECTOR_PORT", 5555))
 REPORT_INTERVAL = float(os.environ.get("REPORT_INTERVAL", 5))
 HMAC_ENABLED    = os.environ.get("HMAC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 HMAC_SECRET     = os.environ.get("HMAC_SECRET", "sdn-ami-hmac-lab-secret-v1")
+PEER_IPS        = [ip.strip() for ip in os.environ.get("PEER_IPS", "").split(",") if ip.strip()]
+PEER_API_PORT   = int(os.environ.get("PEER_API_PORT", 8080))
+PEER_ECHO_PORT  = int(os.environ.get("PEER_ECHO_PORT", 5560))
 
 # Parámetros eléctricos base para la simulación (distribución trifásica)
 VOLTAGE_BASE    = 220.0   # Voltios RMS
 CURRENT_BASE    = 15.0    # Amperios base
 POWER_FACTOR    = 0.92    # Factor de potencia típico
+RECENT_TESTS: list[dict] = []
+RECENT_TESTS_LOCK = threading.Lock()
+
+
+def remember_test(result: dict) -> None:
+    """Guarda los últimos resultados para inspección vía API."""
+    with RECENT_TESTS_LOCK:
+        RECENT_TESTS.append(result)
+        del RECENT_TESTS[:-20]
+
+
+def summarize_rtts(rtts_ms: list[float]) -> dict:
+    if not rtts_ms:
+        return {
+            "min_ms": None,
+            "avg_ms": None,
+            "max_ms": None,
+            "stddev_ms": None,
+            "jitter_ms": None,
+        }
+
+    deltas = [abs(rtts_ms[i] - rtts_ms[i - 1]) for i in range(1, len(rtts_ms))]
+    return {
+        "min_ms": round(min(rtts_ms), 3),
+        "avg_ms": round(statistics.mean(rtts_ms), 3),
+        "max_ms": round(max(rtts_ms), 3),
+        "stddev_ms": round(statistics.pstdev(rtts_ms), 3) if len(rtts_ms) > 1 else 0.0,
+        "jitter_ms": round(statistics.mean(deltas), 3) if deltas else 0.0,
+    }
+
+
+def run_icmp_ping(target: str, count: int = 5, timeout: int = 2) -> dict:
+    """Ejecuta ping ICMP y retorna métricas estructuradas."""
+    count = max(1, min(count, 100))
+    timeout = max(1, min(timeout, 10))
+    started = time.time()
+    cmd = ["ping", "-c", str(count), "-W", str(timeout), target]
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=(count * timeout) + 5)
+
+    rtts_ms: list[float] = []
+    transmitted = count
+    received = 0
+    loss_percent = 100.0
+
+    for line in proc.stdout.splitlines():
+        if " bytes from " in line and "time=" in line:
+            try:
+                rtts_ms.append(float(line.rsplit("time=", 1)[1].split()[0]))
+            except (IndexError, ValueError):
+                pass
+        elif "packets transmitted" in line:
+            parts = [part.strip() for part in line.split(",")]
+            try:
+                transmitted = int(parts[0].split()[0])
+                received = int(parts[1].split()[0])
+                loss_percent = float(parts[2].split("%", 1)[0])
+            except (IndexError, ValueError):
+                pass
+
+    if rtts_ms and received == 0:
+        received = len(rtts_ms)
+        loss_percent = round(((transmitted - received) / transmitted) * 100, 3)
+
+    result = {
+        "type": "icmp_ping",
+        "device_id": DEVICE_ID,
+        "source_ip": get_local_ip(),
+        "target": target,
+        "timestamp": int(started),
+        "duration_ms": round((time.time() - started) * 1000, 3),
+        "transmitted": transmitted,
+        "received": received,
+        "loss_percent": loss_percent,
+        "rtt_ms": summarize_rtts(rtts_ms),
+        "returncode": proc.returncode,
+        "error": proc.stderr.strip() or None,
+    }
+    remember_test(result)
+    return result
+
+
+def start_udp_echo_server() -> None:
+    """Servidor UDP simple para medir tráfico de aplicación entre medidores."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", PEER_ECHO_PORT))
+    log.info("UDP echo entre smart meters escuchando en 0.0.0.0:%d", PEER_ECHO_PORT)
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(65535)
+            sock.sendto(data, addr)
+        except Exception as exc:
+            log.warning("Error en UDP echo: %s", exc)
+
+
+def run_udp_probe(target: str, count: int = 10, interval: float = 0.2, size: int = 64,
+                  timeout: float = 1.0, port: int | None = None) -> dict:
+    """Envía paquetes UDP al echo peer y calcula RTT/loss/jitter."""
+    count = max(1, min(count, 500))
+    interval = max(0.01, min(interval, 10.0))
+    size = max(16, min(size, 1400))
+    timeout = max(0.1, min(timeout, 10.0))
+    port = port or PEER_ECHO_PORT
+    started = time.time()
+    rtts_ms: list[float] = []
+    received = 0
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        for seq in range(1, count + 1):
+            nonce = secrets.token_hex(8)
+            payload = json.dumps({
+                "device_id": DEVICE_ID,
+                "seq": seq,
+                "nonce": nonce,
+                "timestamp_ns": time.time_ns(),
+                "pad": "x" * max(0, size - 96),
+            }, separators=(",", ":")).encode("utf-8")
+
+            sent_at = time.monotonic_ns()
+            sock.sendto(payload, (target, port))
+            try:
+                data, _ = sock.recvfrom(65535)
+                elapsed_ms = (time.monotonic_ns() - sent_at) / 1_000_000
+                if data == payload:
+                    received += 1
+                    rtts_ms.append(elapsed_ms)
+            except socket.timeout:
+                pass
+
+            if seq < count:
+                time.sleep(interval)
+    finally:
+        sock.close()
+
+    loss_percent = round(((count - received) / count) * 100, 3)
+    duration_s = max(time.time() - started, 0.001)
+    result = {
+        "type": "udp_probe",
+        "device_id": DEVICE_ID,
+        "source_ip": get_local_ip(),
+        "target": target,
+        "target_port": port,
+        "timestamp": int(started),
+        "duration_ms": round(duration_s * 1000, 3),
+        "packet_size_bytes": size,
+        "transmitted": count,
+        "received": received,
+        "loss_percent": loss_percent,
+        "rtt_ms": summarize_rtts(rtts_ms),
+        "throughput_kbps": round((received * size * 8) / duration_s / 1000, 3),
+    }
+    remember_test(result)
+    return result
+
+
+class DiagnosticsHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args) -> None:
+        log.info("api %s - %s", self.client_address[0], fmt % args)
+
+    def send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+
+        if parsed.path in ("/", "/api/status"):
+            with RECENT_TESTS_LOCK:
+                recent = list(RECENT_TESTS)
+            self.send_json(200, {
+                "device_id": DEVICE_ID,
+                "local_ip": get_local_ip(),
+                "collector": {"ip": COLLECTOR_IP, "port": COLLECTOR_PORT},
+                "peer_api_port": PEER_API_PORT,
+                "peer_echo_port": PEER_ECHO_PORT,
+                "configured_peers": PEER_IPS,
+                "recent_tests": recent,
+            })
+            return
+
+        if parsed.path == "/api/ping":
+            target = query.get("target", [""])[0].strip()
+            if not target:
+                self.send_json(400, {"error": "missing target query parameter"})
+                return
+            count = int(query.get("count", ["5"])[0])
+            timeout = int(query.get("timeout", ["2"])[0])
+            self.send_json(200, run_icmp_ping(target, count=count, timeout=timeout))
+            return
+
+        if parsed.path == "/api/udp-probe":
+            target = query.get("target", [""])[0].strip()
+            if not target:
+                self.send_json(400, {"error": "missing target query parameter"})
+                return
+            count = int(query.get("count", ["10"])[0])
+            interval = float(query.get("interval", ["0.2"])[0])
+            size = int(query.get("size", ["64"])[0])
+            timeout = float(query.get("timeout", ["1.0"])[0])
+            port = int(query.get("port", [str(PEER_ECHO_PORT)])[0])
+            self.send_json(200, run_udp_probe(target, count=count, interval=interval,
+                                              size=size, timeout=timeout, port=port))
+            return
+
+        self.send_json(404, {"error": "not found"})
+
+
+def start_diagnostics_api() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", PEER_API_PORT), DiagnosticsHandler)
+    log.info("API diagnóstico smart meter escuchando en 0.0.0.0:%d", PEER_API_PORT)
+    server.serve_forever()
 
 
 def canonical_json(payload: dict) -> bytes:
@@ -188,6 +418,9 @@ def main():
     log.info("  collector      : %s:%d", COLLECTOR_IP, COLLECTOR_PORT)
     log.info("  interval       : %.1fs", REPORT_INTERVAL)
     log.info("  hmac_enabled   : %s", HMAC_ENABLED)
+    log.info("  peer_api       : 0.0.0.0:%d", PEER_API_PORT)
+    log.info("  peer_udp_echo  : 0.0.0.0:%d", PEER_ECHO_PORT)
+    log.info("  peer_ips       : %s", ",".join(PEER_IPS) or "none")
     log.info("=" * 60)
 
     if HMAC_ENABLED and not HMAC_SECRET:
@@ -204,6 +437,9 @@ def main():
         except TimeoutError as e:
             log.error("%s Reintentando en 10s sin cerrar el medidor.", e)
             time.sleep(10)
+
+    threading.Thread(target=start_udp_echo_server, daemon=True).start()
+    threading.Thread(target=start_diagnostics_api, daemon=True).start()
 
     is_broadcast = (COLLECTOR_IP == "255.255.255.255")
     sock = create_udp_socket(broadcast=is_broadcast)

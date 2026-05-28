@@ -435,7 +435,7 @@ Cableado válido mínimo para un worker con un solo enlace:
 | `SDN-Worker-2:e0` (`ens3`) | `Master2:e1` (`ens4`) |
 | `SDN-Worker-3:e0` (`ens3`) | `Master3:e1` (`ens4`) |
 
-Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master:e1`, `Master2:e1` y `Master3:e1`, y crea un perfil `gns3-br0-tree` específico para ese clon antes de unirlo. No uses el switch de gestión como punto de conexión de workers.
+Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master:e1`, `Master2:e1` y `Master3:e1`. Por defecto todos los puertos STP usan el mismo coste para que Linux bridge elija el camino más corto real hacia `Mgmt-STP-Switch`; usa `PREFERRED_STP_PORTS` solo si necesitas forzar un árbol específico para un clon. No uses el switch de gestión como punto de conexión de workers.
 
 Cada worker usa una IP persistente en `br0`, genera hostname `worker-<mac>`, instala `k3s-agent` y se une al cluster usando `https://192.168.122.10:6443`.
 

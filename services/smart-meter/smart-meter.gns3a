@@ -2,7 +2,7 @@
     "appliance_id": "a3f1e2d4-7b8c-4e9f-a012-3456789abcde",
     "name": "SDN Smart Meter",
     "category": "guest",
-    "description": "Simulador de Medidor Eléctrico Inteligente (Smart Meter) para redes SDN.\n\nEste appliance simula un dispositivo IoT de medición eléctrica que:\n- Obtiene IP automáticamente via DHCP (cliente udhcpc integrado en Alpine/BusyBox)\n- Publica telemetría sintética (voltaje, corriente, potencia, energía) vía UDP\n- Firma cada lectura con HMAC-SHA256 para autenticación e integridad\n- Se registra en la topología SDN al obtener su dirección IP\n\nTelemetría publicada por defecto hacia el gateway/colector SDN 10.0.0.1 UDP:5555\n\nVariables de entorno configurables en las propiedades del nodo:\n  DEVICE_ID       : Identificador del medidor (default: hostname del contenedor)\n  COLLECTOR_IP    : IP del colector (default: 10.0.0.1)\n  COLLECTOR_PORT  : Puerto UDP destino (default: 5555)\n  REPORT_INTERVAL : Segundos entre reportes (default: 5)\n  HMAC_ENABLED    : Habilita firma HMAC (default: true)\n  HMAC_SECRET     : Secreto compartido del medidor",
+    "description": "Simulador de Medidor Eléctrico Inteligente (Smart Meter) para redes SDN.\n\nEste appliance simula un dispositivo IoT de medición eléctrica que:\n- Obtiene IP automáticamente via DHCP (cliente udhcpc integrado en Alpine/BusyBox)\n- Publica telemetría sintética (voltaje, corriente, potencia, energía) vía UDP en segundo plano\n- Firma cada lectura con HMAC-SHA256 para autenticación e integridad\n- Se registra en la topología SDN al obtener su dirección IP\n- Incluye el ejecutable meter-test para probar conectividad desde la consola\n- Escucha UDP echo para medir RTT/loss/jitter de tráfico de aplicación\n\nTelemetría publicada por defecto hacia el gateway/colector SDN 10.0.0.1 UDP:5555.\nLa consola queda libre para pruebas locales con meter-test; logs en /var/log/smart-meter.log.\n\nVariables de entorno configurables en las propiedades del nodo:\n  DEVICE_ID       : Identificador del medidor (default: hostname del contenedor)\n  COLLECTOR_IP    : IP del colector (default: 10.0.0.1)\n  COLLECTOR_PORT  : Puerto UDP destino (default: 5555)\n  REPORT_INTERVAL : Segundos entre reportes (default: 5)\n  HMAC_ENABLED    : Habilita firma HMAC (default: true)\n  HMAC_SECRET     : Secreto compartido del medidor\n  PEER_IPS        : IPs de otros medidores separadas por coma\n  PEER_API_PORT   : Puerto HTTP de diagnóstico (default: 8080)\n  PEER_ECHO_PORT  : Puerto UDP echo entre medidores (default: 5560)",
     "vendor_name": "SDN Lab",
     "vendor_url": "https://github.com/ArturoAlvarezz/ryu-k8s",
     "documentation_url": "https://github.com/ArturoAlvarezz/ryu-k8s",
@@ -12,13 +12,13 @@
     "availability": "free",
     "maintainer": "arturoalvarez",
     "maintainer_email": "arturoalvarez@example.com",
-    "usage": "1. Conectar eth0 al switch OVS de la topologia SDN.\n2. Al iniciar, el contenedor solicita IP automaticamente al Servidor DHCP SDN via udhcpc.\n3. Configurar HMAC_SECRET con el mismo secreto esperado por el collector.\n4. La telemetria UDP firmada comienza a publicarse cada 5 segundos hacia 10.0.0.1:5555.\n5. Para personalizar, editar las variables de entorno en las propiedades del nodo GNS3:\n   - COLLECTOR_IP: IP del colector (default 10.0.0.1)\n   - DEVICE_ID: nombre identificador del medidor\n   - HMAC_SECRET: secreto compartido del medidor",
+    "usage": "1. Conectar eth0 al switch OVS de la topologia SDN.\n2. Al iniciar, el contenedor solicita IP automaticamente al Servidor DHCP SDN via udhcpc.\n3. La telemetria UDP firmada se ejecuta en segundo plano y publica cada 5 segundos hacia 10.0.0.1:5555.\n4. Abrir la consola del nodo Smart Meter en GNS3 y ejecutar pruebas:\n   - meter-test status\n   - meter-test ping 10.0.0.12 --count 20\n   - meter-test udp 10.0.0.12 --count 50 --interval 0.1 --size 128\n   - meter-test matrix 10.0.0.12 10.0.0.13 --mode both\n5. Para ver la telemetria en vivo:\n   - tail -f /var/log/smart-meter.log\n6. Para personalizar, editar las variables de entorno en las propiedades del nodo GNS3:\n   - COLLECTOR_IP: IP del colector (default 10.0.0.1)\n   - DEVICE_ID: nombre identificador del medidor\n   - HMAC_SECRET: secreto compartido del medidor\n   - PEER_IPS: IPs de pares separadas por coma",
     "symbol": ":/symbols/docker_guest.svg",
     "docker": {
         "adapters": 1,
         "image": "arturoalvarez/sdn-smart-meter:latest",
         "start_command": "",
-        "environment": "COLLECTOR_IP=10.0.0.1\nCOLLECTOR_PORT=5555\nREPORT_INTERVAL=5\nDEVICE_ID=\nHMAC_ENABLED=true\nHMAC_SECRET=sdn-ami-hmac-lab-secret-v1",
+        "environment": "COLLECTOR_IP=10.0.0.1\nCOLLECTOR_PORT=5555\nREPORT_INTERVAL=5\nDEVICE_ID=\nHMAC_ENABLED=true\nHMAC_SECRET=sdn-ami-hmac-lab-secret-v1\nPEER_IPS=\nPEER_API_PORT=8080\nPEER_ECHO_PORT=5560",
         "console_type": "telnet"
     }
 }

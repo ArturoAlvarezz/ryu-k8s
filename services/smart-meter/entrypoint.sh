@@ -4,7 +4,8 @@
 # =============================================================================
 # 1. Levanta la interfaz eth0
 # 2. Solicita IP vía DHCP (udhcpc es parte de BusyBox/Alpine)
-# 3. Lanza el servicio Python del medidor
+# 3. Lanza el servicio Python del medidor en segundo plano
+# 4. Deja una shell interactiva para ejecutar pruebas de red
 # =============================================================================
 
 set -e
@@ -49,7 +50,36 @@ echo "[net] Configuración de red actual:"
 ip addr show eth0 2>/dev/null || ip addr show
 
 # ---------------------------------------------------------------------------
-# 4. Lanzar el medidor
+# 4. Lanzar el medidor en segundo plano.
+#    Se usa setsid para que Ctrl+C en la consola no mate el proceso de
+#    telemetria mientras se ejecutan comandos como meter-test.
 # ---------------------------------------------------------------------------
-echo "[start] Iniciando SDN Smart Meter..."
-exec python /app/app.py
+LOG_FILE="${SMART_METER_LOG:-/var/log/smart-meter.log}"
+echo "[start] Iniciando SDN Smart Meter en segundo plano..."
+echo "[start] Logs: ${LOG_FILE}"
+touch "$LOG_FILE"
+setsid python /app/app.py >>"$LOG_FILE" 2>&1 &
+METER_PID="$!"
+
+cleanup() {
+    echo "[stop] Deteniendo SDN Smart Meter..."
+    kill "$METER_PID" 2>/dev/null || true
+    wait "$METER_PID" 2>/dev/null || true
+}
+
+trap cleanup INT TERM
+
+echo "============================================================"
+echo " Consola lista. Comandos utiles:"
+echo "   meter-test status"
+echo "   meter-test ping <ip-destino> --count 20"
+echo "   meter-test udp <ip-destino> --count 50 --interval 0.1 --size 128"
+echo "   tail -f ${LOG_FILE}"
+echo "============================================================"
+
+if [ -t 0 ]; then
+    /bin/sh
+    cleanup
+else
+    wait "$METER_PID"
+fi

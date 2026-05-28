@@ -10,7 +10,9 @@ STP_PORTS=${STP_PORTS:-$ALL_PORTS}
 PREFERRED_STP_PORTS=${PREFERRED_STP_PORTS:-$STP_PORTS}
 BR_PRIORITY=${BR_PRIORITY:-32768}
 STP_LOW_COST=${STP_LOW_COST:-10}
-STP_HIGH_COST=${STP_HIGH_COST:-200}
+STP_HIGH_COST=${STP_HIGH_COST:-$STP_LOW_COST}
+STP_EXPECTED_ROOT_PREFIX=${STP_EXPECTED_ROOT_PREFIX:-0000.}
+STP_STABLE_SECONDS=${STP_STABLE_SECONDS:-20}
 NODE_PREFIX=${NODE_PREFIX:-24}
 NODE_GATEWAY=${NODE_GATEWAY:-192.168.122.1}
 NODE_DNS=${NODE_DNS:-$NODE_GATEWAY}
@@ -60,7 +62,7 @@ NODE_GATEWAY=$NODE_GATEWAY
 NODE_DNS=$NODE_DNS
 ALL_PORTS="$ALL_PORTS"
 STP_PORTS="$STP_PORTS"
-PREFERRED_STP_PORTS="${BOOTSTRAP_PREFERRED_STP_PORTS:-ens3}"
+PREFERRED_STP_PORTS="${BOOTSTRAP_PREFERRED_STP_PORTS:-$STP_PORTS}"
 EOF
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
   echo "configure-br0-tree: bootstrapped $CONFIG_FILE with NODE_IP=$bootstrap_ip"
@@ -74,7 +76,9 @@ STP_PORTS=${STP_PORTS:-$ALL_PORTS}
 PREFERRED_STP_PORTS=${PREFERRED_STP_PORTS:-$STP_PORTS}
 BR_PRIORITY=${BR_PRIORITY:-32768}
 STP_LOW_COST=${STP_LOW_COST:-10}
-STP_HIGH_COST=${STP_HIGH_COST:-200}
+STP_HIGH_COST=${STP_HIGH_COST:-$STP_LOW_COST}
+STP_EXPECTED_ROOT_PREFIX=${STP_EXPECTED_ROOT_PREFIX:-0000.}
+STP_STABLE_SECONDS=${STP_STABLE_SECONDS:-20}
 NODE_PREFIX=${NODE_PREFIX:-24}
 NODE_GATEWAY=${NODE_GATEWAY:-192.168.122.1}
 NODE_DNS=${NODE_DNS:-$NODE_GATEWAY}
@@ -134,9 +138,20 @@ is_preferred_stp_port() {
 }
 
 wait_for_stp() {
-  for _ in $(seq 1 45); do
+  stable=0
+  for _ in $(seq 1 120); do
     pending=0
     forwarding=0
+    root_ok=1
+
+    if [ -n "$STP_EXPECTED_ROOT_PREFIX" ]; then
+      root_id=$(cat /sys/class/net/br0/bridge/root_id 2>/dev/null || echo "")
+      case "$root_id" in
+        "$STP_EXPECTED_ROOT_PREFIX"*) ;;
+        *) root_ok=0 ;;
+      esac
+    fi
+
     for iface in $STP_PORTS; do
       [ -e "/sys/class/net/br0/brif/$iface/state" ] || continue
       state=$(cat "/sys/class/net/br0/brif/$iface/state" 2>/dev/null || echo 0)
@@ -145,7 +160,12 @@ wait_for_stp() {
         3) forwarding=1 ;;
       esac
     done
-    [ "$pending" = "0" ] && [ "$forwarding" = "1" ] && return 0
+    if [ "$pending" = "0" ] && [ "$forwarding" = "1" ] && [ "$root_ok" = "1" ]; then
+      stable=$((stable + 1))
+      [ "$stable" -ge "$STP_STABLE_SECONDS" ] && return 0
+    else
+      stable=0
+    fi
     sleep 1
   done
   return 1

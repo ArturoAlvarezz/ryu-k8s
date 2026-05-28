@@ -21,17 +21,24 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py /app/
+COPY meter_test.py /app/
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /app/meter_test.py && \
+    ln -s /app/meter_test.py /usr/local/bin/meter-test
 
 # Variables de entorno por defecto
 ENV DEVICE_ID=""
 ENV COLLECTOR_IP="10.0.0.1"
 ENV COLLECTOR_PORT="5555"
 ENV REPORT_INTERVAL="5"
+ENV PEER_IPS=""
+ENV PEER_API_PORT="8080"
+ENV PEER_ECHO_PORT="5560"
 ENV PYTHONUNBUFFERED=1
 
-# Puerto de información (no escucha, solo documentación)
+# Puertos documentados: telemetría, API diagnóstico y UDP echo entre medidores.
 EXPOSE 5555/udp
+EXPOSE 5560/udp
+EXPOSE 8080/tcp
 
 ENTRYPOINT ["/entrypoint.sh"]
