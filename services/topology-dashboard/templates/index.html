@@ -2,8 +2,8 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>⚡ SDN Controller | Neon Topology Live</title>
-    <!-- Use Google Fonts -->
+    <title>Controlador SDN | Topologia en vivo</title>
+    <!-- Fuentes de Google -->
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
     <!-- Vis.js -->
     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
@@ -198,21 +198,21 @@
     <div id="sidebar">
         <header>
             <h1>Ryu K8s SDN</h1>
-            <div class="live-status">● LIVE TOPOLOGY SYNC</div>
+            <div class="live-status">● TOPOLOGIA EN VIVO</div>
         </header>
         
         <div id="switch-list">
-            <!-- Dynamic switch list populates here -->
+            <!-- La lista dinamica de switches se carga aqui -->
         </div>
 
         <div id="routing-tool">
-            <h3 style="font-size:1rem; color:var(--text-color);">Trace Route</h3>
+            <h3 style="font-size:1rem; color:var(--text-color);">Trazar ruta</h3>
             <div class="control-group">
-                <label for="srcGuest">Source Guest:</label>
+                <label for="srcGuest">Guest origen:</label>
                 <select id="srcGuest"></select>
             </div>
             <div class="control-group">
-                <label for="dstGuest">Dest Guest:</label>
+                <label for="dstGuest">Guest destino:</label>
                 <select id="dstGuest"></select>
             </div>
             <button onclick="tracePath()">ILUMINAR CAMINO</button>
@@ -230,7 +230,7 @@
         let nodesDataset;
         let currentData = null;
 
-        // Custom Vis.js icons based on groups
+            // Iconos Vis.js por grupo
         const maestroIcon = {
             shape: 'icon',
             icon: { face: "'Orbitron'", code: '\u2605', size: 60, color: '#00ffcc' },
@@ -287,7 +287,7 @@
                     // Reutilizar la función centralizada
                     updateNetwork(data);
                 })
-                .catch(err => console.error("Error fetching topology", err));
+                .catch(err => console.error("Error consultando topologia", err));
         }
 
         function buildSidebar(data) {
@@ -303,7 +303,7 @@
             srcSelect.innerHTML = '';
             dstSelect.innerHTML = '';
 
-            // Group guests by switch
+            // Agrupar guests por switch
             const switches = data.nodes.filter(n => n.group === 'worker' || n.group === 'maestro');
             
             switches.forEach(sw => {
@@ -321,7 +321,7 @@
                     const empty = document.createElement('div');
                     empty.className = 'guest-item';
                     empty.style.color = '#555';
-                    empty.innerText = 'No guests detected';
+                    empty.innerText = 'Sin guests detectados';
                     swBlock.appendChild(empty);
                 } else {
                     swGuests.forEach(g => {
@@ -330,7 +330,7 @@
                         gDiv.innerText = g.label.replace('\n', '  |  ');
                         swBlock.appendChild(gDiv);
                         
-                        // Add to dropdowns
+                        // Agregar a los selectores
                         const opt = new Option(`${g.id} (${sw.label.split('\n')[0]})`, g.id);
                         srcSelect.add(opt.cloneNode(true));
                         dstSelect.add(opt);
@@ -385,7 +385,7 @@
                 });
                 
                 if(existing.length === 0) {
-                    e.id = e.from + "-" + e.to; // force predictable IDs
+                    e.id = e.from + "-" + e.to; // IDs predecibles
                     edgesDataset.add(Object.assign(e, newProps));
                 } else {
                     edgesDataset.update({id: existing[0].id, ...newProps});
@@ -426,7 +426,7 @@
                         return;
                     }
                     
-                    const switchPath = data.path; // e.g: [dpid1, dpid2, dpid3]
+                    const switchPath = data.path; // ejemplo: [dpid1, dpid2, dpid3]
                     // El full path incluye a los guests en los extremos
                     const fullPath = [srcId, ...switchPath, dstId];
                     
@@ -437,11 +437,11 @@
                         if(edge) edgeIdsToHighlight.push(edge.id);
                     }
 
-                    // Apply Neon Highlight
+                    // Resaltar camino
                     const updates = edgeIdsToHighlight.map(id => {
                         return {
                             id: id,
-                            color: { color: '#facc15', highlight: '#facc15' }, // cyber-yellow
+                            color: { color: '#facc15', highlight: '#facc15' },
                             width: 5,
                             shadow: { enabled: true, color: '#facc15', size: 20 }
                         };
@@ -455,7 +455,7 @@
                 });
         }
 
-        // Auto-refresh topology structurally every 10 seconds silently
+        // Refrescar topologia cada 10 segundos sin interrumpir
         setInterval(() => {
             fetch('/api/topology')
                 .then(res => res.json())
@@ -464,7 +464,7 @@
                 });
         }, 10000);
 
-        // Start
+        // Inicio
         window.onload = initNetwork;
     </script>
 </body>

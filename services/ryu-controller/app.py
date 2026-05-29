@@ -1,7 +1,7 @@
 import os
 import eventlet
 import redis
-from datetime import datetime
+from datetime import datetime, timezone
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
@@ -21,6 +21,7 @@ from ryu.lib.packet import ether_types
 from ryu.topology import event, switches
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
+ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS", 30))
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
 MGMT_SWITCH_ID = "mgmt-stp-switch"
 
@@ -828,11 +829,48 @@ class DistributedL2Switch(app_manager.RyuApp):
         return blocked_links
 
     def _is_recent_guest(self, mac, dpid):
-        return (
-            self.redis.exists(f"active_mac:{dpid}:{mac}") or
-            self.redis.exists(f"health:{mac}") or
-            mac in (self.redis.hgetall("topology:guest_ips") or {})
-        )
+        try:
+            raw_dpid = self._decimal_dpid_to_raw(dpid)
+            if not self.redis.exists(f"switch:alive:{raw_dpid}"):
+                return False
+            ip = (self.redis.hget("topology:guest_ips", mac) or "").strip()
+            is_smart_meter = False
+            if ip:
+                device_id = self.redis.get(f"security:mac_to_device:{mac}")
+                if device_id:
+                    import json
+                    raw = self.redis.get(f"security:device:{device_id}")
+                    if raw:
+                        device = json.loads(raw)
+                        if device.get("role") == "smart_meter":
+                            is_smart_meter = True
+                if not is_smart_meter:
+                    for key in self.redis.scan_iter("meter:latest:*"):
+                        if (self.redis.hget(key, "source_ip") or "").strip() == ip:
+                            is_smart_meter = True
+                            break
+            if is_smart_meter:
+                if ip:
+                    for key in self.redis.scan_iter("meter:latest:*"):
+                        if (self.redis.hget(key, "source_ip") or "").strip() != ip:
+                            continue
+                        timestamp = self.redis.hget(key, "timestamp")
+                        try:
+                            seen = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                            if seen.tzinfo is None:
+                                seen = seen.replace(tzinfo=timezone.utc)
+                            if (datetime.now(timezone.utc) - seen).total_seconds() <= ACTIVE_METER_MAX_AGE_SECONDS:
+                                return True
+                        except Exception:
+                            continue
+                return False
+            if self.redis.exists(f"active_mac:{dpid}:{mac}"):
+                return True
+            if self.redis.exists(f"health:{mac}"):
+                return True
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking guest freshness %s: %s", mac, e)
+        return False
 
     def _add_guest_node_edge(self, guests, edges, mac, dpid, port_no, guest_ips):
         ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
@@ -941,6 +979,8 @@ class DistributedL2Switch(app_manager.RyuApp):
                 )
                 if not is_local_guest_port and not is_non_tunnel_port:
                     continue
+                if not self._is_recent_guest(mac, dpid):
+                    continue
                 self._add_guest_node_edge(guests, edges, mac, dpid, port_no, guest_ips)
 
         worker_macs = self._known_worker_macs()
@@ -951,6 +991,8 @@ class DistributedL2Switch(app_manager.RyuApp):
                 continue
             location_dpid, _, port_no = str(location).partition(":")
             if not location_dpid or not port_no or location_dpid not in dpids:
+                continue
+            if not self._is_recent_guest(mac, location_dpid):
                 continue
             self._add_guest_node_edge(guests, edges, mac, location_dpid, port_no, guest_ips)
 
@@ -969,6 +1011,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             if not mac or mac in worker_macs or mac in guests:
                 continue
             if not dpid or not port_no or dpid not in dpids:
+                continue
+            if not self._is_recent_guest(mac, dpid):
                 continue
             status = device.get("status", "authorized")
             guests[mac] = {

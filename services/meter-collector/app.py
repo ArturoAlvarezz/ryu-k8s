@@ -63,6 +63,7 @@ HMAC_ENABLED          = os.environ.get("HMAC_ENABLED", "true").lower() in ("1", 
 HMAC_SECRET           = os.environ.get("HMAC_SECRET", "")
 MAX_TIME_SKEW_SECONDS = int(os.environ.get("MAX_TIME_SKEW_SECONDS", 60))
 NONCE_TTL_SECONDS     = int(os.environ.get("NONCE_TTL_SECONDS", 300))
+ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS", 30))
 
 try:
     HMAC_DEVICE_SECRETS = json.loads(os.environ.get("HMAC_DEVICE_SECRETS", "{}"))
@@ -194,6 +195,73 @@ def telemetry_source_allowed(source_ip: str) -> bool:
     return telemetry_source_authorization(source_ip)[0]
 
 
+def _observed_guest_for_ip(redis, source_ip: str) -> dict | None:
+    if not source_ip:
+        return None
+    guest_ips = redis.hgetall("topology:guest_ips")
+    for mac, ip in guest_ips.items():
+        if ip != source_ip:
+            continue
+        mac = registry.normalize_mac(mac)
+        location = redis.hget("topology:guest_locations", mac) or ""
+        dpid, _, in_port = str(location).partition(":")
+        return {"mac": mac, "ip": source_ip, "dpid": dpid, "in_port": in_port}
+    return None
+
+
+def _cleanup_recreated_meter(redis, device_id: str, current_mac: str, current_ip: str):
+    if not device_id or not current_mac:
+        return
+    for key in redis.scan_iter("meter:latest:*"):
+        if key == f"meter:latest:{device_id}":
+            continue
+        latest = redis.hgetall(key) or {}
+        if latest.get("device_id") == device_id:
+            redis.delete(key)
+
+    for mac, ip in redis.hgetall("topology:guest_ips").items():
+        mac = registry.normalize_mac(mac)
+        if mac == current_mac or ip == current_ip:
+            continue
+        health_key = f"health:{mac}"
+        health_matches = False
+        if redis.type(health_key) == "hash":
+            health = redis.hgetall(health_key) or {}
+            health_matches = health.get("device_id") == device_id or health.get("name") == device_id
+        if health_matches:
+            redis.hdel("topology:guest_ips", mac)
+            redis.hdel("topology:guest_locations", mac)
+            redis.hdel("topology:guest_names", mac)
+            redis.delete(health_key)
+
+
+def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
+    if not device_id.startswith("SDNSmartMeter-"):
+        return False
+    observed = _observed_guest_for_ip(redis, source_ip)
+    if not observed or not observed.get("mac"):
+        return False
+
+    existing = registry.get_device(redis, device_id)
+    if existing and existing.get("status") in ("blocked", "quarantined"):
+        return False
+
+    registry.save_device(redis, {
+        "device_id": device_id,
+        "mac": observed["mac"],
+        "ip": source_ip,
+        "role": "smart_meter",
+        "allowed_dst_ip": "10.0.0.1",
+        "allowed_udp_port": UDP_PORT,
+        "status": "authorized",
+        "dpid": observed.get("dpid", ""),
+        "in_port": observed.get("in_port", ""),
+    })
+    _cleanup_recreated_meter(redis, device_id, observed["mac"], source_ip)
+    log.info("Smart Meter recreado adoptado automaticamente device=%s source=%s mac=%s", device_id, source_ip, observed["mac"])
+    return True
+
+
 def sync_security_identity(device_id: str, source_ip: str):
     if not device_id or not source_ip:
         return
@@ -211,15 +279,31 @@ def sync_security_identity(device_id: str, source_ip: str):
             raw = redis.get(f"security:device:{device_id}")
 
         if not raw:
+            _register_observed_meter(redis, device_id, source_ip)
             return
         device = json.loads(raw)
         if device.get("role") != "smart_meter":
             return
         old_id = device.get("device_id", current_id or device_id)
         old_ip = device.get("ip", "")
+        old_mac = registry.normalize_mac(device.get("mac", ""))
+        observed = _observed_guest_for_ip(redis, source_ip) or {}
+        observed_mac = registry.normalize_mac(observed.get("mac", ""))
         device["device_id"] = device_id
         device["ip"] = source_ip
+        if observed_mac:
+            device["mac"] = observed_mac
+            device["dpid"] = observed.get("dpid", device.get("dpid", ""))
+            device["in_port"] = observed.get("in_port", device.get("in_port", ""))
         mac = registry.normalize_mac(device.get("mac", ""))
+        if (
+            old_id == device_id
+            and old_ip == source_ip
+            and old_mac == mac
+            and (not observed.get("dpid") or str(device.get("dpid", "")) == str(observed.get("dpid", "")))
+            and (not observed.get("in_port") or str(device.get("in_port", "")) == str(observed.get("in_port", "")))
+        ):
+            return
         pipe = redis.pipeline()
         pipe.set(f"security:device:{device_id}", json.dumps(device, sort_keys=True))
         pipe.sadd("security:devices", device_id)
@@ -230,9 +314,12 @@ def sync_security_identity(device_id: str, source_ip: str):
             pipe.delete(f"security:ip_to_device:{old_ip}")
         if mac:
             pipe.set(f"security:mac_to_device:{mac}", device_id)
+        if old_mac and old_mac != mac:
+            pipe.delete(f"security:mac_to_device:{old_mac}")
         if old_id != device_id:
             pipe.delete(f"security:device:{old_id}")
         pipe.execute()
+        _cleanup_recreated_meter(redis, device_id, mac, source_ip)
         log.info("Registro AMI sincronizado source=%s old_device=%s device=%s", source_ip, old_id, device_id)
     except Exception as e:
         log.warning("No se pudo sincronizar identidad AMI source=%s device=%s: %s", source_ip, device_id, e)
@@ -399,6 +486,7 @@ def observed_guests(redis):
         device_id = (redis.hget(key, "device_id") or "").strip()
         if source_ip:
             meter_by_ip[source_ip] = device_id
+    live_meter_ips = set(meter_by_ip)
     for device in registry.list_devices(redis):
         mac = registry.normalize_mac(device.get("mac", ""))
         if not mac or mac in guests or mac in worker_macs:
@@ -419,9 +507,13 @@ def observed_guests(redis):
         guest["telemetry_device_id"] = meter_by_ip.get(guest.get("ip", ""), "")
         if guest.get("ip") in meter_by_ip:
             guest["online"] = True
+            if not guest.get("name") and guest["telemetry_device_id"]:
+                guest["name"] = guest["telemetry_device_id"]
     current_guests = [
         guest for guest in guests.values()
-        if guest.get("online") or guest.get("telemetry_device_id") or guest.get("port_name") == "registered"
+        if guest.get("telemetry_device_id")
+        or guest.get("ip") in live_meter_ips
+        or guest.get("port_name") == "registered"
     ]
     return sorted(current_guests, key=lambda item: (item.get("ip") or "", item["mac"]))
 
@@ -654,6 +746,22 @@ def normalize_reading(reading: dict) -> dict:
     return normalized
 
 
+def reading_age_seconds(reading: dict) -> float | None:
+    timestamp = reading.get("timestamp")
+    if not timestamp:
+        return None
+    try:
+        if isinstance(timestamp, (int, float)):
+            seen = datetime.fromtimestamp(float(timestamp), timezone.utc)
+        else:
+            seen = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - seen).total_seconds()
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Almacenamiento de lecturas
 # ---------------------------------------------------------------------------
@@ -716,6 +824,11 @@ def get_all_latest() -> list[dict]:
             for dev in devices:
                 data = redis.hgetall(f"meter:latest:{dev}")
                 if data:
+                    age = reading_age_seconds(data)
+                    if age is None or age > ACTIVE_METER_MAX_AGE_SECONDS:
+                        redis.delete(f"meter:latest:{dev}")
+                        redis.srem("meter:devices", dev)
+                        continue
                     if not telemetry_source_allowed(data.get("source_ip", "")):
                         redis.delete(f"meter:latest:{dev}")
                         redis.srem("meter:devices", dev)
@@ -865,17 +978,23 @@ def api_stats():
                 latest = readings[-1] if readings else {}
 
         if latest:
-            online_count += 1
+            age = reading_age_seconds(latest)
+            is_online = age is not None and age <= ACTIVE_METER_MAX_AGE_SECONDS
+            if is_online:
+                online_count += 1
             energy = float(latest.get("energy_kwh", 0))
             power = float(latest.get("active_power_kw", 0))
-            total_energy += energy
-            total_power += power
+            if is_online:
+                total_energy += energy
+                total_power += power
             device_stats.append({
                 "device_id": dev,
                 "source_ip": latest.get("source_ip", ""),
                 "energy_kwh": round(energy, 4),
                 "active_power_kw": round(power, 3),
                 "last_seen": latest.get("timestamp", ""),
+                "online": is_online,
+                "age_seconds": round(age, 1) if age is not None else None,
                 "seq": latest.get("seq", 0),
             })
 

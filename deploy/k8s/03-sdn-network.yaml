@@ -44,8 +44,6 @@ spec:
             sleep 5
           done
 
-          MASTER_NODE_IP="${MASTER_NODE_IP:-192.168.122.100}"
-
           get_br0_ip() {
             ip -4 addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1
           }
@@ -62,12 +60,6 @@ spec:
               if ! ip link show br0 2>/dev/null | grep -q "state UP"; then
                 echo "br0 existe pero no esta UP; intentando levantarlo..."
                 ip link set br0 up 2>/dev/null || true
-                sleep 3
-                continue
-              fi
-
-              if [ "$MY_IP" != "$MASTER_NODE_IP" ] && ! ping -c1 -W1 "$MASTER_NODE_IP" > /dev/null 2>&1; then
-                echo "Sin conectividad L3 hacia master $MASTER_NODE_IP desde $MY_IP; esperando red GNS3..."
                 sleep 3
                 continue
               fi
@@ -177,8 +169,28 @@ spec:
             fi
 
             PHYSICAL_NEIGHBORS=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "\.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | sort -u || true)
+            REDIS_STP_PEERS=""
+            while read -r stp_key && read -r stp_status; do
+              state=$(echo "$stp_status" | cut -d: -f1)
+              remote_ip=$(echo "$stp_status" | cut -d: -f2-)
+              remote_dpid=$(echo "$stp_key" | cut -d: -f1)
 
-            for remote_ip in $PHYSICAL_NEIGHBORS; do
+              if [ "$state" != "forwarding" ]; then
+                continue
+              fi
+
+              if echo "$stp_key" | grep -q "^${DPID}:" && echo "$remote_ip" | grep -Eq "^192\.168\."; then
+                REDIS_STP_PEERS=$(printf '%s\n%s\n' "$REDIS_STP_PEERS" "$remote_ip")
+              elif [ "$remote_ip" = "$MY_IP" ]; then
+                peer_ip=$(redis-cli -h "$MASTER_IP" HGET topology:node_ips "$remote_dpid" 2>/dev/null || true)
+                if echo "$peer_ip" | grep -Eq "^192\.168\."; then
+                  REDIS_STP_PEERS=$(printf '%s\n%s\n' "$REDIS_STP_PEERS" "$peer_ip")
+                fi
+              fi
+            done < <(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null || true)
+            VXLAN_PEERS=$(printf '%s\n%s\n' "$PHYSICAL_NEIGHBORS" "$REDIS_STP_PEERS" | grep -E "^192\.168\." | sort -u || true)
+
+            for remote_ip in $VXLAN_PEERS; do
               # Validar IP
               if [ -z "$remote_ip" ] || [ "$remote_ip" = "$MY_IP" ]; then continue; fi
 
@@ -203,7 +215,7 @@ spec:
 
             for vx_port in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep "^vx" || true); do
               remote_ip=$(echo "$vx_port" | sed -E 's/^vx192168122([0-9]{1,3})$/192.168.122.\1/')
-              if echo "$PHYSICAL_NEIGHBORS" | grep -qx "$remote_ip"; then
+              if echo "$VXLAN_PEERS" | grep -qx "$remote_ip"; then
                 rm -f "/run/ryu-vx-stale/${vx_port}" 2>/dev/null || true
                 continue
               fi

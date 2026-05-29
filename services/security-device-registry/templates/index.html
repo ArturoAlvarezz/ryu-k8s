@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SDN AMI Security Registry</title>
+  <title>Registro de seguridad SDN AMI</title>
   <style>
     :root { --bg: #071016; --panel: #101c27; --line: #294155; --cyan: #00d4ff; --green: #2ee88a; --yellow: #ffcc4d; --red: #ff5570; --text: #e8f6ff; --muted: #89a5b8; }
     * { box-sizing: border-box; }
@@ -46,7 +46,7 @@
 </head>
 <body>
   <header>
-    <h1>AMI Security Registry</h1>
+    <h1>Registro de seguridad AMI</h1>
     <p>Administra guests detectados por Ryu/DHCP y cambia su estado sin usar kubectl manualmente.</p>
   </header>
   <main>
@@ -56,7 +56,7 @@
       <span id="error" class="error"></span>
     </section>
     <section>
-      <h2>Workers de la arquitectura</h2>
+      <h2>Nodos worker de la arquitectura</h2>
       <div id="workers" class="grid"></div>
     </section>
     <section>
@@ -70,6 +70,7 @@
   </main>
   <script>
     const statusOptions = ['authorized', 'quarantined', 'blocked'];
+    const statusLabels = {authorized: 'autorizado', quarantined: 'cuarentena', blocked: 'bloqueado', unregistered: 'no registrado', worker: 'worker'};
 
     async function api(path, options = {}) {
       const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -109,7 +110,7 @@
     }
 
     function renderStatusButtons(device) {
-      return statusOptions.map(status => `<button onclick="setStatus('${device.device_id}', '${status}')">${status}</button>`).join('') +
+      return statusOptions.map(status => `<button onclick="setStatus('${device.device_id}', '${status}')">${statusLabels[status]}</button>`).join('') +
         `<button onclick="deleteDevice('${device.device_id}')">eliminar</button>`;
     }
 
@@ -122,15 +123,15 @@
         ? renderStatusButtons(guest.device)
         : `<button onclick='registerGuest(${JSON.stringify(guest)})'>Autorizar guest</button>`;
       return `<article class="card ${status}">
-        <div class="title"><div><div class="mac">${guest.mac}</div><p>${guest.kind === 'worker' ? 'Worker SDN' : (guest.name || guest.node_name || 'Guest SDN')}</p></div><span class="badge">${status}</span></div>
+        <div class="title"><div><div class="mac">${guest.mac}</div><p>${guest.kind === 'worker' ? 'Worker SDN' : (guest.name || guest.node_name || 'Guest SDN')}</p></div><span class="badge">${statusLabels[status] || status}</span></div>
         <dl>
           <dt>IP</dt><dd>${guest.ip ? `${guest.ip}${deviceId ? ` (${deviceId})` : ''}` : 'DHCP pendiente'}</dd>
           <dt>Tipo</dt><dd>${guest.kind || 'guest'}</dd>
           <dt>DPID</dt><dd>${guest.dpid || 'sin observar'}</dd>
           <dt>Puerto</dt><dd>${guest.in_port || '-'} ${guest.port_name ? `(${guest.port_name})` : ''}</dd>
-          <dt>Online</dt><dd>${guest.online ? 'si' : 'no'}</dd>
+          <dt>En linea</dt><dd>${guest.online ? 'si' : 'no'}</dd>
           <dt>Validacion</dt><dd>${guest.validation ? `${guest.validation.allowed ? 'permitido' : 'rechazado'}: ${guest.validation.reason}` : 'sin registro'}</dd>
-          <dt>Device ID</dt><dd>${guest.kind === 'worker' ? 'worker auto-permitido' : (deviceId ? `${deviceId}${guest.ip ? ` (${guest.ip})` : ''}` : 'no registrado')}</dd>
+          <dt>ID dispositivo</dt><dd>${guest.kind === 'worker' ? 'worker auto-permitido' : (deviceId ? `${deviceId}${guest.ip ? ` (${guest.ip})` : ''}` : 'no registrado')}</dd>
         </dl>
         <div class="actions">${actions}</div>
       </article>`;
@@ -138,8 +139,8 @@
 
     function renderOffline(device) {
       return `<article class="card ${device.status} offline">
-        <div class="title"><div><div class="mac">${device.mac}</div><p>${device.device_id}</p></div><span class="badge">${device.status}</span></div>
-        <dl><dt>IP</dt><dd>${device.ip} (${device.device_id})</dd><dt>Device ID</dt><dd>${device.device_id} (${device.ip})</dd><dt>DPID</dt><dd>${device.dpid || '-'}</dd><dt>Puerto</dt><dd>${device.in_port || '-'}</dd></dl>
+        <div class="title"><div><div class="mac">${device.mac}</div><p>${device.device_id}</p></div><span class="badge">${statusLabels[device.status] || device.status}</span></div>
+        <dl><dt>IP</dt><dd>${device.ip} (${device.device_id})</dd><dt>ID dispositivo</dt><dd>${device.device_id} (${device.ip})</dd><dt>DPID</dt><dd>${device.dpid || '-'}</dd><dt>Puerto</dt><dd>${device.in_port || '-'}</dd></dl>
         <div class="actions">${renderStatusButtons(device)}</div>
       </article>`;
     }
@@ -148,10 +149,10 @@
       document.getElementById('error').textContent = '';
       try {
         const data = await api('/api/guests');
-        document.getElementById('summary').textContent = `${data.workers.length} workers, ${data.guests.length} guests observados, ${data.offline_registered.length} registrados offline`;
-        document.getElementById('workers').innerHTML = data.workers.length ? data.workers.map(renderGuest).join('') : '<div class="empty card">No hay workers observados.</div>';
+        document.getElementById('summary').textContent = `${data.workers.length} nodos worker, ${data.guests.length} guests observados, ${data.offline_registered.length} registrados sin conexion`;
+        document.getElementById('workers').innerHTML = data.workers.length ? data.workers.map(renderGuest).join('') : '<div class="empty card">No hay nodos worker observados.</div>';
         document.getElementById('guests').innerHTML = data.guests.length ? data.guests.map(renderGuest).join('') : '<div class="empty card">No hay guests observados todavia.</div>';
-        document.getElementById('offline').innerHTML = data.offline_registered.length ? data.offline_registered.map(renderOffline).join('') : '<div class="empty card">Sin dispositivos offline registrados.</div>';
+        document.getElementById('offline').innerHTML = data.offline_registered.length ? data.offline_registered.map(renderOffline).join('') : '<div class="empty card">Sin dispositivos registrados sin conexion.</div>';
       } catch (err) {
         document.getElementById('error').textContent = err.message;
       }

@@ -116,6 +116,8 @@ def connect_redis():
 def save_device(redis_client, device):
     device = normalize_device(device)
     old_payload = redis_client.get(KEY_DEVICE.format(device["device_id"]))
+    old_mac_owner = redis_client.get(KEY_MAC_TO_DEVICE.format(device["mac"]))
+    old_ip_owner = redis_client.get(KEY_IP_TO_DEVICE.format(device["ip"]))
     pipe = redis_client.pipeline()
 
     if old_payload:
@@ -124,6 +126,11 @@ def save_device(redis_client, device):
             pipe.delete(KEY_MAC_TO_DEVICE.format(old["mac"]))
         if old.get("ip") and old.get("ip") != device["ip"]:
             pipe.delete(KEY_IP_TO_DEVICE.format(old["ip"]))
+
+    for owner in {old_mac_owner, old_ip_owner}:
+        if owner and owner != device["device_id"]:
+            pipe.srem(KEY_DEVICES, owner)
+            pipe.delete(KEY_DEVICE.format(owner))
 
     pipe.sadd(KEY_DEVICES, device["device_id"])
     pipe.set(KEY_DEVICE.format(device["device_id"]), json.dumps(device, sort_keys=True))
