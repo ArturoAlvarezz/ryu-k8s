@@ -71,6 +71,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.flow_mod_total = {}
         self.installed_flows = {}
         self.port_stats = {}
+        self.security_flow_state = {}
         self.metrics_started_at = datetime.utcnow().timestamp()
         self.monitor_thread = hub.spawn(self._monitor_datapaths)
         self.metrics_thread = hub.spawn(self._start_metrics_server)
@@ -273,10 +274,15 @@ class DistributedL2Switch(app_manager.RyuApp):
                     mac = str(device.get("mac", "")).lower()
                     if not datapath or not mac:
                         continue
-                    if device.get("status") in ("quarantine", "quarantined", "blocked"):
+                    state_key = (device.get("device_id"), dpid, in_port, mac)
+                    desired_state = "blocked" if device.get("status") in ("quarantine", "quarantined", "blocked") else "authorized"
+                    if self.security_flow_state.get(state_key) == desired_state:
+                        continue
+                    if desired_state == "blocked":
                         self._drop_guest_packet(datapath, in_port, mac, reason="status_%s" % device.get("status"), install_flow=True)
-                    elif device.get("status") in ("authorized", "learning"):
+                    else:
                         self._delete_guest_drop_flow(datapath, in_port, mac)
+                    self.security_flow_state[state_key] = desired_state
             except redis.RedisError as e:
                 self.logger.warning("Redis unavailable while syncing quarantine flows: %s", e)
             except Exception as e:
@@ -1219,17 +1225,16 @@ class DistributedL2Switch(app_manager.RyuApp):
             path_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
             return path_edges
 
-        adjacency = {str(dpid): set() for dpid in dpids}
+        adjacency = {str(dpid): [] for dpid in dpids}
         for dpid, ports in switch_ports.items():
-            for port_name in ports.values():
+            for _, port_name in sorted(ports.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else 0):
                 if not str(port_name).startswith("vx"):
                     continue
                 target = ip_to_dpid.get(str(port_name)[2:])
                 if target and target in dpids:
                     if _edge_link_id(dpid, target) in blocked_br0_links:
                         continue
-                    adjacency[str(dpid)].add(str(target))
-                    adjacency[str(target)].add(str(dpid))
+                    adjacency[str(dpid)].append(str(target))
 
         queue = [(str(src_switch), [str(src_switch)])]
         visited = {str(src_switch)}
@@ -1242,7 +1247,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                 graph_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
                 return graph_edges
 
-            for next_switch in sorted(adjacency.get(curr_switch, [])):
+            for next_switch in adjacency.get(curr_switch, []):
                 if next_switch in visited:
                     continue
                 visited.add(next_switch)
