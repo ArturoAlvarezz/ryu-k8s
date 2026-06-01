@@ -534,6 +534,15 @@ class DistributedL2Switch(app_manager.RyuApp):
                 self._drop_guest_packet(datapath, in_port, src, reason=reason, install_flow=True)
                 return
 
+        observed_src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
+        if (
+            src not in known_worker_macs and
+            in_port != ofproto.OFPP_LOCAL and
+            not in_port_name.startswith("vx") and
+            in_port_name != "br-sdn"
+        ):
+            self._learn_guest_ip(src, observed_src_ip)
+
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
             raw_dpid = self._decimal_dpid_to_raw(dpid)
             gateway_mac = ":".join(raw_dpid[-12:][i:i + 2] for i in range(0, 12, 2))
@@ -727,7 +736,35 @@ class DistributedL2Switch(app_manager.RyuApp):
         for mac, guest_ip in guest_ips.items():
             if guest_ip == ip_addr:
                 return mac
+        try:
+            import json
+            for device_id in self.redis.smembers("security:devices") or []:
+                payload = self.redis.get(f"security:device:{device_id}")
+                if not payload:
+                    continue
+                try:
+                    device = json.loads(payload)
+                except Exception:
+                    continue
+                mac = str(device.get("mac", "")).lower()
+                if mac and device.get("ip") == ip_addr:
+                    self.redis.hset("topology:guest_ips", mac, ip_addr)
+                    return mac
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while resolving security IP %s: %s", ip_addr, e)
         return None
+
+    def _learn_guest_ip(self, mac, ip_addr):
+        if not ip_addr or ip_addr in ("0.0.0.0", "10.0.0.1"):
+            return
+        if not str(ip_addr).startswith("10.0.0."):
+            return
+        try:
+            current_ip = self.redis.hget("topology:guest_ips", mac)
+            if current_ip != ip_addr:
+                self.redis.hset("topology:guest_ips", mac, ip_addr)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while learning guest IP %s=%s: %s", mac, ip_addr, e)
 
     def _send_arp_reply(self, datapath, in_port, dst_mac, dst_ip, src_mac, src_ip):
         ofproto = datapath.ofproto
@@ -835,15 +872,17 @@ class DistributedL2Switch(app_manager.RyuApp):
                 return False
             ip = (self.redis.hget("topology:guest_ips", mac) or "").strip()
             is_smart_meter = False
+            device_id = self.redis.get(f"security:mac_to_device:{mac}")
+            if device_id:
+                import json
+                raw = self.redis.get(f"security:device:{device_id}")
+                if raw:
+                    device = json.loads(raw)
+                    if not ip:
+                        ip = str(device.get("ip", "")).strip()
+                    if device.get("role") == "smart_meter":
+                        is_smart_meter = True
             if ip:
-                device_id = self.redis.get(f"security:mac_to_device:{mac}")
-                if device_id:
-                    import json
-                    raw = self.redis.get(f"security:device:{device_id}")
-                    if raw:
-                        device = json.loads(raw)
-                        if device.get("role") == "smart_meter":
-                            is_smart_meter = True
                 if not is_smart_meter:
                     for key in self.redis.scan_iter("meter:latest:*"):
                         if (self.redis.hget(key, "source_ip") or "").strip() == ip:

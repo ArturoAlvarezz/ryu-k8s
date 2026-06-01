@@ -39,8 +39,11 @@ spec:
         - -c
         - |
           echo "Instalando dependencias y demonios de red nativa L2..."
-          until apt-get update > /dev/null && apt-get install -y openvswitch-switch kmod iproute2 iputils-ping redis-tools lldpd jq > /dev/null; do
+          export DEBIAN_FRONTEND=noninteractive
+          rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
+          until timeout 120 apt-get update && timeout 300 apt-get install -y --no-install-recommends openvswitch-switch kmod iproute2 iputils-ping redis-tools lldpd jq; do
             echo "apt no disponible todavia; reintentando dependencias OVS..."
+            rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
             sleep 5
           done
 
