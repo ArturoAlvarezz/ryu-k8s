@@ -71,6 +71,8 @@ spec:
           value: "5.0"
         - name: METRICS_PORT
           value: "8000"
+        - name: FORWARDING_FLOW_IDLE_TIMEOUT
+          value: "120"
         volumeMounts:
         - name: code-volume
           mountPath: /app/app.py

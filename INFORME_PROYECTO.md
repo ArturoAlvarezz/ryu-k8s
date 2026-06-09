@@ -157,6 +157,8 @@ El aprendizaje MAC no queda en memoria local del proceso. Cada entrada se guarda
 
 Para evitar conflictos en entornos distribuidos, el controlador usa locks Redis antes de instalar reglas OpenFlow. La llave tiene el formato `lock:flow:{dpid}:{src}:{dst}`. Con esto, si varios eventos derivados del mismo flujo llegan casi al mismo tiempo, solo una instancia programa la regla y las demás evitan duplicar o contradecir la acción.
 
+Los flujos reactivos de forwarding usan `FORWARDING_FLOW_IDLE_TIMEOUT=120`. Este valor reduce la latencia fria observada durante pruebas todos-contra-todos, porque evita que los flows expiren mientras se recorren varios pares de Smart Meters. La recuperación ante fallos no depende de esperar ese timeout: Ryu elimina activamente flows que apuntan a puertos VXLAN marcados como inactivos por los probes del inicializador.
+
 Ryu también implementa medidas específicas para el laboratorio:
 
 | Problema | Solución implementada |
@@ -216,7 +218,7 @@ Claves relevantes:
 
 Se eligió Redis porque ofrece estructuras simples y eficientes para este caso: sets, hashes, contadores, listas, TTLs y locks. Además, la integración desde Python es directa para Ryu, Flask y Scapy.
 
-En este laboratorio Redis usa `emptyDir`. Esta decisión es intencional para evitar que volúmenes persistentes locales queden atados a nodos antiguos cuando se recrean workers en GNS3. Para producción, el equivalente debería usar almacenamiento persistente y política clara de backup.
+En el despliegue actual Redis usa PVCs persistentes `data-redis-0`, `data-redis-1` y `data-redis-2` con `local-path`. Esta decisión evita perder estado por reinicios de pod y permite validar failover de Sentinel sin vaciar la base de datos runtime. Para producción, el equivalente debería usar almacenamiento persistente con política clara de backup, anti-affinity reforzada y recuperación documentada ante pérdida de nodo físico.
 
 ## 11. DHCP Distribuido
 
@@ -423,7 +425,7 @@ Limitaciones actuales:
 
 | Limitación | Implicancia |
 | --- | --- |
-| Redis usa `emptyDir` | El estado runtime se pierde al recrear Redis, útil para laboratorio pero no ideal para producción |
+| PVCs Redis locales `local-path` | Mejoran persistencia frente a reinicios de pod, pero siguen atados al nodo donde se creó cada volumen |
 | Dashboards fijados al master | Simplifica acceso, pero no da HA completa a la capa visual |
 | Secretos HMAC de laboratorio | Deben gestionarse con rotación y secretos robustos en producción |
 | Seguridad centrada en AMI | El enforcement está orientado a Smart Meters y amenazas L2/L3 concretas |
@@ -431,7 +433,97 @@ Limitaciones actuales:
 
 Estas limitaciones no contradicen el objetivo del proyecto. El objetivo principal es demostrar una SDN distribuida, resiliente y observable en un entorno reproducible, y las decisiones tomadas favorecen ese objetivo.
 
-## 21. Conclusión
+## 21. Validación Experimental y Resultados Actuales
+
+La validación completa se ejecutó el 2026-06-09 sobre el laboratorio activo. La prueba incluyó estado base del cluster, APIs, métricas Prometheus consumidas por Grafana, conectividad Smart Meter, carga concurrente, caída de topología y recuperación posterior.
+
+Estado base verificado:
+
+| Elemento | Resultado |
+| --- | --- |
+| Nodos K3s | 7/7 `Ready` |
+| DaemonSet Ryu | 7/7 pods disponibles |
+| DaemonSet OVS initializer | 7/7 pods disponibles |
+| DaemonSet DHCP | 7/7 pods disponibles |
+| DaemonSet meter collector | 7/7 pods disponibles |
+| Redis Sentinel | Master `redis-0.redis-headless.sdn-controller.svc.cluster.local`, 2 replicas sincronizadas |
+| Topología API | 7 switches, 5 guests Smart Meter, 13 enlaces SDN/guest |
+| Grafana/Prometheus | 13 nodos totales: 7 switches SDN, 5 guests y `mgmt-stp-switch` para STP físico |
+| Telemetría AMI | 5/5 Smart Meters online |
+
+Durante la revisión se detectó una inconsistencia de topología: Prometheus/Grafana mostraban 6 guests mientras la telemetría real tenía 5 Smart Meters. La causa fue una MAC antigua de `SDNSmartMeter-5` retenida en Redis tras recreación del contenedor. Se limpió la entrada runtime de `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `health:*`, `active_mac:*` y `mac_to_port:*`. Tras expirar la ventana `last_over_time`, Grafana volvió a coincidir con la realidad: 5 guests y 5 meters.
+
+Pruebas de conectividad:
+
+| Prueba | Resultado |
+| --- | --- |
+| Matriz inicial 5 Smart Meters, 20 pares, 5 paquetes | Detectó convergencia lenta en algunos pares por expiración de flows reactivos |
+| Corrección aplicada | `FORWARDING_FLOW_IDLE_TIMEOUT` aumentado de 30s a 120s |
+| Rollout Ryu | 270s hasta 7/7 pods disponibles |
+| Matriz estable posterior, 20 pares, 10 paquetes | 0/20 fallos, 0% pérdida, promedio global 4.964 ms, peor promedio 17.387 ms |
+| Matriz final post-fallo, 20 pares, 5 paquetes | 0/20 fallos, 0% pérdida, promedio global 5.442 ms, peor promedio 14.495 ms |
+
+Prueba de carga:
+
+| Carga | Resultado |
+| --- | --- |
+| Tipo de carga | 20 flujos ICMP concurrentes todos-contra-todos |
+| Volumen | 100 paquetes por flujo, 2000 paquetes totales |
+| Duración medida | 2.31s |
+| Pérdida | 0% |
+| Promedio global por par | 12.856 ms |
+| Peor promedio por par | 25.633 ms |
+| Estado posterior | 5/5 meters online, 7/7 DaemonSets disponibles, 81 flows instalados reportados por Prometheus |
+
+Prueba de caída y recuperación:
+
+| Evento | Resultado medido |
+| --- | --- |
+| Nodo apagado | `SDN-Worker-2`, correspondiente a `worker-b56b35` |
+| Rol en topología | Nodo intermedio VXLAN y host de `SDNSmartMeter-3` |
+| Tráfico monitorizado | SM1 `10.0.0.14` hacia SM4 `10.0.0.12` |
+| Latencia base previa | Promedio 4.276 ms |
+| Recuperación SM1->SM4 tras caída | 87.5s desde orden de apagado |
+| Ventana de pérdida observada | 85.8s desde primer fallo hasta 5 éxitos consecutivos |
+| Estado durante caída | 6 nodos K3s `Ready`, `worker-b56b35` `NotReady`, topología reducida a 10 nodos, 4 guests y 10 enlaces |
+| Reinicio del worker | Nodo `Ready` en 94.1s desde orden de arranque |
+| Recuperación completa de topología/telemetría | 2.1s tras el primer chequeo posterior al rollout de DaemonSets |
+| Estado final | 7/7 nodos `Ready`, 7/7 DaemonSets disponibles, 12 nodos API, 5 guests, 13 enlaces, 5/5 meters online |
+
+Monitorización final de procesos y recursos:
+
+| Métrica | Resultado |
+| --- | --- |
+| CPU por nodo tras pruebas | Entre 36.15% y 53.05% según Node Exporter |
+| Memoria por nodo tras pruebas | Entre 35.78% y 49.31% |
+| Redis | Master operativo y dos replicas `slave` |
+| Pods no `Running` | Ninguno en `sdn-controller` |
+| Logs Ryu durante caída | Eliminación esperada de flows hacia VXLAN inactivos y breves errores Redis mientras Sentinel/servicios reconvergían |
+
+La arquitectura se recuperó correctamente de la caída de un worker intermedio sin malla completa VXLAN. La recuperación no fue instantánea porque depende de la detección de reachability, expiración/limpieza de estado y recomputo de camino, pero el sistema volvió a operar sin intervención manual. El resultado es suficiente para demostrar resiliencia de laboratorio y deja dos límites claros: el underlay virtualizado en GNS3 domina la latencia, y los flujos reactivos introducen latencia fria cuando no están instalados.
+
+## 22. Comparación con una Arquitectura Típica
+
+Una arquitectura típica para un laboratorio SDN suele usar uno o varios controladores centralizados detrás de una IP de servicio, switches apuntando a ese endpoint remoto, estado parcial en memoria del controlador y servicios auxiliares no necesariamente distribuidos por nodo. Ese diseño es más simple de desplegar al principio, pero concentra fallos y hace que la recuperación dependa de la disponibilidad del controlador central, del balanceador y de la conectividad de gestión hacia ese punto.
+
+La arquitectura de este proyecto es mejor para el objetivo buscado porque prioriza continuidad local y recuperación automática:
+
+| Aspecto | Arquitectura típica | Arquitectura del proyecto |
+| --- | --- | --- |
+| Controlador | Centralizado o balanceado por servicio | Un Ryu local por nodo con `hostNetwork` |
+| Conexión OVS-controlador | IP remota del controlador | `tcp:127.0.0.1:6653` local |
+| Estado | Frecuentemente en memoria del controlador | Redis Sentinel compartido con TTLs y locks |
+| DHCP/telemetría | Servicios centrales | DaemonSets locales por nodo |
+| Recuperación de dataplane | Depende de reconectar al controlador central | El controlador local vuelve junto al nodo y OVS reconecta localmente |
+| Topología | A menudo fija o manual | VXLAN dinámico por LLDP/probes y Redis |
+| Observabilidad | Métricas separadas o parciales | Prometheus/Grafana/Loki integrados |
+| Seguridad AMI | Normalmente externa al plano SDN | Registro, validación y cuarentena conectados a Ryu y collector |
+
+La mejora principal no es que todos los paquetes sean siempre más rápidos. En un entorno virtualizado como GNS3, la latencia depende mucho del underlay, de la CPU disponible y del número de saltos VXLAN. La ventaja real es operacional: el sistema mantiene control local, reconstruye estado, limpia información obsoleta, redistribuye la telemetría y conserva visibilidad cuando se apagan o reinician nodos. Para una red AMI distribuida, esa resiliencia y trazabilidad son más importantes que depender de un controlador central con menor complejidad inicial pero mayor impacto ante fallos.
+
+La arquitectura típica sigue siendo preferible si el objetivo es una demo mínima o un entorno pequeño sin necesidad de recuperación automática. En cambio, para este proyecto, donde se requiere demostrar alta disponibilidad, failover, observabilidad y seguridad de dispositivos, la arquitectura distribuida es más adecuada.
+
+## 23. Conclusión
 
 El proyecto implementa una plataforma SDN distribuida completa sobre GNS3 y K3s. La arquitectura final evita un controlador central único, ejecuta Ryu localmente en cada nodo, coordina el estado mediante Redis Sentinel y reconstruye automáticamente dataplane, túneles, leases, topología y métricas tras reinicios o cambios de red.
 

@@ -23,7 +23,7 @@ from ryu.topology import event, switches
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
 ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS", 30))
 MONITOR_INTERVAL_SECONDS = float(os.environ.get("MONITOR_INTERVAL_SECONDS", 5))
-FORWARDING_FLOW_IDLE_TIMEOUT = int(os.environ.get("FORWARDING_FLOW_IDLE_TIMEOUT", 30))
+FORWARDING_FLOW_IDLE_TIMEOUT = int(os.environ.get("FORWARDING_FLOW_IDLE_TIMEOUT", 120))
 VXLAN_REQUIRES_FORWARDING_BR0_EDGE = os.environ.get("VXLAN_REQUIRES_FORWARDING_BR0_EDGE", "false").lower() == "true"
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
 MGMT_SWITCH_ID = "mgmt-stp-switch"
