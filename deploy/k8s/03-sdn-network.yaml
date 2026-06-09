@@ -129,9 +129,11 @@ spec:
           }
 
           refresh_gateway_flows() {
-            # Keep local gateway/collector traffic available even while Ryu is
-            # reconverging or busy processing Packet-In bursts.
-            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_tpa=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
+            # Let Ryu answer gateway ARP directly; sending these requests to
+            # LOCAL can strand ARP replies if learned return flows were cleared.
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_tpa=10.0.0.1,actions=CONTROLLER:65535" > /dev/null 2>&1 || true
+            # Keep local gateway/collector IP traffic available even while Ryu
+            # is reconverging or busy processing Packet-In bursts.
             ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,ip,nw_dst=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
           }
           refresh_table_miss
@@ -153,6 +155,39 @@ spec:
 
           echo "Evaluando mapa físico mediante LLDP Point-to-Point asíncrono..."
           mkdir -p /run/ryu-vx-stale
+          mkdir -p /run/ryu-vx-peer
+
+          probe_vxlan_peer() {
+            remote_ip="$1"
+            [ -n "$remote_ip" ] || return 0
+            [ "$remote_ip" != "$MY_IP" ] || return 0
+
+            safe_name=$(echo "$remote_ip" | tr '.' '_')
+            fail_file="/run/ryu-vx-peer/${safe_name}.fails"
+            success_file="/run/ryu-vx-peer/${safe_name}.success"
+            state_key="vxlan:peer:state:${DPID}:${remote_ip}"
+
+            if ping -c 1 -W 1 "$remote_ip" > /dev/null 2>&1; then
+              successes=0
+              [ -f "$success_file" ] && successes=$(cat "$success_file" 2>/dev/null || echo 0)
+              successes=$((successes + 1))
+              echo "$successes" > "$success_file"
+              echo 0 > "$fail_file"
+              if [ "$successes" -ge 2 ]; then
+                redis-cli -h "$MASTER_IP" SET "$state_key" up EX 10 > /dev/null 2>&1 || true
+              fi
+            else
+              failures=0
+              [ -f "$fail_file" ] && failures=$(cat "$fail_file" 2>/dev/null || echo 0)
+              failures=$((failures + 1))
+              echo "$failures" > "$fail_file"
+              echo 0 > "$success_file"
+              if [ "$failures" -ge 3 ]; then
+                redis-cli -h "$MASTER_IP" SET "$state_key" down EX 10 > /dev/null 2>&1 || true
+              fi
+            fi
+          }
+
           while true; do
             refresh_gateway_flows
 
@@ -238,6 +273,13 @@ spec:
               fi
             done
 
+            for vx_port in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep "^vx" || true); do
+              remote_ip=$(echo "$vx_port" | sed -E 's/^vx192168122([0-9]{1,3})$/192.168.122.\1/')
+              if echo "$remote_ip" | grep -Eq "^192\.168\."; then
+                probe_vxlan_peer "$remote_ip"
+              fi
+            done
+
             # Añadir Guests en cualquier interfaz ensX que NO pertenezca a br0 (topología física)
             for intf in $(ls /sys/class/net | grep -E "^ens[4-9]$|^ens[1-9][0-9]$"); do
               if ip link show $intf | grep -q "master br0"; then continue; fi
@@ -266,7 +308,7 @@ spec:
               done
             fi
 
-            # Heartbeat (Latido L2): Avisar al Controlador global que este nodo físico sigue vivo. (TTL 30s)
+            # Heartbeat (Latido L2): Avisar al Controlador global que este nodo físico sigue vivo.
             if [ -n "$MASTER_IP" ] && [ -n "$DPID" ]; then
               redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
               redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP > /dev/null 2>&1 || true
@@ -295,7 +337,7 @@ spec:
                 fi
               done
               redis-cli -h $MASTER_IP HSET topology:node_last_seen $DPID "$(date +%s)" > /dev/null 2>&1 || true
-              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 120 > /dev/null 2>&1 || true
+              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true
             fi
             sleep 2
           done

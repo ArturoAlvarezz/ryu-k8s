@@ -1,6 +1,7 @@
 import os
 import redis
 import json
+from datetime import datetime, timezone
 from flask import Flask, g, jsonify, render_template
 
 app = Flask(__name__)
@@ -10,6 +11,7 @@ from redis.sentinel import Sentinel
 SENTINEL_HOST = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
 SENTINEL_PORT = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
 sentinel = Sentinel([(SENTINEL_HOST, SENTINEL_PORT)], socket_timeout=0.5)
+ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get('ACTIVE_METER_MAX_AGE_SECONDS', '30'))
 
 
 def redis_master():
@@ -59,6 +61,38 @@ def meter_device_ids_by_ip():
         if source_ip and device_id:
             meters[source_ip] = device_id
     return meters
+
+
+def has_fresh_meter_telemetry(ip):
+    if not ip:
+        return False
+    for key in r.scan_iter('meter:latest:*', count=1000):
+        if (r.hget(key, 'source_ip') or '').strip() != ip:
+            continue
+        timestamp = r.hget(key, 'timestamp')
+        try:
+            seen = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00'))
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - seen).total_seconds() <= ACTIVE_METER_MAX_AGE_SECONDS
+        except Exception:
+            continue
+    return False
+
+
+def append_guest(guests, mac, dpid, guest_ips, telemetry_device_ids):
+    guest_id = normalize_mac(mac)
+    if not guest_id or guest_id in [g['id'] for g in guests]:
+        return
+    ip_text = guest_ips.get(guest_id, "Desconocida / DHCP Pendiente")
+    device_id = telemetry_device_ids.get(ip_text) or device_id_for_mac(guest_id)
+    device_text = f"\nDevice: {device_id}" if device_id else ""
+    guests.append({
+        "id": guest_id,
+        "label": f"{guest_id}{device_text}\nIP: {ip_text}",
+        "group": "guest",
+        "switch": dpid,
+    })
 
 
 @app.route('/')
@@ -148,7 +182,7 @@ def get_topology():
                     continue
                     
                 # Healthcheck L2: Si el Ping ARP falló durante 30s, declaramos Muerte Sistemática.
-                if not r.exists(f"health:{mac}"):
+                if not r.exists(f"health:{mac}") and not has_fresh_meter_telemetry(guest_ips.get(normalize_mac(mac), "")):
                     r.hdel(f"mac_to_port:{dpid}", mac)
                     r.hdel('topology:guest_ips', mac)
                     continue
@@ -156,17 +190,22 @@ def get_topology():
                 # Identificación determinista: Solo las MACs en los puertos con nombre 'ens' son Guests locales!
                 port_name = switch_ports_map.get(port_str, "")
                 if port_name.startswith("ens"):
-                    guest_id = mac
-                    if guest_id not in [g['id'] for g in guests]:
-                        ip_text = guest_ips.get(guest_id, "Desconocida / DHCP Pendiente")
-                        device_id = telemetry_device_ids.get(ip_text) or device_id_for_mac(guest_id)
-                        device_text = f"\nDevice: {device_id}" if device_id else ""
-                        guests.append({
-                            "id": guest_id,
-                            "label": f"{guest_id}{device_text}\nIP: {ip_text}",
-                            "group": "guest",
-                            "switch": dpid
-                        })
+                    append_guest(guests, mac, dpid, guest_ips, telemetry_device_ids)
+
+        guest_locations = r.hgetall('topology:guest_locations')
+        for mac, location in guest_locations.items():
+            mac = normalize_mac(mac)
+            location_dpid, _, port_no = str(location).partition(':')
+            if not location_dpid or not port_no or location_dpid not in switches:
+                continue
+            ip_text = guest_ips.get(mac, '')
+            if not r.exists(f"health:{mac}") and not has_fresh_meter_telemetry(ip_text):
+                continue
+            ports = r.hgetall(f"switch_ports:{location_dpid}")
+            port_name = ports.get(port_no, "")
+            if not str(port_name).startswith("ens"):
+                continue
+            append_guest(guests, mac, location_dpid, guest_ips, telemetry_device_ids)
                         
         # Topología Determinista usando Port Names de Ryu
         # En lugar de depender del tráfico, leemos la estructura exacta del switch!

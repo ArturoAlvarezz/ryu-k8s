@@ -61,29 +61,106 @@ spec:
         - sh
         - -c
         - |
-          # Solo crear configuración si el Pod es nuevo (volumen nuevo)
-          if [ ! -f /data/sentinel.conf ]; then
-            echo "bind 0.0.0.0" > /data/redis.conf
-            if [ "$HOSTNAME" != "redis-0" ]; then
-              echo "replicaof redis-0.redis-headless.sdn-controller.svc.cluster.local 6379" >> /data/redis.conf
+          DEFAULT_MASTER="redis-0.redis-headless.sdn-controller.svc.cluster.local"
+          SENTINEL_HOST="redis-sentinel.sdn-controller.svc.cluster.local"
+          SELF="${HOSTNAME}.redis-headless.sdn-controller.svc.cluster.local"
+
+          CURRENT_MASTER=""
+          for i in $(seq 1 30); do
+            CURRENT_MASTER=$(redis-cli -h "$SENTINEL_HOST" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | sed -n '1p' || true)
+            if [ -n "$CURRENT_MASTER" ]; then
+              break
             fi
-            
-            echo "bind 0.0.0.0" > /data/sentinel.conf
-            echo "sentinel monitor mymaster redis-0.redis-headless.sdn-controller.svc.cluster.local 6379 2" >> /data/sentinel.conf
-            echo "sentinel down-after-milliseconds mymaster 10000" >> /data/sentinel.conf
-            echo "sentinel failover-timeout mymaster 30000" >> /data/sentinel.conf
-            echo "sentinel parallel-syncs mymaster 1" >> /data/sentinel.conf
-            echo "sentinel resolve-hostnames yes" >> /data/sentinel.conf
-            echo "sentinel announce-hostnames yes" >> /data/sentinel.conf
-            chmod 666 /data/sentinel.conf
+            sleep 1
+          done
+          CURRENT_MASTER="${CURRENT_MASTER:-$DEFAULT_MASTER}"
+          case "$CURRENT_MASTER" in
+            *.*.*.*)
+              MASTER_BY_NAME=""
+              for pod in redis-0 redis-1 redis-2; do
+                pod_host="${pod}.redis-headless.sdn-controller.svc.cluster.local"
+                pod_ip=$(getent hosts "$pod_host" | sed -n 's/ .*//p' | sed -n '1p' || true)
+                if [ "$pod_ip" = "$CURRENT_MASTER" ]; then
+                  MASTER_BY_NAME="$pod_host"
+                  break
+                fi
+              done
+              CURRENT_MASTER="${MASTER_BY_NAME:-$DEFAULT_MASTER}"
+              ;;
+          esac
+
+          echo "Redis bootstrap: self=$SELF master=$CURRENT_MASTER"
+
+          # La configuracion se regenera en cada arranque para evitar que
+          # redis-0 arranque como master si Sentinel ya promovio otro nodo.
+          cat > /data/redis.conf <<EOF
+          bind 0.0.0.0
+          protected-mode no
+          replica-announce-ip $SELF
+          replica-announce-port 6379
+          EOF
+          if [ "$CURRENT_MASTER" != "$SELF" ]; then
+            echo "replicaof $CURRENT_MASTER 6379" >> /data/redis.conf
           fi
+
+          cat > /data/sentinel.conf <<EOF
+          bind 0.0.0.0
+          protected-mode no
+          sentinel announce-ip $SELF
+          sentinel announce-port 26379
+          sentinel monitor mymaster $CURRENT_MASTER 6379 2
+          sentinel down-after-milliseconds mymaster 10000
+          sentinel failover-timeout mymaster 30000
+          sentinel parallel-syncs mymaster 1
+          sentinel resolve-hostnames yes
+          sentinel announce-hostnames yes
+          EOF
+          chmod 666 /data/sentinel.conf
         volumeMounts:
         - name: data
           mountPath: /data
       containers:
       - name: redis
         image: redis:7-alpine
-        command: ["redis-server", "/data/redis.conf"]
+        command:
+        - sh
+        - -c
+        - |
+          redis-server /data/redis.conf &
+          REDIS_PID="$!"
+          SENTINEL_HOST="redis-sentinel.sdn-controller.svc.cluster.local"
+          SELF="${HOSTNAME}.redis-headless.sdn-controller.svc.cluster.local"
+          set -- $(hostname -i)
+          SELF_IP="$1"
+
+          while kill -0 "$REDIS_PID" 2>/dev/null; do
+            CURRENT_MASTER=$(redis-cli -h "$SENTINEL_HOST" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | sed -n '1p' || true)
+            case "$CURRENT_MASTER" in
+              *.*.*.*)
+                MASTER_BY_NAME=""
+                for pod in redis-0 redis-1 redis-2; do
+                  pod_host="${pod}.redis-headless.sdn-controller.svc.cluster.local"
+                  pod_ip=$(getent hosts "$pod_host" | sed -n 's/ .*//p' | sed -n '1p' || true)
+                  if [ "$pod_ip" = "$CURRENT_MASTER" ]; then
+                    MASTER_BY_NAME="$pod_host"
+                    break
+                  fi
+                done
+                CURRENT_MASTER="$MASTER_BY_NAME"
+                ;;
+            esac
+            if [ -n "$CURRENT_MASTER" ] && [ "$CURRENT_MASTER" != "$SELF" ] && [ "$CURRENT_MASTER" != "$SELF_IP" ]; then
+              ROLE=$(redis-cli INFO replication 2>/dev/null | sed -n 's/^role://p' | tr -d '\r' || true)
+              MASTER_HOST=$(redis-cli INFO replication 2>/dev/null | sed -n 's/^master_host://p' | tr -d '\r' || true)
+              if [ "$ROLE" = "master" ] || [ "$MASTER_HOST" != "$CURRENT_MASTER" ]; then
+                echo "Redis HA guard: following Sentinel master $CURRENT_MASTER"
+                redis-cli REPLICAOF "$CURRENT_MASTER" 6379 || true
+              fi
+            fi
+            sleep 5
+          done &
+
+          wait "$REDIS_PID"
         ports:
         - containerPort: 6379
         volumeMounts:
@@ -97,6 +174,13 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /data
-      volumes:
-      - name: data
-        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: local-path
+      resources:
+        requests:
+          storage: 1Gi

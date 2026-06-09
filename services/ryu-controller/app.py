@@ -22,6 +22,9 @@ from ryu.topology import event, switches
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
 ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS", 30))
+MONITOR_INTERVAL_SECONDS = float(os.environ.get("MONITOR_INTERVAL_SECONDS", 5))
+FORWARDING_FLOW_IDLE_TIMEOUT = int(os.environ.get("FORWARDING_FLOW_IDLE_TIMEOUT", 30))
+VXLAN_REQUIRES_FORWARDING_BR0_EDGE = os.environ.get("VXLAN_REQUIRES_FORWARDING_BR0_EDGE", "false").lower() == "true"
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
 MGMT_SWITCH_ID = "mgmt-stp-switch"
 
@@ -193,7 +196,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             if not is_tunnel:
                 dpid_mismatch = device.get("dpid") and device.get("dpid") != str(dpid)
                 port_mismatch = device.get("in_port") and device.get("in_port") != str(in_port)
-                if dpid_mismatch or port_mismatch:
+                missing_location = is_local_guest_port and (not device.get("dpid") or not device.get("in_port"))
+                if dpid_mismatch or port_mismatch or missing_location:
                     ip_matches = observed_ip in ("", "0.0.0.0", device.get("ip", ""))
                     if is_local_guest_port and (is_dhcp_request or ip_matches):
                         self._refresh_security_device_location(device, dpid, in_port)
@@ -347,11 +351,16 @@ class DistributedL2Switch(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
         dpid = ev.msg.datapath.id
+        ports_key = f"switch_ports:{dpid}"
+        try:
+            self.redis.delete(ports_key)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while refreshing ports for %s: %s", dpid, e)
         for p in ev.msg.body:
             port_no = p.port_no
             name = p.name.decode('utf-8')
             try:
-                self.redis.hset(f"switch_ports:{dpid}", port_no, name)
+                self.redis.hset(ports_key, port_no, name)
             except redis.RedisError as e:
                 self.logger.warning("Redis unavailable while registering port %s/%s: %s", dpid, port_no, e)
                 continue
@@ -386,7 +395,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         timeouts = {}
         if priority > 0:
-            timeouts = {"idle_timeout": 120, "hard_timeout": 0}
+            timeouts = {"idle_timeout": FORWARDING_FLOW_IDLE_TIMEOUT, "hard_timeout": 0}
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                              actions)]
@@ -510,6 +519,26 @@ class DistributedL2Switch(app_manager.RyuApp):
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while reading ports for %s: %s", dpid, e)
             ports = {}
+        if out_port_str and str(out_port_str) not in ports:
+            self.logger.info(
+                "Ignoring stale learned port: dpid=%s dst=%s port=%s",
+                dpid, dst, out_port_str,
+            )
+            try:
+                self.redis.hdel(mac_table_key, dst)
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while deleting stale MAC %s on %s: %s", dst, dpid, e)
+            out_port_str = None
+        if out_port_str and not self._is_forwarding_port_alive(str(ports.get(str(out_port_str), "")), dpid):
+            self.logger.info(
+                "Ignoring learned port to inactive VXLAN peer: dpid=%s dst=%s port=%s",
+                dpid, dst, out_port_str,
+            )
+            try:
+                self.redis.hdel(mac_table_key, dst)
+            except redis.RedisError as e:
+                self.logger.warning("Redis unavailable while deleting inactive-peer MAC %s on %s: %s", dst, dpid, e)
+            out_port_str = None
         in_port_name = str(ports.get(str(in_port), ""))
         if (
             src not in known_worker_macs and
@@ -643,11 +672,49 @@ class DistributedL2Switch(app_manager.RyuApp):
                     datapath.send_msg(parser.OFPPortStatsRequest(datapath, 0, datapath.ofproto.OFPP_ANY))
                 except Exception as e:
                     self.logger.warning("Error requesting OpenFlow stats: %s", e)
-            hub.sleep(30)
+            hub.sleep(MONITOR_INTERVAL_SECONDS)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
-        dpid = ev.msg.datapath.id
+        datapath = ev.msg.datapath
+        dpid = datapath.id
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        try:
+            ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking flow output ports for %s: %s", dpid, e)
+            ports = {}
+        for stat in ev.msg.body:
+            if stat.priority <= 0:
+                continue
+            delete_flow = False
+            for instruction in getattr(stat, "instructions", []):
+                for action in getattr(instruction, "actions", []):
+                    out_port = getattr(action, "port", None)
+                    if out_port is None:
+                        continue
+                    port_name = str(ports.get(str(out_port), ""))
+                    if port_name.startswith("vx") and not self._is_forwarding_port_alive(port_name, dpid):
+                        delete_flow = True
+                        break
+                if delete_flow:
+                    break
+            if not delete_flow:
+                continue
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                command=ofproto.OFPFC_DELETE_STRICT,
+                out_port=ofproto.OFPP_ANY,
+                out_group=ofproto.OFPG_ANY,
+                priority=stat.priority,
+                match=stat.match,
+            )
+            datapath.send_msg(mod)
+            self.logger.info(
+                "Deleted flow using inactive VXLAN peer: dpid=%s priority=%s match=%s",
+                dpid, stat.priority, stat.match,
+            )
         # Exclude table-miss when reporting installed forwarding flows.
         self.installed_flows[dpid] = sum(1 for stat in ev.msg.body if stat.priority > 0)
 
@@ -814,8 +881,14 @@ class DistributedL2Switch(app_manager.RyuApp):
         if current_dpid == str(dst_dpid):
             return int(dst_port)
 
-        dpids = self._get_topology_switch_dpids(node_ips)
-        dpids.update([current_dpid, str(dst_dpid)])
+        dpids = {
+            str(dpid) for dpid in self._get_topology_switch_dpids(node_ips)
+            if self._is_switch_alive(dpid)
+        }
+        if self._is_switch_alive(current_dpid):
+            dpids.add(current_dpid)
+        if self._is_switch_alive(dst_dpid):
+            dpids.add(str(dst_dpid))
         ip_to_dpid = {
             str(ip).replace(".", ""): self._raw_dpid_to_decimal(raw_dpid)
             for raw_dpid, ip in node_ips.items()
@@ -838,22 +911,138 @@ class DistributedL2Switch(app_manager.RyuApp):
                 next_dpid = ip_to_dpid.get(port_name[2:])
                 if not next_dpid or str(next_dpid) not in dpids:
                     continue
-                if _edge_link_id(dpid, next_dpid) in blocked_br0_links:
+                if not self._is_valid_vxlan_edge(dpid, next_dpid, node_ips, switch_ports, blocked_br0_links):
                     continue
-                adjacency.setdefault(str(dpid), []).append((str(next_dpid), int(port_no)))
+                edge_blocked = (
+                    _edge_link_id(dpid, next_dpid) in blocked_br0_links or
+                    self._is_br0_edge_blocked(dpid, next_dpid, node_ips)
+                )
+                adjacency.setdefault(str(dpid), []).append((edge_blocked, str(next_dpid), int(port_no)))
 
-        queue = [(current_dpid, [])]
-        visited = {current_dpid}
+        for dpid in adjacency:
+            adjacency[dpid].sort(key=lambda edge: edge[0])
+
+        queue = [(0, 0, current_dpid, [])]
+        best = {current_dpid: (0, 0)}
         while queue:
-            dpid, path_ports = queue.pop(0)
+            queue.sort(key=lambda item: (item[0], item[1]))
+            blocked_cost, hops, dpid, path_ports = queue.pop(0)
             if dpid == str(dst_dpid):
                 return path_ports[0] if path_ports else int(dst_port)
-            for next_dpid, out_port in adjacency.get(dpid, []):
-                if next_dpid in visited:
+            for edge_blocked, next_dpid, out_port in adjacency.get(dpid, []):
+                next_cost = blocked_cost + (1 if edge_blocked else 0)
+                next_hops = hops + 1
+                previous = best.get(next_dpid)
+                if previous is not None and previous <= (next_cost, next_hops):
                     continue
-                visited.add(next_dpid)
-                queue.append((next_dpid, path_ports + [out_port]))
+                best[next_dpid] = (next_cost, next_hops)
+                queue.append((next_cost, next_hops, next_dpid, path_ports + [out_port]))
         return None
+
+    def _is_switch_alive(self, dpid):
+        raw_dpid = self._decimal_dpid_to_raw(dpid)
+        try:
+            return bool(self.redis.exists(f"switch:alive:{raw_dpid}"))
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking switch liveness %s: %s", dpid, e)
+            return False
+
+    def _is_forwarding_port_alive(self, port_name, local_dpid=None):
+        if not port_name.startswith("vx"):
+            return True
+        try:
+            node_ips = self.redis.hgetall("topology:node_ips") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking VXLAN peer %s: %s", port_name, e)
+            return False
+        peer_ip = port_name[2:]
+        for raw_dpid, ip in node_ips.items():
+            if str(ip).replace(".", "") != peer_ip:
+                continue
+            if not self._is_switch_alive(self._raw_dpid_to_decimal(raw_dpid)):
+                return False
+            if local_dpid is not None and not self._is_vxlan_peer_reachable(local_dpid, str(ip)):
+                return False
+            return True
+        return False
+
+    def _is_vxlan_peer_reachable(self, local_dpid, peer_ip):
+        raw_local = self._decimal_dpid_to_raw(local_dpid)
+        try:
+            state = self.redis.get(f"vxlan:peer:state:{raw_local}:{peer_ip}")
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking VXLAN reachability %s->%s: %s", local_dpid, peer_ip, e)
+            return False
+        # Missing state is allowed during rollout or before the first probe.
+        return str(state or "up").lower() != "down"
+
+    def _node_ip_for_dpid(self, dpid, node_ips):
+        raw_dpid = self._decimal_dpid_to_raw(dpid)
+        return node_ips.get(raw_dpid, "")
+
+    def _has_vxlan_to_ip(self, ports, peer_ip):
+        expected = "vx%s" % str(peer_ip).replace(".", "")
+        return expected in {str(port_name) for port_name in ports.values()}
+
+    def _is_valid_vxlan_edge(self, local_dpid, remote_dpid, node_ips, switch_ports, blocked_br0_links):
+        local_dpid = str(local_dpid)
+        remote_dpid = str(remote_dpid)
+        if not self._is_switch_alive(local_dpid) or not self._is_switch_alive(remote_dpid):
+            return False
+        if VXLAN_REQUIRES_FORWARDING_BR0_EDGE:
+            if _edge_link_id(local_dpid, remote_dpid) in blocked_br0_links:
+                return False
+            if self._is_br0_edge_blocked(local_dpid, remote_dpid, node_ips):
+                return False
+        local_ip = self._node_ip_for_dpid(local_dpid, node_ips)
+        remote_ip = self._node_ip_for_dpid(remote_dpid, node_ips)
+        if not local_ip or not remote_ip:
+            return False
+        if not self._is_vxlan_peer_reachable(local_dpid, remote_ip):
+            return False
+        if not self._is_vxlan_peer_reachable(remote_dpid, local_ip):
+            return False
+        local_ports = switch_ports.get(local_dpid)
+        if local_ports is None:
+            local_ports = self.redis.hgetall(f"switch_ports:{local_dpid}") or {}
+            switch_ports[local_dpid] = local_ports
+        remote_ports = switch_ports.get(remote_dpid)
+        if remote_ports is None:
+            remote_ports = self.redis.hgetall(f"switch_ports:{remote_dpid}") or {}
+            switch_ports[remote_dpid] = remote_ports
+        return self._has_vxlan_to_ip(local_ports, remote_ip) and self._has_vxlan_to_ip(remote_ports, local_ip)
+
+    def _is_br0_edge_blocked(self, local_dpid, remote_dpid, node_ips):
+        local_dpid = str(local_dpid)
+        remote_dpid = str(remote_dpid)
+        remote_ip = self._node_ip_for_dpid(remote_dpid, node_ips)
+        local_ip = self._node_ip_for_dpid(local_dpid, node_ips)
+        if not local_ip or not remote_ip:
+            return True
+        try:
+            br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking br0 STP edge %s-%s: %s", local_dpid, remote_dpid, e)
+            return True
+        local_raw = self._decimal_dpid_to_raw(local_dpid)
+        remote_raw = self._decimal_dpid_to_raw(remote_dpid)
+        seen = False
+        for key, status in br0_stp_ports.items():
+            if ":" not in key:
+                continue
+            raw_dpid, _ = str(key).split(":", 1)
+            state, _, peer_ip = str(status).partition(":")
+            state = state.strip()
+            peer_ip = peer_ip.strip()
+            if raw_dpid == local_raw and peer_ip == remote_ip:
+                seen = True
+                if state != "forwarding":
+                    return True
+            if raw_dpid == remote_raw and peer_ip == local_ip:
+                seen = True
+                if state != "forwarding":
+                    return True
+        return not seen
 
     def _get_blocked_br0_links(self, ip_to_dpid, dpids):
         br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
@@ -917,6 +1106,73 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.logger.warning("Redis unavailable while checking guest freshness %s: %s", mac, e)
         return False
 
+    def _has_fresh_meter_telemetry(self, ip):
+        if not ip:
+            return False
+        try:
+            for key in self.redis.scan_iter("meter:latest:*"):
+                if (self.redis.hget(key, "source_ip") or "").strip() != ip:
+                    continue
+                timestamp = self.redis.hget(key, "timestamp")
+                try:
+                    seen = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                    if seen.tzinfo is None:
+                        seen = seen.replace(tzinfo=timezone.utc)
+                    return (datetime.now(timezone.utc) - seen).total_seconds() <= ACTIVE_METER_MAX_AGE_SECONDS
+                except Exception:
+                    continue
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while checking meter telemetry %s: %s", ip, e)
+        return False
+
+    def _sync_security_guest_locations(self, guest_ips, guest_locations, dpids):
+        import json
+
+        try:
+            for device_id in self.redis.smembers("security:devices") or []:
+                payload = self.redis.get(f"security:device:{device_id}")
+                if not payload:
+                    continue
+                try:
+                    device = json.loads(payload)
+                except Exception:
+                    continue
+                if device.get("role") != "smart_meter":
+                    continue
+                if device.get("status", "authorized") not in ("authorized", "learning"):
+                    continue
+
+                mac = str(device.get("mac", "")).lower()
+                ip = str(device.get("ip", "")).strip()
+                dpid = str(device.get("dpid", "")).strip()
+                in_port = str(device.get("in_port", "")).strip()
+                if not mac or not ip or not dpid or not in_port or dpid not in dpids:
+                    continue
+                if not self.redis.exists(f"switch:alive:{self._decimal_dpid_to_raw(dpid)}"):
+                    continue
+                if not self._has_fresh_meter_telemetry(ip):
+                    continue
+
+                ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
+                port_name = str(ports.get(in_port, ""))
+                if port_name.startswith("vx") or in_port == "4294967294" or port_name == "br-sdn":
+                    continue
+
+                location = f"{dpid}:{in_port}"
+                if guest_ips.get(mac) != ip:
+                    self.redis.hset("topology:guest_ips", mac, ip)
+                    guest_ips[mac] = ip
+                if guest_locations.get(mac) != location:
+                    self.redis.hset("topology:guest_locations", mac, location)
+                    self.redis.hset("topology:guest_names", mac, device.get("device_id", device_id))
+                    guest_locations[mac] = location
+                    self.logger.info(
+                        "Guest location restored from security registry: device=%s mac=%s location=%s",
+                        device.get("device_id", device_id), mac, location,
+                    )
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while syncing security guest locations: %s", e)
+
     def _add_guest_node_edge(self, guests, edges, mac, dpid, port_no, guest_ips):
         ports = self.redis.hgetall(f"switch_ports:{dpid}") or {}
         port_name = ports.get(str(port_no), "")
@@ -955,6 +1211,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         guest_ips = self.redis.hgetall("topology:guest_ips") or {}
         guest_locations = self.redis.hgetall("topology:guest_locations") or {}
         br0_stp_ports = self.redis.hgetall("topology:br0_stp_ports") or {}
+        self._sync_security_guest_locations(guest_ips, guest_locations, dpids)
 
         nodes = []
         edges = []
@@ -989,7 +1246,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if str(port_name).startswith("vx"):
                     target = ip_to_dpid.get(str(port_name)[2:])
                     if target and target in dpids:
-                        if _edge_link_id(dpid, target) in blocked_br0_links:
+                        if not self._is_valid_vxlan_edge(dpid, target, node_ips, {str(dpid): ports}, blocked_br0_links):
                             continue
                         source, dest = sorted([str(dpid), str(target)])
                         edge_id = "vx:%s:%s" % (source, dest)
@@ -1169,6 +1426,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         switch_ports = {}
         mac_tables = {}
         guest_locations = self.redis.hgetall("topology:guest_locations") or {}
+        node_ips = self.redis.hgetall("topology:node_ips") or {}
         blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
 
         for dpid in dpids:
@@ -1215,7 +1473,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             next_switch = ip_to_dpid.get(str(port_name)[2:])
             if not next_switch:
                 break
-            if _edge_link_id(curr_switch, next_switch) in blocked_br0_links:
+            if not self._is_valid_vxlan_edge(curr_switch, next_switch, node_ips, switch_ports, blocked_br0_links):
                 break
 
             path_edges.append(("path:%s" % _edge_link_id(curr_switch, next_switch), curr_switch, next_switch))
@@ -1232,7 +1490,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     continue
                 target = ip_to_dpid.get(str(port_name)[2:])
                 if target and target in dpids:
-                    if _edge_link_id(dpid, target) in blocked_br0_links:
+                    if not self._is_valid_vxlan_edge(dpid, target, node_ips, switch_ports, blocked_br0_links):
                         continue
                     adjacency[str(dpid)].append(str(target))
 
