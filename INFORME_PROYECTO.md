@@ -127,7 +127,6 @@ Los manifiestos se organizan por capas:
 | `01-database.yaml` | Redis + Sentinel |
 | `02-ryu-controller.yaml` | Ryu/OpenFlow |
 | `03-sdn-network.yaml` | OVS, VXLAN y DHCP distribuido |
-| `04-topology-dashboard.yaml` | Dashboard propio de topología |
 | `05-telemetry.yaml` | Collector de Smart Meters |
 | `06-observability.yaml` | Prometheus, Grafana, Loki, Promtail, Node Exporter |
 | `07-security-registry.yaml` | Registro web/API de dispositivos autorizados |
@@ -243,9 +242,9 @@ Esta decisión mejora la frescura de la topología: si un guest deja de responde
 
 ## 12. Visualización de Topología
 
-La visualización de topología se implementa en dos niveles: un dashboard web propio y un dashboard Grafana basado en métricas Prometheus.
+La visualización de topología se implementa en dos niveles: la web de operaciones unificada y un dashboard Grafana basado en métricas Prometheus.
 
-El dashboard propio está en `services/topology-dashboard/app.py`. Expone `/api/topology` y `/api/trace/<src_guest>/<dst_guest>`. Lee Redis para construir nodos, enlaces, guests e información de caminos.
+La web de operaciones está en `services/meter-collector/app.py` (pestaña "Topologia SDN"). Expone `/api/sdn-topology` y `/api/sdn-trace`. Lee Redis para construir nodos, enlaces, guests e información de caminos.
 
 La API construye la vista a partir de:
 
@@ -262,7 +261,7 @@ El dashboard evita mostrar nodos desconectados mediante heartbeats. Si un switch
 
 Grafana complementa esta vista con un panel Node graph nativo. Ryu exporta métricas `ryu_topology_node_info`, `ryu_topology_edge_info` y `ryu_trace_path_edge_info`, que Grafana consulta para mostrar el mapa SDN y resaltar caminos entre dos guests seleccionados.
 
-La decisión de usar Grafana para la vista operacional se fundamenta en que permite unir topología, métricas, logs y eventos de seguridad en un mismo lugar. El dashboard propio queda como herramienta directa de depuración basada en Redis, mientras Grafana queda como observabilidad integrada.
+La decisión de usar Grafana para la vista operacional se fundamenta en que permite unir topología, métricas, logs y eventos de seguridad en un mismo lugar. La web de operaciones queda como herramienta directa de depuración y trazado de caminos basada en Redis, mientras Grafana queda como observabilidad integrada.
 
 ## 13. Smart Meters y Telemetría AMI
 

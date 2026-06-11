@@ -539,34 +539,7 @@ data:
       "version": 1,
       "refresh": "10s",
       "timezone": "browser",
-      "templating": {
-        "list": [
-          {
-            "name": "src_guest",
-            "label": "Guest origen",
-            "type": "query",
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "query": "query_result(max by (id) (last_over_time(ryu_topology_node_info{type=\"guest\"}[30s])))",
-            "regex": "/id=\"([^\"]+)\"/",
-            "refresh": 1,
-            "sort": 1,
-            "includeAll": false,
-            "multi": false
-          },
-          {
-            "name": "dst_guest",
-            "label": "Guest destino",
-            "type": "query",
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "query": "query_result(max by (id) (last_over_time(ryu_topology_node_info{type=\"guest\",id!=\"$src_guest\"}[30s])))",
-            "regex": "/id=\"([^\"]+)\"/",
-            "refresh": 1,
-            "sort": 1,
-            "includeAll": false,
-            "multi": false
-          }
-        ]
-      },
+      "templating": {"list": []},
       "annotations": {
         "list": [
           {
@@ -585,65 +558,33 @@ data:
       },
       "panels": [
         {
-          "type": "nodeGraph",
-          "title": "Mapa SDN y camino entre guests",
-          "gridPos": {"x": 0, "y": 0, "w": 24, "h": 18},
-          "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "targets": [
-            {
-              "refId": "nodes",
-              "expr": "topk by (id) (1, last_over_time(ryu_topology_node_info[30s]))",
-              "format": "table",
-              "instant": true
-            },
-            {
-              "refId": "edges",
-              "expr": "topk by (link) (1, ((last_over_time(ryu_topology_edge_info{link!=\"\"}[45s]) unless on (link) last_over_time(ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}[20s])) or last_over_time(ryu_trace_path_edge_info{src_guest=\"$src_guest\",dst_guest=\"$dst_guest\",link!=\"\"}[20s])))",
-              "format": "table",
-              "instant": true
-            }
-          ],
-          "options": {
-            "layout": "grid",
-            "zoomMode": "greedy",
-            "nodes": {
-              "mainStatUnit": "short",
-              "secondaryStatUnit": "short"
-            },
-            "edges": {
-              "mainStatUnit": "short",
-              "secondaryStatUnit": "short"
-            }
-          }
-        },
-        {
           "type": "timeseries",
           "title": "Packet-In por segundo",
-          "gridPos": {"x": 0, "y": 18, "w": 12, "h": 8},
+          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
           "targets": [{"expr": "sum by (dpid) (rate(ryu_packet_in_total[1m]))", "legendFormat": "switch {{dpid}}"}]
         },
         {
           "type": "stat",
           "title": "Nodos activos",
-          "gridPos": {"x": 12, "y": 18, "w": 6, "h": 4},
+          "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
           "targets": [{"expr": "max(ryu_active_nodes)", "legendFormat": "nodos"}]
         },
         {
           "type": "stat",
           "title": "Switches activos",
-          "gridPos": {"x": 18, "y": 18, "w": 6, "h": 4},
+          "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
           "targets": [{"expr": "max(ryu_active_switches)", "legendFormat": "switches"}]
         },
         {
           "type": "bargauge",
           "title": "Flujos instalados por switch",
-          "gridPos": {"x": 12, "y": 22, "w": 12, "h": 4},
+          "gridPos": {"x": 12, "y": 4, "w": 12, "h": 4},
           "targets": [{"expr": "max by (dpid) (ryu_installed_flows)", "legendFormat": "{{dpid}}", "instant": true}]
         },
         {
           "type": "timeseries",
           "title": "Trafico por nodo (MB/s)",
-          "gridPos": {"x": 0, "y": 26, "w": 12, "h": 8},
+          "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
           "fieldConfig": {
             "defaults": {
               "unit": "MBs",
@@ -657,19 +598,19 @@ data:
         {
           "type": "timeseries",
           "title": "CPU por nodo",
-          "gridPos": {"x": 12, "y": 26, "w": 12, "h": 8},
+          "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
           "targets": [{"expr": "100 - (avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)", "legendFormat": "{{node}}"}]
         },
         {
           "type": "timeseries",
           "title": "Memoria usada por nodo",
-          "gridPos": {"x": 0, "y": 34, "w": 12, "h": 8},
+          "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
           "targets": [{"expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100", "legendFormat": "{{node}}"}]
         },
         {
           "type": "timeseries",
           "title": "Trafico SDN por puerto OpenFlow (MB/s)",
-          "gridPos": {"x": 12, "y": 34, "w": 12, "h": 8},
+          "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
           "fieldConfig": {
             "defaults": {
               "unit": "MBs",
@@ -683,7 +624,7 @@ data:
         {
           "type": "logs",
           "title": "Logs Ryu",
-          "gridPos": {"x": 0, "y": 42, "w": 24, "h": 10},
+          "gridPos": {"x": 0, "y": 24, "w": 24, "h": 10},
           "datasource": {"type": "loki", "uid": "loki"},
           "targets": [
             {
@@ -706,55 +647,37 @@ data:
         {
           "type": "timeseries",
           "title": "Eventos de Seguridad (por tipo)",
-          "gridPos": {"x": 0, "y": 52, "w": 18, "h": 8},
-          "targets": [{"expr": "sum by (type) (rate(ryu_security_events_by_type[1m]))", "legendFormat": "{{type}}"}]
+          "gridPos": {"x": 0, "y": 34, "w": 18, "h": 8},
+          "targets": [{"expr": "sum by (type) (rate(ryu_security_events_by_type_total[1m]))", "legendFormat": "{{type}}"}]
         },
         {
           "type": "stat",
           "title": "Ataques Totales",
-          "gridPos": {"x": 18, "y": 52, "w": 6, "h": 8},
+          "gridPos": {"x": 18, "y": 34, "w": 6, "h": 8},
           "targets": [{"expr": "max(ryu_security_events_total)", "legendFormat": "Eventos detectados"}]
         },
         {
           "type": "timeseries",
-          "title": "Telemetria AMI rechazada por HMAC/replay",
-          "gridPos": {"x": 0, "y": 60, "w": 18, "h": 8},
-          "targets": [{"expr": "max by (reason) (rate(meter_hmac_invalid_by_reason_total{job=\"meter-collector\"}[1m]))", "legendFormat": "{{reason}}"}]
-        },
-        {
-          "type": "stat",
-          "title": "Paquetes AMI validos",
-          "gridPos": {"x": 18, "y": 60, "w": 6, "h": 4},
-          "targets": [{"expr": "max(meter_hmac_accepted_total{job=\"meter-collector\"})", "legendFormat": "aceptados"}]
-        },
-        {
-          "type": "stat",
-          "title": "Paquetes AMI invalidos",
-          "gridPos": {"x": 18, "y": 64, "w": 6, "h": 4},
-          "targets": [{"expr": "max(meter_hmac_invalid_total{job=\"meter-collector\"})", "legendFormat": "rechazados"}]
-        },
-        {
-          "type": "timeseries",
           "title": "Potencia por Smart Meter",
-          "gridPos": {"x": 0, "y": 68, "w": 18, "h": 8},
+          "gridPos": {"x": 0, "y": 42, "w": 18, "h": 8},
           "targets": [{"expr": "max by (device_id, source_ip) (meter_latest_power_kw{job=\"meter-collector\"})", "legendFormat": "{{device_id}} {{source_ip}}"}]
         },
         {
           "type": "stat",
           "title": "Smart Meters con telemetria",
-          "gridPos": {"x": 18, "y": 68, "w": 6, "h": 8},
+          "gridPos": {"x": 18, "y": 42, "w": 6, "h": 8},
           "targets": [{"expr": "count(count by (device_id) (meter_latest_info{job=\"meter-collector\"}))", "legendFormat": "meters"}]
         },
         {
           "type": "timeseries",
           "title": "Consultas Redis por segundo",
-          "gridPos": {"x": 0, "y": 76, "w": 12, "h": 8},
+          "gridPos": {"x": 0, "y": 50, "w": 12, "h": 8},
           "targets": [{"expr": "sum by (service, operation, status) (rate(redis_query_total[1m]))", "legendFormat": "{{service}} {{operation}} {{status}}"}]
         },
         {
           "type": "timeseries",
           "title": "Latencia media Redis por operacion",
-          "gridPos": {"x": 12, "y": 76, "w": 12, "h": 8},
+          "gridPos": {"x": 12, "y": 50, "w": 12, "h": 8},
           "fieldConfig": {
             "defaults": {
               "unit": "s",
@@ -768,13 +691,13 @@ data:
         {
           "type": "timeseries",
           "title": "Errores Redis por segundo",
-          "gridPos": {"x": 0, "y": 84, "w": 12, "h": 8},
+          "gridPos": {"x": 0, "y": 58, "w": 12, "h": 8},
           "targets": [{"expr": "sum by (service, operation) (rate(redis_query_total{status=\"error\"}[1m]))", "legendFormat": "{{service}} {{operation}}"}]
         },
         {
           "type": "timeseries",
           "title": "Pico de latencia Redis observado",
-          "gridPos": {"x": 12, "y": 84, "w": 12, "h": 8},
+          "gridPos": {"x": 12, "y": 58, "w": 12, "h": 8},
           "fieldConfig": {
             "defaults": {
               "unit": "s",

@@ -16,8 +16,6 @@ jobs:
             image: arturoalvarez/ryu-controller
           - service: dhcp-server
             image: arturoalvarez/ryu-dhcp
-          - service: topology-dashboard
-            image: arturoalvarez/topology-dashboard
           - service: meter-collector
             image: arturoalvarez/meter-collector
           - service: smart-meter

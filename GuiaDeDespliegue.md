@@ -477,12 +477,6 @@ kubectl create configmap ryu-code \
   -n sdn-controller \
   --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl create configmap ryu-topology-code \
-  --from-file=app.py=services/topology-dashboard/app.py \
-  --from-file=index.html=services/topology-dashboard/templates/index.html \
-  -n sdn-controller \
-  --dry-run=client -o yaml | kubectl apply -f -
-
 kubectl create configmap dhcp-code \
   --from-file=app.py=services/dhcp-server/app.py \
   -n sdn-controller \
@@ -508,9 +502,6 @@ kubectl rollout status daemonset/ovs-sdn-initializer -n sdn-controller --timeout
 kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller --timeout=300s
 kubectl rollout status daemonset/ryu -n sdn-controller --timeout=300s
 
-kubectl apply -f deploy/k8s/04-topology-dashboard.yaml
-kubectl rollout status deployment/ryu-topology -n sdn-controller --timeout=300s
-
 kubectl apply -f deploy/k8s/05-telemetry.yaml
 kubectl rollout status daemonset/meter-collector -n sdn-controller --timeout=300s
 
@@ -519,7 +510,7 @@ kubectl rollout status deployment/prometheus -n sdn-controller --timeout=300s
 kubectl rollout status deployment/grafana -n sdn-controller --timeout=300s
 ```
 
-Este orden evita errores transitorios difíciles de diagnosticar: Ryu, DHCP, topology-dashboard y meter-collector dependen de Redis; Ryu debe aplicarse antes de OVS para que OVS pueda apuntar al controlador local, pero no debes esperar el rollout de Ryu hasta que `ovs-sdn-initializer` haya creado `br-sdn`. Prometheus/Grafana deben desplegarse al final para descubrir servicios ya creados.
+Este orden evita errores transitorios difíciles de diagnosticar: Ryu, DHCP y meter-collector dependen de Redis; Ryu debe aplicarse antes de OVS para que OVS pueda apuntar al controlador local, pero no debes esperar el rollout de Ryu hasta que `ovs-sdn-initializer` haya creado `br-sdn`. Prometheus/Grafana deben desplegarse al final para descubrir servicios ya creados.
 
 Los manifiestos aplicados son:
 
@@ -529,7 +520,6 @@ Los manifiestos aplicados son:
 | `01-database.yaml` | Redis + Sentinel |
 | `02-ryu-controller.yaml` | Ryu distribuido con `hostNetwork` |
 | `03-sdn-network.yaml` | OVS initializer y DHCP distribuido |
-| `04-topology-dashboard.yaml` | Dashboard de topología |
 | `05-telemetry.yaml` | Meter collector y consola AMI |
 | `06-observability.yaml` | Prometheus, Grafana, Loki y exporters |
 
@@ -602,7 +592,6 @@ kubectl rollout status daemonset/ryu -n sdn-controller
 kubectl rollout status daemonset/ovs-sdn-initializer -n sdn-controller
 kubectl rollout status daemonset/sdn-dhcp-server -n sdn-controller
 kubectl rollout status daemonset/meter-collector -n sdn-controller
-kubectl rollout status deployment/ryu-topology -n sdn-controller
 kubectl rollout status deployment/prometheus -n sdn-controller
 kubectl rollout status deployment/grafana -n sdn-controller
 ```
@@ -621,8 +610,7 @@ Endpoints principales del laboratorio:
 | Servicio | URL |
 | --- | --- |
 | API Server K3s | `https://192.168.122.10:6443` |
-| Topología | `http://192.168.122.10:8080` |
-| Meter collector / Seguridad AMI | `http://192.168.122.10:8081` |
+| Meter collector / Seguridad AMI / Topología | `http://192.168.122.10:8081` |
 | Prometheus | `http://192.168.122.10:9090` |
 | Grafana | `http://192.168.122.10:3000` |
 
@@ -633,7 +621,7 @@ La telemetria AMI es deny-default. `/api/stats` muestra solo medidores autorizad
 Consultas rápidas:
 
 ```bash
-curl http://192.168.122.10:8080/api/topology
+curl http://192.168.122.10:8081/api/sdn-topology
 curl http://192.168.122.10:8081/api/stats
 curl http://192.168.122.10:8081/api/guests
 curl http://192.168.122.10:8081/api/telemetry-security
@@ -815,7 +803,6 @@ kubectl rollout restart daemonset/ovs-sdn-initializer -n sdn-controller
 kubectl rollout restart daemonset/ryu -n sdn-controller
 kubectl rollout restart daemonset/sdn-dhcp-server -n sdn-controller
 kubectl rollout restart daemonset/meter-collector -n sdn-controller
-kubectl rollout restart deployment/ryu-topology -n sdn-controller
 kubectl rollout restart deployment/prometheus -n sdn-controller
 kubectl rollout restart deployment/grafana -n sdn-controller
 kubectl rollout restart deployment/loki -n sdn-controller
@@ -833,7 +820,6 @@ kubectl rollout restart statefulset/redis -n sdn-controller
 kubectl rollout restart daemonset/ryu -n sdn-controller
 kubectl rollout restart daemonset/sdn-dhcp-server -n sdn-controller
 kubectl rollout restart daemonset/meter-collector -n sdn-controller
-kubectl rollout restart deployment/ryu-topology -n sdn-controller
 ```
 
 Después del reset, reinicia o recrea los guests Smart Meter para que pidan DHCP otra vez. El reset también borra el registro de seguridad, por lo que la telemetria quedará rechazada hasta volver a registrar o autorizar los medidores esperados.
@@ -858,7 +844,7 @@ for i in $(seq 1 30); do
 done
 KUBECONFIG=$HOME/.kube/config kubectl get nodes
 KUBECONFIG=$HOME/.kube/config kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
-curl http://192.168.122.10:8080/api/topology
+curl http://192.168.122.10:8081/api/sdn-topology
 curl http://192.168.122.10:8081/api/health
 ```
 
