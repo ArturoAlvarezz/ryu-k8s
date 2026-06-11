@@ -71,6 +71,30 @@ spec:
           value: "5.0"
         - name: METRICS_PORT
           value: "8000"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: METRICS_EXPORTER_NODE
+          value: "master"
+        - name: METRICS_CACHE_SECONDS
+          value: "30"
+        - name: RYU_CACHE_NODE_IPS_SECONDS
+          value: "5"
+        - name: RYU_CACHE_SWITCH_PORTS_SECONDS
+          value: "5"
+        - name: RYU_CACHE_WORKER_MACS_SECONDS
+          value: "10"
+        - name: RYU_CACHE_LIVENESS_SECONDS
+          value: "2"
+        - name: RYU_CACHE_BR0_STP_SECONDS
+          value: "5"
+        - name: RYU_CACHE_SECURITY_SECONDS
+          value: "5"
+        - name: RYU_CACHE_PATH_SECONDS
+          value: "5"
+        - name: VXLAN_REQUIRES_FORWARDING_BR0_EDGE
+          value: "true"
         - name: FORWARDING_FLOW_IDLE_TIMEOUT
           value: "120"
         volumeMounts:

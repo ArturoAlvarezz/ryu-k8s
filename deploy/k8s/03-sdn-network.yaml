@@ -1,5 +1,33 @@
 # Plano SDN del host: OVS/VXLAN y DHCP distribuido.
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ovs-sdn-initializer
+  namespace: sdn-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ovs-sdn-initializer-node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ovs-sdn-initializer-node-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ovs-sdn-initializer-node-reader
+subjects:
+- kind: ServiceAccount
+  name: ovs-sdn-initializer
+  namespace: sdn-controller
+---
 # ==========================
 # Auto-Configurador de OVS Host (DaemonSet) - Compatible Kernel Host
 # ==========================
@@ -21,12 +49,14 @@ spec:
       labels:
         app: ovs-init
     spec:
+      serviceAccountName: ovs-sdn-initializer
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: ovs-configurator
-        image: ubuntu:22.04  # Usamos la misma base nativa del nodo anfitrión
+        image: arturoalvarez/ovs-sdn-initializer:latest
+        imagePullPolicy: Always
         securityContext:
           privileged: true
         env:
@@ -38,15 +68,6 @@ spec:
         - /bin/bash
         - -c
         - |
-          echo "Instalando dependencias y demonios de red nativa L2..."
-          export DEBIAN_FRONTEND=noninteractive
-          rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
-          until timeout 120 apt-get update && timeout 300 apt-get install -y --no-install-recommends openvswitch-switch kmod iproute2 iputils-ping redis-tools lldpd jq; do
-            echo "apt no disponible todavia; reintentando dependencias OVS..."
-            rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
-            sleep 5
-          done
-
           get_br0_ip() {
             ip -4 addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1
           }
@@ -91,6 +112,86 @@ spec:
             [ "$port_num" = "$root_port" ]
           }
 
+          node_role() {
+            role=""
+            token_file=/var/run/secrets/kubernetes.io/serviceaccount/token
+            ca_file=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            if command -v curl >/dev/null 2>&1 && [ -r "$token_file" ] && [ -r "$ca_file" ] && [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+              token=$(cat "$token_file" 2>/dev/null || true)
+              labels=$(curl -fsS --connect-timeout 1 --max-time 2 --cacert "$ca_file" \
+                -H "Authorization: Bearer $token" \
+                "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes/${NODE_NAME}" 2>/dev/null \
+                | jq -r '.metadata.labels | keys[]?' 2>/dev/null || true)
+              if printf '%s\n' "$labels" | grep -q '^node-role.kubernetes.io/control-plane$\|^node-role.kubernetes.io/master$'; then
+                role="control-plane"
+              fi
+            fi
+            if [ -z "$role" ]; then
+              case "$NODE_NAME" in
+                master|master-*|control-*|controlplane-*|control-plane-*) role="control-plane" ;;
+                *) role="worker" ;;
+              esac
+            fi
+            printf '%s' "$role"
+          }
+
+          elected_control_plane_gateway() {
+            token_file=/var/run/secrets/kubernetes.io/serviceaccount/token
+            ca_file=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            if command -v curl >/dev/null 2>&1 && [ -r "$token_file" ] && [ -r "$ca_file" ] && [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+              token=$(cat "$token_file" 2>/dev/null || true)
+              curl -fsS --connect-timeout 1 --max-time 2 --cacert "$ca_file" \
+                -H "Authorization: Bearer $token" \
+                "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes" 2>/dev/null \
+                | jq -r '
+                    .items[]
+                    | select(.metadata.labels["node-role.kubernetes.io/control-plane"] != null or .metadata.labels["node-role.kubernetes.io/master"] != null)
+                    | {name:.metadata.name, ip:(.status.addresses[]? | select(.type=="InternalIP") | .address)}
+                    | select(.ip != null)
+                    | [.ip, .name] | @tsv
+                  ' 2>/dev/null \
+                | sort -V \
+                | awk 'NR == 1 {print $2}'
+            fi
+          }
+
+          apply_dynamic_stp_costs() {
+            LLDP_KV="$1"
+            role=$(node_role)
+            node_link_cost=${STP_NODE_LINK_COST:-4}
+            switch_worker_cost=${STP_SWITCH_WORKER_COST:-40}
+            switch_control_cost=${STP_SWITCH_CONTROL_COST:-2000}
+            unknown_cost=${STP_UNKNOWN_LINK_COST:-80}
+            control_gateway=$(elected_control_plane_gateway)
+
+            for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
+              remote_ip=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
+              if [ -n "$remote_ip" ]; then
+                cost=$node_link_cost
+                reason="k3s-neighbor"
+              elif is_root_port "$stp_intf" || printf '%s\n' "$LLDP_KV" | grep -q "^lldp.${stp_intf}.chassis.name=Mgmt-STP-Switch$"; then
+                if [ "$role" = "control-plane" ] && [ -n "$control_gateway" ] && [ "$NODE_NAME" = "$control_gateway" ]; then
+                  cost=$switch_worker_cost
+                  reason="mgmt-switch-elected-control-plane-gateway"
+                elif [ "$role" = "control-plane" ]; then
+                  cost=$switch_control_cost
+                  reason="mgmt-switch-control-plane"
+                else
+                  cost=$switch_worker_cost
+                  reason="mgmt-switch-worker"
+                fi
+              else
+                cost=$unknown_cost
+                reason="unknown-neighbor"
+              fi
+              current=$(bridge -j link show dev "$stp_intf" 2>/dev/null | jq -r '.[0].cost // empty' 2>/dev/null || true)
+              if [ "$current" != "$cost" ]; then
+                bridge link set dev "$stp_intf" cost "$cost" 2>/dev/null || true
+                echo "STP cost $stp_intf=$cost ($reason role=$role)"
+              fi
+            done
+          }
+
           wait_for_management_plane
           
           echo "Cargando módulo del kernel..."
@@ -101,16 +202,23 @@ spec:
           mkdir -p /run/lldpd
           lldpd -d &
           sleep 2
-          
-          echo "Limpiando estado anterior para evitar fantasmas..."
-          ovs-vsctl --if-exists del-br br-sdn
-          
+
           # Generar el DPID permanente usando la MAC principal de la máquina (br0) tal como los switches físicos
           BR0_MAC=$(ip link show br0 | awk '/ether/ {print $2}')
           MAC_ADDR=$(echo "$BR0_MAC" | tr -d ':')
           DPID="0000${MAC_ADDR}"
-          
-          echo "Creando br-sdn con DPID físico estático: $DPID..."
+
+          if ovs-vsctl br-exists br-sdn; then
+            CURRENT_DPID=$(ovs-vsctl get bridge br-sdn other-config:datapath-id 2>/dev/null | tr -d '"' || true)
+            if [ "$CURRENT_DPID" != "$DPID" ]; then
+              echo "br-sdn tiene DPID inesperado ($CURRENT_DPID != $DPID). Reconstruyendo bridge..."
+              ovs-vsctl --if-exists del-br br-sdn
+            else
+              echo "br-sdn existente valido. Reutilizando bridge para acelerar restauracion."
+            fi
+          fi
+
+          echo "Asegurando br-sdn con DPID físico estático: $DPID..."
           ovs-vsctl --may-exist add-br br-sdn
           ovs-vsctl set bridge br-sdn other-config:datapath-id=$DPID
           ovs-vsctl set bridge br-sdn other-config:hwaddr=$BR0_MAC
@@ -149,9 +257,6 @@ spec:
           else
             echo "Error: No se pudo obtener el Redis Master de Sentinel."
           fi
-
-          echo "Esperando 15 segundos para dar tiempo a convergencia topologica de lldpd..."
-          sleep 15
 
           echo "Evaluando mapa físico mediante LLDP Point-to-Point asíncrono..."
           mkdir -p /run/ryu-vx-stale
@@ -206,27 +311,45 @@ spec:
               continue
             fi
 
-            PHYSICAL_NEIGHBORS=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "\.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | sort -u || true)
-            REDIS_STP_PEERS=""
+            # Arquitectura estricta: los túneles VXLAN representan enlaces SDN
+            # entre vecinos físicos directos. No se crean sobre enlaces br0 que
+            # STP mantiene bloqueados aunque la IP remota sea alcanzable por otro camino.
+            LOCAL_FORWARDING_PEERS=""
+            LLDP_KV=$(lldpcli show neighbors -f keyvalue 2>/dev/null || true)
+            apply_dynamic_stp_costs "$LLDP_KV"
+            for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
+              STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null || echo "")
+              [ "$STATE_NUM" = "3" ] || continue
+              remote_ip=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
+              if [ -n "$remote_ip" ] && [ "$remote_ip" != "$MY_IP" ]; then
+                LOCAL_FORWARDING_PEERS=$(printf '%s\n%s\n' "$LOCAL_FORWARDING_PEERS" "$remote_ip")
+              fi
+            done
+
+            REDIS_LOCAL_FORWARDING_PEERS=""
             while read -r stp_key && read -r stp_status; do
               state=$(echo "$stp_status" | cut -d: -f1)
               remote_ip=$(echo "$stp_status" | cut -d: -f2-)
-              remote_dpid=$(echo "$stp_key" | cut -d: -f1)
 
               if [ "$state" != "forwarding" ]; then
                 continue
               fi
 
               if echo "$stp_key" | grep -q "^${DPID}:" && echo "$remote_ip" | grep -Eq "^192\.168\."; then
-                REDIS_STP_PEERS=$(printf '%s\n%s\n' "$REDIS_STP_PEERS" "$remote_ip")
-              elif [ "$remote_ip" = "$MY_IP" ]; then
-                peer_ip=$(redis-cli -h "$MASTER_IP" HGET topology:node_ips "$remote_dpid" 2>/dev/null || true)
-                if echo "$peer_ip" | grep -Eq "^192\.168\."; then
-                  REDIS_STP_PEERS=$(printf '%s\n%s\n' "$REDIS_STP_PEERS" "$peer_ip")
-                fi
+                REDIS_LOCAL_FORWARDING_PEERS=$(printf '%s\n%s\n' "$REDIS_LOCAL_FORWARDING_PEERS" "$remote_ip")
               fi
             done < <(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null || true)
-            VXLAN_PEERS=$(printf '%s\n%s\n' "$PHYSICAL_NEIGHBORS" "$REDIS_STP_PEERS" | grep -E "^192\.168\." | sort -u || true)
+            CANDIDATE_VXLAN_PEERS=$(printf '%s\n%s\n' "$LOCAL_FORWARDING_PEERS" "$REDIS_LOCAL_FORWARDING_PEERS" | grep -E "^192\.168\." | sort -u || true)
+            VXLAN_PEERS=""
+            for candidate_ip in $CANDIDATE_VXLAN_PEERS; do
+              remote_raw=$(redis-cli -h "$MASTER_IP" HGETALL topology:node_ips 2>/dev/null | awk -v ip="$candidate_ip" 'NR % 2 == 1 {key=$0; next} $0 == ip {print key; exit}')
+              [ -n "$remote_raw" ] || continue
+              remote_forwarding=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${remote_raw}:" -v my_ip="$MY_IP" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 == "forwarding:" my_ip {print "yes"; exit}')
+              if [ "$remote_forwarding" = "yes" ]; then
+                VXLAN_PEERS=$(printf '%s\n%s\n' "$VXLAN_PEERS" "$candidate_ip")
+              fi
+            done
+            VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
 
             for remote_ip in $VXLAN_PEERS; do
               # Validar IP
@@ -244,7 +367,6 @@ spec:
                      options:key=100 \
                      options:dst_port=4789 \
                   > /dev/null 2>&1 || true
-                ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
                 refresh_table_miss
                 refresh_gateway_flows
               fi
@@ -265,8 +387,11 @@ spec:
               echo "$misses" > "$miss_file"
               if [ "$misses" -ge 4 ]; then
                 echo "Vecino LLDP perdido: $remote_ip ($vx_port). Eliminando túnel VXLAN obsoleto..."
+                OFPORT=$(ovs-vsctl get Interface "$vx_port" ofport 2>/dev/null || echo "")
+                if echo "$OFPORT" | grep -Eq '^[0-9]+$'; then
+                  ovs-ofctl -O OpenFlow13 del-flows br-sdn "out_port=$OFPORT" > /dev/null 2>&1 || true
+                fi
                 ovs-vsctl --if-exists del-port br-sdn "$vx_port" > /dev/null 2>&1 || true
-                ovs-ofctl -O OpenFlow13 del-flows br-sdn > /dev/null 2>&1 || true
                 refresh_table_miss
                 refresh_gateway_flows
                 rm -f "$miss_file" 2>/dev/null || true
@@ -326,9 +451,18 @@ spec:
                   4) STP_STATE="blocking" ;;
                   *) STP_STATE="unknown" ;;
                 esac
-                REMOTE_IP=$(lldpcli show neighbors -f keyvalue 2>/dev/null | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
+                LLDP_KV=$(lldpcli show neighbors -f keyvalue 2>/dev/null || true)
+                REMOTE_IP=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
                 if [ -z "$REMOTE_IP" ]; then
-                  if [ "$STP_STATE" = "forwarding" ] && is_root_port "$stp_intf"; then
+                  REMOTE_NAME=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.name=" | cut -d= -f2 | head -n 1 || true)
+                  if [ "$REMOTE_NAME" = "Mgmt-STP-Switch" ]; then
+                    REMOTE_IP="mgmt-switch"
+                  elif [ "$STP_STATE" = "forwarding" ] && is_root_port "$stp_intf"; then
+                    REMOTE_IP="mgmt-switch"
+                  elif [ "$STP_STATE" != "disabled" ]; then
+                    # Some simple L2 switches do not advertise LLDP. If a br0
+                    # port participates in STP but has no LLDP neighbor, expose
+                    # it as the management/STP switch so blocked backup links are visible.
                     REMOTE_IP="mgmt-switch"
                   fi
                 fi

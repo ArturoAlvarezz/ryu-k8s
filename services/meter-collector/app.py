@@ -76,10 +76,50 @@ _memory_cache: dict[str, list] = defaultdict(list)
 _memory_nonces: dict[str, float] = {}
 _memory_hmac_counters: dict[str, int] = defaultdict(int)
 _cache_lock = threading.Lock()
+_redis_metrics: dict[tuple[str, str], dict[str, float]] = {}
+_redis_metrics_lock = threading.Lock()
 
 
 def canonical_json(payload: dict) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+class RedisMetricsProxy:
+    def __init__(self, client, service: str):
+        self._client = client
+        self._service = service
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            start = time.time()
+            status = "ok"
+            try:
+                return attr(*args, **kwargs)
+            except Exception:
+                status = "error"
+                raise
+            finally:
+                record_redis_metric(name, status, time.time() - start)
+
+        return wrapped
+
+
+def record_redis_metric(operation: str, status: str, duration: float):
+    key = (str(operation), str(status))
+    with _redis_metrics_lock:
+        metric = _redis_metrics.setdefault(key, {"count": 0, "seconds": 0.0, "max": 0.0})
+        metric["count"] += 1
+        metric["seconds"] += duration
+        if duration > metric["max"]:
+            metric["max"] = duration
+
+
+def escape_label(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 # ---------------------------------------------------------------------------
 # Redis
@@ -102,7 +142,7 @@ def connect_redis(attempts: int | None = None, sleep_between: bool = True) -> re
             )
             r.ping()
             log.info("Conexión a Redis Sentinel exitosa.")
-            return r
+            return RedisMetricsProxy(r, "meter-collector")
         except Exception as e:
             log.warning("Intento %d/%d — Redis no disponible: %s", attempt, attempts, e)
             if sleep_between and attempt < attempts:
@@ -337,6 +377,26 @@ def normalize_dpid(dpid):
         return value
 
 
+def raw_dpid_from(dpid):
+    if not dpid:
+        return ""
+    value = str(dpid)
+    if value.isdigit():
+        return "0000" + hex(int(value))[2:].zfill(12)
+    return value if value.startswith("0000") else "0000" + value[-12:]
+
+
+def mac_from_raw_dpid(raw_dpid):
+    raw_mac = str(raw_dpid or "")[-12:]
+    if len(raw_mac) != 12:
+        return ""
+    return ":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower()
+
+
+def edge_link_id(source, target):
+    return "--".join(sorted([str(source), str(target)]))
+
+
 def looks_like_worker_name(name):
     value = (name or "").lower()
     return value.startswith(("worker", "master", "maestro", "control-"))
@@ -540,6 +600,299 @@ def with_security_state(redis, guest):
     return guest
 
 
+def active_switch_dpids(redis):
+    dpids = set()
+    for dpid in redis.smembers("topology:switches") or []:
+        raw = raw_dpid_from(dpid)
+        if redis.exists(f"switch:alive:{raw}"):
+            dpids.add(normalize_dpid(dpid))
+    for raw in redis.hkeys("topology:node_names") or []:
+        if redis.exists(f"switch:alive:{raw}"):
+            dpids.add(normalize_dpid(raw))
+    return dpids
+
+
+def vxlan_peer_state(redis, local_dpid, remote_ip):
+    raw = raw_dpid_from(local_dpid)
+    for key in (f"vxlan:peer:state:{local_dpid}:{remote_ip}", f"vxlan:peer:state:{raw}:{remote_ip}"):
+        state = redis.get(key)
+        if state:
+            return state
+    return "unknown"
+
+
+def forwarding_br0_links(redis, dpids, ip_to_dpid):
+    states = {}
+    for key, value in (redis.hgetall("topology:br0_stp_ports") or {}).items():
+        if ":" not in key:
+            continue
+        raw, _ = key.split(":", 1)
+        local_dpid = normalize_dpid(raw)
+        state, _, remote_ip = str(value).partition(":")
+        remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
+        if local_dpid not in dpids or remote_dpid not in dpids:
+            continue
+        link = edge_link_id(local_dpid, remote_dpid)
+        entry = states.setdefault(link, {"forwarding": set(), "blocked": False})
+        if state == "forwarding":
+            entry["forwarding"].add(local_dpid)
+        else:
+            entry["blocked"] = True
+    return {
+        link for link, state in states.items()
+        if not state["blocked"] and len(state["forwarding"]) >= 2
+    }
+
+
+def build_sdn_topology(redis):
+    dpids = active_switch_dpids(redis)
+    node_names = redis.hgetall("topology:node_names") or {}
+    node_ips = redis.hgetall("topology:node_ips") or {}
+    nodes = []
+    edges_by_id = {}
+    ip_to_dpid = {}
+
+    for raw, ip in node_ips.items():
+        if ip:
+            ip_to_dpid[str(ip).replace(".", "")] = normalize_dpid(raw)
+    valid_br0_links = forwarding_br0_links(redis, dpids, ip_to_dpid)
+
+    for dpid in sorted(dpids, key=lambda value: node_names.get(raw_dpid_from(value), value)):
+        raw = raw_dpid_from(dpid)
+        name = node_names.get(raw, f"switch-{dpid}")
+        ip = node_ips.get(raw, "")
+        role = "control-plane" if looks_like_worker_name(name) and not str(name).startswith("worker") else "worker"
+        nodes.append({
+            "id": str(dpid),
+            "label": name,
+            "type": "switch",
+            "role": role,
+            "name": name,
+            "ip": ip,
+            "mac": mac_from_raw_dpid(raw),
+            "dpid": str(dpid),
+            "raw_dpid": raw,
+            "status": "online",
+        })
+
+    for guest in [with_security_state(redis, item) for item in observed_guests(redis)]:
+        mac = registry.normalize_mac(guest.get("mac", ""))
+        if not mac:
+            continue
+        device = guest.get("device") or {}
+        device_id = guest.get("device_id") or guest.get("telemetry_device_id") or device.get("device_id", "")
+        nodes.append({
+            "id": mac,
+            "label": device_id or guest.get("name") or mac,
+            "type": "smart_meter" if device_id else "guest",
+            "name": guest.get("name") or device_id or mac,
+            "device_id": device_id,
+            "ip": guest.get("ip", ""),
+            "mac": mac,
+            "dpid": str(guest.get("dpid", "")),
+            "in_port": str(guest.get("in_port", "")),
+            "port_name": guest.get("port_name", ""),
+            "security_status": guest.get("security_status", "unknown"),
+            "online": bool(guest.get("online")),
+        })
+        if guest.get("dpid") in dpids:
+            edge_id = f"guest:{guest.get('dpid')}:{mac}"
+            edges_by_id[edge_id] = {
+                "id": edge_id,
+                "source": str(guest.get("dpid")),
+                "target": mac,
+                "type": "guest",
+                "status": "online" if guest.get("online") else "stale",
+                "label": guest.get("port_name") or str(guest.get("in_port", "")),
+                "port": str(guest.get("in_port", "")),
+                "details": "Conexion local guest-switch",
+            }
+
+    for dpid in dpids:
+        ports = redis.hgetall(f"switch_ports:{dpid}") or {}
+        for port_no, port_name in ports.items():
+            if not str(port_name).startswith("vx"):
+                continue
+            remote_key = str(port_name)[2:]
+            remote_dpid = ip_to_dpid.get(remote_key)
+            if not remote_dpid or remote_dpid not in dpids or str(remote_dpid) == str(dpid):
+                continue
+            source, target = sorted([str(dpid), str(remote_dpid)])
+            if edge_link_id(source, target) not in valid_br0_links:
+                continue
+            edge_id = f"vxlan:{source}:{target}"
+            remote_ip = ".".join([remote_key[0:3], remote_key[3:6], remote_key[6:9], remote_key[9:]]) if len(remote_key) == 12 else remote_key
+            state = vxlan_peer_state(redis, dpid, remote_ip)
+            existing = edges_by_id.get(edge_id)
+            status = "down" if state == "down" or (existing and existing.get("status") == "down") else ("up" if state == "up" else "unknown")
+            edges_by_id[edge_id] = {
+                "id": edge_id,
+                "source": source,
+                "target": target,
+                "type": "vxlan",
+                "status": status,
+                "label": "VXLAN",
+                "port": str(port_no),
+                "remote_ip": remote_ip,
+                "details": f"Puerto {port_no} hacia {remote_ip} ({state})",
+            }
+
+    has_mgmt_switch = False
+    for key, value in (redis.hgetall("topology:br0_stp_ports") or {}).items():
+        if ":" not in key:
+            continue
+        raw, intf = key.split(":", 1)
+        local_dpid = normalize_dpid(raw)
+        state, _, remote_ip = str(value).partition(":")
+        if local_dpid not in dpids:
+            continue
+        if remote_ip == "mgmt-switch":
+            has_mgmt_switch = True
+            edge_id = f"br0:{local_dpid}:mgmt-stp-switch"
+            edges_by_id[edge_id] = {
+                "id": edge_id,
+                "source": local_dpid,
+                "target": "mgmt-stp-switch",
+                "type": "br0_mgmt_switch",
+                "status": state,
+                "label": f"br0 {state}",
+                "port": intf,
+                "details": f"{intf}: {state}",
+            }
+            continue
+        remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
+        if not remote_dpid or remote_dpid not in dpids:
+            continue
+        source, target = sorted([str(local_dpid), str(remote_dpid)])
+        edge_id = f"br0:{source}:{target}"
+        existing = edges_by_id.get(edge_id)
+        status = "blocking" if state == "blocking" or (existing and existing.get("status") == "blocking") else state
+        details = list(existing.get("details_list", [])) if existing else []
+        details.append(f"{local_dpid}:{intf}={state}")
+        edges_by_id[edge_id] = {
+            "id": edge_id,
+            "source": source,
+            "target": target,
+            "type": "br0_stp_blocked" if status == "blocking" else "br0_stp",
+            "status": status,
+            "label": "STP bloqueado" if status == "blocking" else "br0 STP",
+            "port": intf,
+            "details": ", ".join(details),
+            "details_list": details,
+        }
+
+    if has_mgmt_switch:
+        nodes.append({
+            "id": "mgmt-stp-switch",
+            "label": "Mgmt-STP-Switch",
+            "type": "mgmt_switch",
+            "role": "stp-root",
+            "name": "Mgmt-STP-Switch",
+            "ip": "",
+            "mac": "",
+            "dpid": "",
+            "status": "online",
+        })
+
+    edges = []
+    for edge in edges_by_id.values():
+        edge.pop("details_list", None)
+        edge["link"] = edge_link_id(edge["source"], edge["target"])
+        edges.append(edge)
+
+    return {
+        "nodes": sorted(nodes, key=lambda item: (item.get("type", ""), item.get("label", ""), item["id"])),
+        "edges": sorted(edges, key=lambda item: (item.get("type", ""), item["id"])),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def trace_sdn_path(redis, src_guest, dst_guest):
+    topology = build_sdn_topology(redis)
+    dpids = {node["id"] for node in topology["nodes"] if node.get("type") == "switch"}
+    ip_to_dpid = {}
+    for raw, ip in (redis.hgetall("topology:node_ips") or {}).items():
+        if ip:
+            ip_to_dpid[str(ip).replace(".", "")] = normalize_dpid(raw)
+    valid_br0_links = forwarding_br0_links(redis, dpids, ip_to_dpid)
+
+    guest_locations = redis.hgetall("topology:guest_locations") or {}
+    switch_ports = {dpid: redis.hgetall(f"switch_ports:{dpid}") or {} for dpid in dpids}
+    mac_tables = {dpid: redis.hgetall(f"mac_to_port:{dpid}") or {} for dpid in dpids}
+
+    def guest_switch(mac):
+        location = str(guest_locations.get(mac, ""))
+        if ":" in location:
+            dpid = location.split(":", 1)[0]
+            if dpid in dpids:
+                return dpid
+        for dpid, table in mac_tables.items():
+            port = table.get(mac)
+            if port and not str(switch_ports.get(dpid, {}).get(str(port), "")).startswith("vx"):
+                return dpid
+        return None
+
+    src_switch = guest_switch(src_guest)
+    dst_switch = guest_switch(dst_guest)
+    if not src_switch or not dst_switch:
+        return {"nodes": [], "edges": [], "reason": "guest_location_unknown"}
+
+    path = [src_switch]
+    visited = set()
+    current = src_switch
+    while current != dst_switch:
+        if current in visited:
+            path = []
+            break
+        visited.add(current)
+        out_port = mac_tables.get(current, {}).get(dst_guest)
+        port_name = switch_ports.get(current, {}).get(str(out_port), "") if out_port else ""
+        if not str(port_name).startswith("vx"):
+            path = []
+            break
+        next_switch = ip_to_dpid.get(str(port_name)[2:])
+        if not next_switch or next_switch not in dpids:
+            path = []
+            break
+        if edge_link_id(current, next_switch) not in valid_br0_links:
+            path = []
+            break
+        path.append(next_switch)
+        current = next_switch
+
+    if not path:
+        adjacency = {dpid: [] for dpid in dpids}
+        for dpid, ports in switch_ports.items():
+            for _, port_name in ports.items():
+                if not str(port_name).startswith("vx"):
+                    continue
+                target = ip_to_dpid.get(str(port_name)[2:])
+                if target and target in dpids and edge_link_id(dpid, target) in valid_br0_links:
+                    adjacency[dpid].append(target)
+        queue = [(src_switch, [src_switch])]
+        seen = {src_switch}
+        while queue:
+            current, candidate = queue.pop(0)
+            if current == dst_switch:
+                path = candidate
+                break
+            for target in sorted(adjacency.get(current, [])):
+                if target in seen:
+                    continue
+                seen.add(target)
+                queue.append((target, candidate + [target]))
+
+    if not path:
+        return {"nodes": [src_guest, dst_guest], "edges": [], "reason": "path_not_found"}
+
+    edge_ids = [f"guest:{src_switch}:{src_guest}"]
+    for source, target in zip(path, path[1:]):
+        a, b = sorted([str(source), str(target)])
+        edge_ids.append(f"vxlan:{a}:{b}")
+    edge_ids.append(f"guest:{dst_switch}:{dst_guest}")
+    return {"nodes": [src_guest] + path + [dst_guest], "edges": edge_ids, "reason": "ok"}
+
+
 def get_device_secrets(device_id: str) -> list[str]:
     secrets = []
     if device_id in HMAC_DEVICE_SECRETS:
@@ -587,6 +940,34 @@ def _record_invalid_event(reason: str, device_id: str, source_ip: str):
             log.warning("No se pudo registrar evento HMAC inválido: %s", e)
 
     log.warning("Telemetría rechazada reason=%s device=%s source=%s", reason, device_id or "unknown", source_ip)
+
+
+def _is_policy_rejection(reason: str) -> bool:
+    return reason in {"status_blocked", "status_quarantine", "status_quarantined"}
+
+
+def _record_policy_rejection(reason: str, device_id: str, source_ip: str):
+    with _cache_lock:
+        _memory_hmac_counters["policy_rejected_total"] += 1
+        _memory_hmac_counters[f"policy_rejected_total:{reason}"] += 1
+
+    redis = get_redis()
+    if redis is not None:
+        try:
+            pipe = redis.pipeline()
+            pipe.incr(f"meter:policy:rejected_total:{reason}")
+            pipe.incr("meter:policy:rejected_total")
+            pipe.hset("meter:policy:last_rejected", device_id or source_ip, json.dumps({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+                "device_id": device_id,
+                "source_ip": source_ip,
+            }))
+            pipe.execute()
+        except Exception as e:
+            log.warning("No se pudo registrar rechazo por política: %s", e)
+
+    log.info("Telemetría bloqueada por política reason=%s device=%s source=%s", reason, device_id or "unknown", source_ip)
 
 
 def record_hmac_accept(device_id: str):
@@ -684,9 +1065,13 @@ def hmac_counter_snapshot() -> dict:
         try:
             counters["accepted_total"] = int(redis.get("meter:hmac:accepted_total") or 0)
             counters["invalid_total"] = int(redis.get("meter:hmac:invalid_total") or 0)
+            counters["policy_rejected_total"] = int(redis.get("meter:policy:rejected_total") or 0)
             for key in redis.scan_iter("meter:hmac:invalid_total:*"):
                 reason = key.rsplit(":", 1)[-1]
                 counters[f"invalid_total:{reason}"] = int(redis.get(key) or 0)
+            for key in redis.scan_iter("meter:policy:rejected_total:*"):
+                reason = key.rsplit(":", 1)[-1]
+                counters[f"policy_rejected_total:{reason}"] = int(redis.get(key) or 0)
         except Exception as e:
             log.warning("No se pudieron leer contadores HMAC desde Redis: %s", e)
     return dict(counters)
@@ -711,6 +1096,18 @@ def prometheus_metrics() -> str:
         reason = key.split(":", 1)[1].replace('\\', '\\\\').replace('"', '\\"')
         lines.append(f'meter_hmac_invalid_by_reason_total{{reason="{reason}"}} {value}')
     lines.extend([
+        "# HELP meter_policy_rejected_total Telemetry packets rejected by configured device policy",
+        "# TYPE meter_policy_rejected_total counter",
+        f"meter_policy_rejected_total {counters.get('policy_rejected_total', 0)}",
+        "# HELP meter_policy_rejected_by_reason_total Telemetry packets rejected by configured policy reason",
+        "# TYPE meter_policy_rejected_by_reason_total counter",
+    ])
+    for key, value in sorted(counters.items()):
+        if not key.startswith("policy_rejected_total:"):
+            continue
+        reason = key.split(":", 1)[1].replace('\\', '\\\\').replace('"', '\\"')
+        lines.append(f'meter_policy_rejected_by_reason_total{{reason="{reason}"}} {value}')
+    lines.extend([
         "# HELP meter_latest_power_kw Latest active power reported by a smart meter",
         "# TYPE meter_latest_power_kw gauge",
         "# HELP meter_latest_energy_kwh Latest cumulative energy reported by a smart meter",
@@ -726,6 +1123,29 @@ def prometheus_metrics() -> str:
         lines.append(f'meter_latest_power_kw{{device_id="{device_id}",source_ip="{source_ip}"}} {power}')
         lines.append(f'meter_latest_energy_kwh{{device_id="{device_id}",source_ip="{source_ip}"}} {energy}')
         lines.append(f'meter_latest_info{{device_id="{device_id}",source_ip="{source_ip}"}} 1')
+    with _redis_metrics_lock:
+        redis_metrics = dict(_redis_metrics)
+    lines.extend([
+        "# HELP redis_query_total Total Redis operations executed by application services",
+        "# TYPE redis_query_total counter",
+    ])
+    for (operation, status), metric in sorted(redis_metrics.items()):
+        labels = f'service="meter-collector",operation="{escape_label(operation)}",status="{escape_label(status)}"'
+        lines.append(f'redis_query_total{{{labels}}} {metric["count"]}')
+    lines.extend([
+        "# HELP redis_query_duration_seconds_total Total Redis operation duration in seconds",
+        "# TYPE redis_query_duration_seconds_total counter",
+    ])
+    for (operation, status), metric in sorted(redis_metrics.items()):
+        labels = f'service="meter-collector",operation="{escape_label(operation)}",status="{escape_label(status)}"'
+        lines.append(f'redis_query_duration_seconds_total{{{labels}}} {metric["seconds"]}')
+    lines.extend([
+        "# HELP redis_query_duration_seconds_max Maximum observed Redis operation duration in seconds since process start",
+        "# TYPE redis_query_duration_seconds_max gauge",
+    ])
+    for (operation, status), metric in sorted(redis_metrics.items()):
+        labels = f'service="meter-collector",operation="{escape_label(operation)}",status="{escape_label(status)}"'
+        lines.append(f'redis_query_duration_seconds_max{{{labels}}} {metric["max"]}')
     return "\n".join(lines) + "\n"
 
 
@@ -887,7 +1307,10 @@ def udp_listener():
             sync_security_identity(str(device_id), addr[0])
             allowed, reason = telemetry_source_authorization(addr[0])
             if not allowed:
-                _record_invalid_event(reason, str(device_id), addr[0])
+                if _is_policy_rejection(reason):
+                    _record_policy_rejection(reason, str(device_id), addr[0])
+                else:
+                    _record_invalid_event(reason, str(device_id), addr[0])
                 continue
             if HMAC_ENABLED:
                 record_hmac_accept(str(device_id))
@@ -1025,6 +1448,34 @@ def api_guests():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/sdn-topology")
+def api_sdn_topology():
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        return jsonify(build_sdn_topology(redis))
+    except Exception as e:
+        log.exception("No se pudo construir topologia SDN")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sdn-trace")
+def api_sdn_trace():
+    try:
+        src = registry.normalize_mac(request.args.get("src", ""))
+        dst = registry.normalize_mac(request.args.get("dst", ""))
+        if not src or not dst or src == dst:
+            return jsonify({"error": "Selecciona dos Smart Meters diferentes"}), 400
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+        return jsonify(trace_sdn_path(redis, src, dst))
+    except Exception as e:
+        log.exception("No se pudo trazar ruta SDN")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/telemetry-security")
 def api_telemetry_security():
     try:
@@ -1034,11 +1485,15 @@ def api_telemetry_security():
         counters = {
             "accepted_total": int(redis.get("meter:hmac:accepted_total") or 0),
             "invalid_total": int(redis.get("meter:hmac:invalid_total") or 0),
+            "policy_rejected_total": int(redis.get("meter:policy:rejected_total") or 0),
             "by_reason": {},
+            "policy_by_reason": {},
             "recent_events": [],
         }
         for key in redis.scan_iter("meter:hmac:invalid_total:*"):
             counters["by_reason"][key.rsplit(":", 1)[-1]] = int(redis.get(key) or 0)
+        for key in redis.scan_iter("meter:policy:rejected_total:*"):
+            counters["policy_by_reason"][key.rsplit(":", 1)[-1]] = int(redis.get(key) or 0)
         for raw in redis.lrange("meter:hmac:events", 0, 9):
             try:
                 counters["recent_events"].append(json.loads(raw))

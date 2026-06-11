@@ -49,8 +49,8 @@ data:
         - localhost:9090
 
     - job_name: ryu
-      scrape_interval: 10s
-      scrape_timeout: 9s
+      scrape_interval: 30s
+      scrape_timeout: 20s
       kubernetes_sd_configs:
       - role: pod
         namespaces:
@@ -744,6 +744,46 @@ data:
           "title": "Smart Meters con telemetria",
           "gridPos": {"x": 18, "y": 68, "w": 6, "h": 8},
           "targets": [{"expr": "count(count by (device_id) (meter_latest_info{job=\"meter-collector\"}))", "legendFormat": "meters"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Consultas Redis por segundo",
+          "gridPos": {"x": 0, "y": 76, "w": 12, "h": 8},
+          "targets": [{"expr": "sum by (service, operation, status) (rate(redis_query_total[1m]))", "legendFormat": "{{service}} {{operation}} {{status}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Latencia media Redis por operacion",
+          "gridPos": {"x": 12, "y": 76, "w": 12, "h": 8},
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "decimals": 4,
+              "min": 0
+            },
+            "overrides": []
+          },
+          "targets": [{"expr": "sum by (service, operation) (rate(redis_query_duration_seconds_total{status=\"ok\"}[1m])) / clamp_min(sum by (service, operation) (rate(redis_query_total{status=\"ok\"}[1m])), 0.001)", "legendFormat": "{{service}} {{operation}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Errores Redis por segundo",
+          "gridPos": {"x": 0, "y": 84, "w": 12, "h": 8},
+          "targets": [{"expr": "sum by (service, operation) (rate(redis_query_total{status=\"error\"}[1m]))", "legendFormat": "{{service}} {{operation}}"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Pico de latencia Redis observado",
+          "gridPos": {"x": 12, "y": 84, "w": 12, "h": 8},
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "decimals": 4,
+              "min": 0
+            },
+            "overrides": []
+          },
+          "targets": [{"expr": "max by (service, operation) (redis_query_duration_seconds_max)", "legendFormat": "{{service}} {{operation}}"}]
         }
       ]
     }

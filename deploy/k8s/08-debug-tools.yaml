@@ -1,0 +1,96 @@
+# Herramientas opcionales de diagnostico. No se incluyen en kustomization.yaml
+# para evitar desplegarlas junto al stack critico por defecto.
+#
+# RedisInsight debe conectarse por Sentinel, no a un master fijo:
+# - Tipo: Redis Sentinel
+# - Sentinel host: redis-sentinel.sdn-controller.svc.cluster.local
+# - Sentinel port: 26379
+# - Master group name: mymaster
+# - Redis database: 0
+#
+# Usar Sentinel es importante porque el master real puede cambiar ante caidas de
+# nodos o pods Redis. Si se conecta directo a redis-0:6379, la UI puede quedar
+# apuntando a una replica o a un endpoint no master despues de un failover.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redisinsight-data
+  namespace: sdn-controller
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redisinsight
+  namespace: sdn-controller
+  labels:
+    app: redisinsight
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redisinsight
+  template:
+    metadata:
+      labels:
+        app: redisinsight
+    spec:
+      containers:
+      - name: redisinsight
+        image: redis/redisinsight:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 5540
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5540
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5540
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: redisinsight-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redisinsight
+  namespace: sdn-controller
+  labels:
+    app: redisinsight
+spec:
+  type: LoadBalancer
+  selector:
+    app: redisinsight
+  ports:
+  - name: http
+    port: 5540
+    targetPort: 5540

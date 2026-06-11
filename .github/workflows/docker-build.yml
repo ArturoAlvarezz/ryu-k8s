@@ -24,6 +24,8 @@ jobs:
             image: arturoalvarez/sdn-smart-meter
           - service: security-device-registry
             image: arturoalvarez/security-device-registry
+          - service: ovs-sdn-initializer
+            image: arturoalvarez/ovs-sdn-initializer
 
     steps:
       - name: Checkout repository

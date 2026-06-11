@@ -502,26 +502,81 @@ Monitorización final de procesos y recursos:
 
 La arquitectura se recuperó correctamente de la caída de un worker intermedio sin malla completa VXLAN. La recuperación no fue instantánea porque depende de la detección de reachability, expiración/limpieza de estado y recomputo de camino, pero el sistema volvió a operar sin intervención manual. El resultado es suficiente para demostrar resiliencia de laboratorio y deja dos límites claros: el underlay virtualizado en GNS3 domina la latencia, y los flujos reactivos introducen latencia fria cuando no están instalados.
 
-## 22. Comparación con una Arquitectura Típica
+## 22. Comparación con Arquitecturas Alternativas
 
-Una arquitectura típica para un laboratorio SDN suele usar uno o varios controladores centralizados detrás de una IP de servicio, switches apuntando a ese endpoint remoto, estado parcial en memoria del controlador y servicios auxiliares no necesariamente distribuidos por nodo. Ese diseño es más simple de desplegar al principio, pero concentra fallos y hace que la recuperación dependa de la disponibilidad del controlador central, del balanceador y de la conectividad de gestión hacia ese punto.
+Para evaluar el valor del proyecto no basta compararlo solo con una SDN centralizada. En una red eléctrica real, especialmente en una red AMI con medidores inteligentes, también existe una alternativa tradicional: una red IP o Ethernet sin OpenFlow, construida con routers, switches gestionables, VLANs, ACLs, OSPF/Static Routing, VRRP/HSRP, firewalls perimetrales y sistemas de monitoreo separados. Esa arquitectura es habitual porque usa tecnologías maduras y conocidas por los equipos de operación, pero ofrece menos capacidad de reacción programable ante eventos de seguridad, cambios topológicos y grandes volúmenes de telemetría distribuida.
 
-La arquitectura de este proyecto es mejor para el objetivo buscado porque prioriza continuidad local y recuperación automática:
+Las tres opciones comparadas son:
 
-| Aspecto | Arquitectura típica | Arquitectura del proyecto |
+| Arquitectura | Descripción |
+| --- | --- |
+| Red tradicional sin OpenFlow | Switches/routers convencionales, VLANs, ACLs, routing estático o dinámico, firewalls y monitoreo externo |
+| SDN centralizada | OVS/OpenFlow con uno o varios controladores centrales detrás de una IP o servicio común |
+| SDN distribuida del proyecto | OVS/OpenFlow por nodo, Ryu local en `127.0.0.1`, Redis Sentinel como estado compartido, servicios distribuidos y observabilidad integrada |
+
+### 22.1 Respuesta ante Caídas
+
+En una red tradicional sin OpenFlow, la recuperación depende principalmente de protocolos de red clásicos. STP/RSTP protege contra bucles a nivel L2, OSPF o rutas estáticas redundantes pueden recuperar caminos L3, y VRRP/HSRP puede mover una gateway virtual entre routers. Estos mecanismos son robustos y ampliamente probados, pero operan con información limitada: reaccionan a enlaces, interfaces o vecinos de routing, no al estado semántico de los medidores, la seguridad AMI, la validez de la telemetría o la ubicación real de cada dispositivo final.
+
+En una SDN centralizada, el controlador tiene más visibilidad lógica que una red tradicional, pero introduce una dependencia fuerte del punto central. Si el controlador o su conectividad de gestión fallan, los switches pueden seguir reenviando flows ya instalados, pero no pueden resolver correctamente nuevos flujos, cambios de topología, nuevos medidores o eventos de seguridad que requieran nuevas reglas.
+
+En este proyecto, cada nodo mantiene su propio controlador Ryu local. OVS no necesita alcanzar un controlador remoto para procesar eventos OpenFlow, porque se conecta a `tcp:127.0.0.1:6653`. Redis Sentinel mantiene el estado compartido y los TTLs eliminan información obsoleta. En la prueba de caída de `SDN-Worker-2`, el sistema recuperó conectividad SM1->SM4 en 87.5s y volvió a topología completa tras reiniciar el worker sin intervención manual.
+
+| Escenario de caída | Red tradicional sin OpenFlow | SDN centralizada | SDN distribuida del proyecto |
+| --- | --- | --- | --- |
+| Caída de enlace | STP/RSTP u OSPF reconvergen, pero sin conocimiento de guests AMI | El controlador recalcula si sigue accesible | LLDP/probes actualizan VXLAN, Ryu borra flows hacia peers inactivos |
+| Caída de nodo de acceso | Los dispositivos detrás del nodo quedan fuera; la red puede tardar en limpiar MAC/ARP | El controlador central detecta si recibe eventos o métricas | `switch:alive:*`, `health:*` y `active_mac:*` limpian topología y guests obsoletos |
+| Caída del controlador | No aplica si no hay controlador | Alto impacto si el endpoint central no está disponible | Impacto local: cada nodo tiene su Ryu local |
+| Reinicio de un nodo | Requiere scripts/servicios de host para reconstruir bridges y rutas | Depende de que OVS reconecte al controlador central | `ovs-sdn-initializer` reconstruye `br-sdn`, VXLAN, controller y heartbeats |
+| Recuperación observada en la prueba | No medida en este proyecto | No usada como arquitectura final | SM1->SM4 recuperó en 87.5s; worker volvió `Ready` en 94.1s |
+
+La red tradicional puede reconverger más rápido en algunos escenarios puramente L3, sobre todo con hardware físico y protocolos bien ajustados. Sin embargo, no reconstruye por sí sola el estado lógico de una red AMI: qué medidor está autorizado, en qué puerto está, qué MAC/IP le corresponde, si su telemetría es válida o si debe quedar en cuarentena. Esa diferencia es central para el problema abordado.
+
+### 22.2 Seguridad
+
+En una red eléctrica, la seguridad no se limita a impedir acceso IP. Un medidor comprometido puede intentar suplantar otra MAC, usar la IP de otro dispositivo, enviar ARP falsos, repetir telemetría antigua, falsificar lecturas o inundar el segmento con tráfico que degrade la recolección.
+
+Una red tradicional suele resolver esto con VLANs, ACLs, DHCP snooping, Dynamic ARP Inspection, port security, firewalls y eventualmente NAC/802.1X. Estas medidas son útiles, pero normalmente viven repartidas en muchos equipos y no comparten contexto con la aplicación AMI. Por ejemplo, un switch puede limitar MACs por puerto, pero no necesariamente sabe si una lectura UDP firmada pertenece al medidor autorizado para ese `dpid/in_port`, ni puede correlacionar un nonce HMAC inválido con una cuarentena OpenFlow inmediata.
+
+La SDN centralizada mejora la capacidad de enforcement porque el controlador puede instalar drops o redirecciones dinámicas. Su debilidad vuelve a ser la dependencia del controlador central: si hay pérdida de conectividad hacia él, la respuesta ante nuevas amenazas se degrada.
+
+En este proyecto, la seguridad se integra desde el acceso hasta la aplicación:
+
+| Capa | Red tradicional sin OpenFlow | SDN distribuida del proyecto |
 | --- | --- | --- |
-| Controlador | Centralizado o balanceado por servicio | Un Ryu local por nodo con `hostNetwork` |
-| Conexión OVS-controlador | IP remota del controlador | `tcp:127.0.0.1:6653` local |
-| Estado | Frecuentemente en memoria del controlador | Redis Sentinel compartido con TTLs y locks |
-| DHCP/telemetría | Servicios centrales | DaemonSets locales por nodo |
-| Recuperación de dataplane | Depende de reconectar al controlador central | El controlador local vuelve junto al nodo y OVS reconecta localmente |
-| Topología | A menudo fija o manual | VXLAN dinámico por LLDP/probes y Redis |
-| Observabilidad | Métricas separadas o parciales | Prometheus/Grafana/Loki integrados |
-| Seguridad AMI | Normalmente externa al plano SDN | Registro, validación y cuarentena conectados a Ryu y collector |
+| Identidad del dispositivo | MAC/IP, DHCP snooping, NAC o inventario externo | Registro Redis con `device_id`, MAC, IP, DPID, puerto, rol y estado |
+| MAC spoofing | Port security por switch, configuración equipo por equipo | Ryu compara MAC observada contra registro y ubicación real |
+| IP spoofing | ACLs, DHCP snooping o reglas en firewall | Ryu valida IP observada contra dispositivo autorizado |
+| ARP poisoning | Dynamic ARP Inspection si está disponible | Ryu bloquea ARP por `10.0.0.1`, mismatches Ethernet/ARP y anuncios inválidos |
+| Telemetría falsa | Normalmente se valida en aplicación o firewall | Collector valida HMAC, nonce, timestamp y estado de seguridad |
+| Cuarentena | VLAN de cuarentena/NAC, usualmente dependiente de infraestructura externa | Ryu instala drops y el collector rechaza fuentes no autorizadas o en cuarentena |
+| Observabilidad de seguridad | Logs distribuidos entre switches/firewalls/NMS | Eventos, métricas Prometheus, Loki y dashboard unificado |
 
-La mejora principal no es que todos los paquetes sean siempre más rápidos. En un entorno virtualizado como GNS3, la latencia depende mucho del underlay, de la CPU disponible y del número de saltos VXLAN. La ventaja real es operacional: el sistema mantiene control local, reconstruye estado, limpia información obsoleta, redistribuye la telemetría y conserva visibilidad cuando se apagan o reinician nodos. Para una red AMI distribuida, esa resiliencia y trazabilidad son más importantes que depender de un controlador central con menor complejidad inicial pero mayor impacto ante fallos.
+La ventaja de la arquitectura del proyecto es la correlación. La red no solo filtra paquetes; relaciona ubicación física/lógica, estado administrativo, identidad AMI y validez criptográfica de la telemetría. Para una red eléctrica, esto permite responder a ataques de forma más precisa: bloquear un medidor concreto sin afectar a otros, identificar si cambió de puerto, detectar si una IP fue reutilizada y reflejar el evento en Grafana.
 
-La arquitectura típica sigue siendo preferible si el objetivo es una demo mínima o un entorno pequeño sin necesidad de recuperación automática. En cambio, para este proyecto, donde se requiere demostrar alta disponibilidad, failover, observabilidad y seguridad de dispositivos, la arquitectura distribuida es más adecuada.
+### 22.3 Grandes Cantidades de Tráfico
+
+Una red eléctrica con muchos medidores produce tráfico constante y repetitivo: lecturas periódicas, eventos de calidad eléctrica, alarmas, reconexiones, mensajes de control y tráfico de mantenimiento. En una arquitectura tradicional, este tráfico se transporta bien si la red está sobredimensionada y segmentada por VLAN/subredes, pero la gestión fina del flujo suele depender de QoS estática, ACLs y capacidad de los routers/firewalls centrales.
+
+El riesgo de una arquitectura tradicional es que el crecimiento se administra por configuración manual o por plantillas externas. A medida que crece el número de medidores, también crece la necesidad de mantener ACLs, rutas, reglas de firewall, listas de dispositivos y dashboards consistentes. Si se centraliza toda la telemetría en un collector único, aparece además un cuello de botella de aplicación.
+
+En este proyecto, el tráfico AMI se distribuye por diseño. Cada nodo tiene un collector local en `10.0.0.1`, DHCP local coordinado por Redis y Ryu local para instalar flows. Esto reduce dependencia de un collector central y evita que todos los medidores crucen la topología para entregar datos. La prueba de carga ejecutó 20 flujos ICMP concurrentes entre los 5 Smart Meters, con 2000 paquetes totales, 0% de pérdida y todos los servicios críticos disponibles al finalizar.
+
+| Aspecto bajo carga | Red tradicional sin OpenFlow | SDN centralizada | SDN distribuida del proyecto |
+| --- | --- | --- | --- |
+| Instalación de política | ACL/QoS configuradas por equipo o automatización externa | Controlador central instala reglas | Ryu local instala flows y coordina estado en Redis |
+| Telemetría AMI | Puede concentrarse en uno o pocos collectors | Depende del diseño de servicios | Collector local por nodo con `hostNetwork` |
+| Escalamiento operativo | Aumenta complejidad de VLANs, ACLs, rutas y firewalls | Aumenta carga del controlador central | Aumentan instancias DaemonSet por nodo y estado compartido |
+| Fallo bajo ráfagas | Riesgo de saturar enlaces/firewalls/collectors centrales | Riesgo de saturar controlador si hay muchos Packet-In | Flujos reactivos se instalan localmente; timeout de 120s reduce Packet-In repetidos |
+| Visibilidad | NMS/SNMP/NetFlow separados de la aplicación | Métricas SDN centralizadas | Prometheus une topología, flows, CPU, memoria, logs y telemetría |
+
+La arquitectura tradicional puede ofrecer mayor rendimiento bruto si usa switches y routers físicos especializados. Esa es una ventaja real: ASICs dedicados pueden reenviar a línea de cable con latencias muy bajas. Pero el problema de este proyecto no es solo reenviar paquetes; es administrar una red eléctrica distribuida con medidores identificables, telemetría validada, recuperación automática y seguridad contextual. Para ese objetivo, la programabilidad de OpenFlow y la distribución por nodo aportan más valor que una red clásica puramente estática.
+
+### 22.4 Evaluación Final
+
+La arquitectura del proyecto es superior a una SDN centralizada cuando se prioriza continuidad local: la caída del controlador remoto deja de ser un punto único de falla porque cada OVS habla con el Ryu de su propio nodo. También es superior a una red tradicional sin OpenFlow cuando se requiere control dinámico basado en identidad, ubicación y estado de seguridad AMI, porque las decisiones no dependen solo de VLANs o ACLs estáticas.
+
+No obstante, una red tradicional sigue siendo válida para entornos donde los medidores solo deben enviar datos a un backend central, el inventario cambia poco, la seguridad se delega a firewalls/NAC externos y la operación prefiere protocolos conocidos antes que programabilidad. También puede ser mejor en rendimiento puro si se implementa con hardware especializado. La arquitectura propuesta es más adecuada cuando el requisito principal es resiliencia observable y control granular: detectar fallos, reconstruir topología, validar dispositivos, aislar amenazas y mantener telemetría distribuida aun durante cambios o caídas parciales.
 
 ## 23. Conclusión
 

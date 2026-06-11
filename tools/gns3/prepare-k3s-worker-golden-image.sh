@@ -206,7 +206,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=/bin/sleep 5
+ExecStartPre=/bin/sleep 1
 ExecStart=/usr/local/bin/k3s-br0-forwarding.sh
 
 [Install]
