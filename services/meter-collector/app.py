@@ -210,21 +210,28 @@ def redis_status_snapshot() -> dict:
     }
 
 
-def telemetry_source_authorization(source_ip: str) -> tuple[bool, str]:
+def telemetry_source_authorization(source_ip: str, device_id: str = "") -> tuple[bool, str]:
     redis = get_redis()
     if redis is None or not source_ip:
         return False, "security_unavailable"
     try:
-        device_id = redis.get(f"security:ip_to_device:{source_ip}")
-        if not device_id:
-            return False, "unregistered_source"
-        payload = redis.get(f"security:device:{device_id}")
-        if not payload:
-            return False, "missing_security_device"
-        device = json.loads(payload)
-        status = device.get("status", "unknown")
-        if status != "authorized":
-            return False, f"status_{status}"
+        observed = _observed_guests_for_ip(redis, source_ip)
+        if not observed:
+            return False, "source_not_observed"
+        if len(observed) > 1:
+            return False, "ambiguous_source_ip"
+        guest = observed[0]
+        allowed, reason, device = registry.validate_observed_device(
+            redis,
+            guest.get("mac", ""),
+            source_ip,
+            guest.get("dpid", ""),
+            guest.get("in_port", ""),
+        )
+        if not allowed:
+            return False, reason
+        if device_id and device and device.get("device_id") != device_id:
+            return False, "device_id_mismatch"
         return True, "authorized"
     except Exception as e:
         log.warning("No se pudo validar estado de seguridad para source=%s: %s", source_ip, e)
@@ -235,9 +242,10 @@ def telemetry_source_allowed(source_ip: str) -> bool:
     return telemetry_source_authorization(source_ip)[0]
 
 
-def _observed_guest_for_ip(redis, source_ip: str) -> dict | None:
+def _observed_guests_for_ip(redis, source_ip: str) -> list[dict]:
     if not source_ip:
-        return None
+        return []
+    observed = []
     guest_ips = redis.hgetall("topology:guest_ips")
     for mac, ip in guest_ips.items():
         if ip != source_ip:
@@ -245,8 +253,15 @@ def _observed_guest_for_ip(redis, source_ip: str) -> dict | None:
         mac = registry.normalize_mac(mac)
         location = redis.hget("topology:guest_locations", mac) or ""
         dpid, _, in_port = str(location).partition(":")
-        return {"mac": mac, "ip": source_ip, "dpid": dpid, "in_port": in_port}
-    return None
+        observed.append({"mac": mac, "ip": source_ip, "dpid": dpid, "in_port": in_port})
+    return observed
+
+
+def _observed_guest_for_ip(redis, source_ip: str) -> dict | None:
+    observed = _observed_guests_for_ip(redis, source_ip)
+    if len(observed) != 1:
+        return None
+    return observed[0]
 
 
 def _cleanup_recreated_meter(redis, device_id: str, current_mac: str, current_ip: str):
@@ -523,6 +538,8 @@ def observed_guests(redis):
                 continue
             if mac in worker_macs or looks_like_worker_name(guest_names.get(mac, "")):
                 continue
+            if mac in guests and guests[mac].get("dpid") and guests[mac].get("in_port"):
+                continue
             port_name = ports.get(str(in_port), "")
             if not port_name.startswith("ens"):
                 continue
@@ -547,6 +564,18 @@ def observed_guests(redis):
         if source_ip:
             meter_by_ip[source_ip] = device_id
     live_meter_ips = set(meter_by_ip)
+
+    rejected_meter_by_ip = {}
+    for raw_event in redis.lrange("meter:hmac:events", 0, 199) or []:
+        try:
+            event = json.loads(raw_event)
+        except Exception:
+            continue
+        source_ip = str(event.get("source_ip", "")).strip()
+        device_id = str(event.get("device_id", "")).strip()
+        if source_ip and device_id and source_ip not in rejected_meter_by_ip:
+            rejected_meter_by_ip[source_ip] = device_id
+
     for device in registry.list_devices(redis):
         mac = registry.normalize_mac(device.get("mac", ""))
         if not mac or mac in guests or mac in worker_macs:
@@ -564,11 +593,13 @@ def observed_guests(redis):
             "kind": "guest",
         }
     for guest in guests.values():
-        guest["telemetry_device_id"] = meter_by_ip.get(guest.get("ip", ""), "")
+        guest["telemetry_device_id"] = meter_by_ip.get(guest.get("ip", ""), "") or rejected_meter_by_ip.get(guest.get("ip", ""), "")
         if guest.get("ip") in meter_by_ip:
             guest["online"] = True
             if not guest.get("name") and guest["telemetry_device_id"]:
                 guest["name"] = guest["telemetry_device_id"]
+        elif not guest.get("name") and guest["telemetry_device_id"]:
+            guest["name"] = guest["telemetry_device_id"]
     current_guests = [
         guest for guest in guests.values()
         if guest.get("telemetry_device_id")
@@ -1304,8 +1335,7 @@ def udp_listener():
             reading = normalize_reading(reading)
             reading["source_ip"] = addr[0]
             device_id = reading.get("device_id", "unknown")
-            sync_security_identity(str(device_id), addr[0])
-            allowed, reason = telemetry_source_authorization(addr[0])
+            allowed, reason = telemetry_source_authorization(addr[0], str(device_id))
             if not allowed:
                 if _is_policy_rejection(reason):
                     _record_policy_rejection(reason, str(device_id), addr[0])

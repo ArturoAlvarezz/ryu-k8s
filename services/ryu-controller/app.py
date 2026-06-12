@@ -991,6 +991,15 @@ class DistributedL2Switch(app_manager.RyuApp):
         if not str(ip_addr).startswith("10.0.0."):
             return
         try:
+            dhcp_ip = self.redis.get(f"dhcp:bind:{mac}")
+            guest_ips = self.redis.hgetall("topology:guest_ips") or {}
+            for other_mac, other_ip in guest_ips.items():
+                if other_mac != mac and other_ip == ip_addr and dhcp_ip != ip_addr:
+                    self.logger.warning(
+                        "Ignoring duplicate guest IP learn mac=%s ip=%s already owned by mac=%s",
+                        mac, ip_addr, other_mac,
+                    )
+                    return
             current_ip = self.redis.hget("topology:guest_ips", mac)
             if current_ip != ip_addr:
                 self.redis.hset("topology:guest_ips", mac, ip_addr)

@@ -32,25 +32,45 @@ while True:
 def get_ip_for_mac(mac):
     allocated = r.get(f"dhcp:bind:{mac}")
     if allocated:
+        r.hset("topology:guest_ips", mac, allocated)
         return allocated
-    
-    # Calculate new IP
-    next_index = r.incr("dhcp:next_ip")
-    # If next_index was empty and initialized by incr, start at 10
-    if next_index == 1: 
-        r.set("dhcp:next_ip", 10)
-        next_index = 10
-        
-    if next_index > 250:
-        print("¡El Pool de direcciones DHCP está agotado (Límite 250)!")
-        return None
-        
-    new_ip = f"10.0.0.{next_index}"
-    r.set(f"dhcp:bind:{mac}", new_ip)
-    # Registrar también en el listado general de Topología a futuro
-    r.hset("topology:guest_ips", mac, new_ip)
-    
-    return new_ip
+
+    used_ips = set()
+    for key in r.scan_iter("dhcp:bind:*"):
+        bound_mac = key.rsplit(":", 6)[-6:]
+        if ":".join(bound_mac).lower() == mac.lower():
+            continue
+        ip = r.get(key)
+        if ip:
+            used_ips.add(ip)
+    for guest_mac, ip in (r.hgetall("topology:guest_ips") or {}).items():
+        if guest_mac.lower() != mac.lower() and ip:
+            used_ips.add(ip)
+
+    # Calculate a new IP, skipping stale topology entries and active leases.
+    for _ in range(10, 251):
+        next_index = r.incr("dhcp:next_ip")
+        # If next_index was empty and initialized by incr, start at 10
+        if next_index == 1:
+            r.set("dhcp:next_ip", 10)
+            next_index = 10
+
+        if next_index > 250:
+            print("¡El Pool de direcciones DHCP está agotado (Límite 250)!")
+            return None
+
+        new_ip = f"10.0.0.{next_index}"
+        if new_ip in used_ips:
+            print(f"[{mac}] IP {new_ip} ya está ocupada; probando la siguiente.")
+            continue
+
+        r.set(f"dhcp:bind:{mac}", new_ip)
+        # Registrar también en el listado general de Topología a futuro
+        r.hset("topology:guest_ips", mac, new_ip)
+        return new_ip
+
+    print("¡El Pool de direcciones DHCP está agotado o retenido por entradas existentes!")
+    return None
 
 def get_local_dpid():
     global LOCAL_DPID
