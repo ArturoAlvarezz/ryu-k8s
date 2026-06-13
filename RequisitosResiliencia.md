@@ -52,6 +52,7 @@ La arquitectura SDN distribuida sobre K3s/GNS3 debe mantener la conectividad ent
 - Cada prueba evalúa un solo tipo de caída a la vez. No se mezclan dos escenarios de caída en la misma prueba.
 - Solo se cae un nodo a la vez. No se provocan caídas simultáneas de múltiples nodos.
 - Debe probarse con pares de Smart Meters distintos para cada escenario de caída, de modo que se cubran diferentes caminos dentro del anillo.
+- Para las pruebas de caída de un control plane o de caída de un Smart Meter, el par de Smart Meters elegido para el ping debe tener como camino el nodo que se va a apagar. Esto permite demostrar que el ping se interrumpe ante la caída y se restablece después de que la arquitectura reconverja y genere un nuevo camino para el tráfico. Aplica también al master, ya que el master es un control plane.
 
 ### Configuración
 
