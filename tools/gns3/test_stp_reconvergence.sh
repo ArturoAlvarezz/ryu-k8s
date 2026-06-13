@@ -57,15 +57,15 @@ declare -A NODES=(
 )
 NODES_ORDER=(master control-2 control-3 worker-24cf41 worker-b0ff27 worker-b56b35 worker-ea7e34 worker-ef72ea)
 
-DPID_TO_NAME=(
-    [000042f5e5b0ff27]=worker-b0ff27
-    [0000969c1d49e584]=control-3
-    [00008efc06ea7e34]=worker-ea7e34
-    [00003aa74e404786]=control-2
-    [000062ceca24cf41]=worker-24cf41
-    [00008636f75c06d4]=master
-    [0000fedca2b56b35]=worker-b56b35
-    [0000462f37ef72ea]=worker-ef72ea
+declare -A DPID_TO_NAME=(
+    ["000042f5e5b0ff27"]=worker-b0ff27
+    ["0000969c1d49e584"]=control-3
+    ["00008efc06ea7e34"]=worker-ea7e34
+    ["00003aa74e404786"]=control-2
+    ["000062ceca24cf41"]=worker-24cf41
+    ["00008636f75c06d4"]=master
+    ["0000fedca2b56b35"]=worker-b56b35
+    ["0000462f37ef72ea"]=worker-ef72ea
 )
 
 # Obtener el pod de ovs-sdn-initializer que corre en un nodo especifico
@@ -173,14 +173,17 @@ test_sdn_connectivity() {
         fi
     done
 
-    # Construir grafo y verificar conectividad
+    # Construir lista de edges (pares de IPs) y contar tunnels
     local all_tunnels_count=0
+    local edges=""
     for node_name in "${NODES_ORDER[@]}"; do
         local node_ip="${NODES[$node_name]}"
         for t in ${tunnels_by_node[$node_name]}; do
             if [[ "$t" =~ ^vx192168122([0-9]+)$ ]]; then
                 local last_octet="${BASH_REMATCH[1]}"
                 local remote_ip="192.168.122.$last_octet"
+                edges="$edges
+$node_ip|$remote_ip"
                 all_tunnels_count=$((all_tunnels_count + 1))
             fi
         done
@@ -192,9 +195,9 @@ test_sdn_connectivity() {
         fail "Muy pocos tuneles VXLAN ($all_tunnels_count). Topologia fragmentada."
     fi
 
-    # BFS desde master
+    # BFS desde master usando la lista de edges
     local master_ip="192.168.122.100"
-    local visited=" $master_ip "
+    local visited="|$master_ip|"
     local queue="$master_ip"
     local iter=0
 
@@ -204,25 +207,23 @@ test_sdn_connectivity() {
         queue="${queue#* }"
         [ "$current" = "$queue" ] && queue=""
 
-        for node_name in "${NODES_ORDER[@]}"; do
-            local node_ip="${NODES[$node_name]}"
-            for t in ${tunnels_by_node[$node_name]}; do
-                if [[ "$t" =~ ^vx192168122([0-9]+)$ ]]; then
-                    local last_octet="${BASH_REMATCH[1]}"
-                    local remote_ip="192.168.122.$last_octet"
-                    if [ "$node_ip" = "$current" ] && [[ "$visited" != *" $remote_ip "* ]]; then
-                        visited="$visited$remote_ip "
-                        queue="$queue $remote_ip"
-                    fi
-                fi
-            done
-        done
+        # Buscar todos los neighbors de current en los edges
+        while IFS='|' read -r src dst; do
+            [ -z "$src" ] && continue
+            if [ "$src" = "$current" ] && [[ "$visited" != *"|$dst|"* ]]; then
+                visited="$visited$dst|"
+                queue="$queue $dst"
+            elif [ "$dst" = "$current" ] && [[ "$visited" != *"|$src|"* ]]; then
+                visited="$visited$src|"
+                queue="$queue $src"
+            fi
+        done <<< "$edges"
     done
 
     local reachable_count=0
     for node_name in "${NODES_ORDER[@]}"; do
         local node_ip="${NODES[$node_name]}"
-        if [[ "$visited" == *" $node_ip "* ]]; then
+        if [[ "$visited" == *"|$node_ip|"* ]]; then
             reachable_count=$((reachable_count + 1))
         fi
     done
