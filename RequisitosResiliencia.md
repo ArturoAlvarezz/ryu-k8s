@@ -125,3 +125,46 @@ Un problema identificado previamente fue que STP bloqueaba ciertos caminos físi
 **Solución aplicada**: Se configuraron los costes STP para privilegiar las conexiones de los control planes hacia `Mgmt-STP-Switch` (coste 20) sobre las conexiones de los workers (coste 40). De esta forma, STP prefiere mantener activos los enlaces de los control planes y bloquea preferentemente enlaces entre workers, reduciendo la cantidad de túneles VXLAN bloqueados y mejorando la conectividad general entre Smart Meters.
 
 Esta configuración debe mantenerse durante las pruebas de resiliencia para garantizar que la reconvergencia STP no bloquee caminos críticos para la red SDN.
+
+## Resultados de Pruebas de Resiliencia
+
+### Resumen de Escenarios
+
+| Escenario | Descripción | Resultado | Detalles |
+|-----------|-------------|-----------|----------|
+| 1.1 | Caída Master-1 (control-plane primario) | OK | Ping recupera automáticamente tras failover Redis y reconvergencia STP (~5 min) |
+| 1.2 | Caída control-2 (control-plane secundario) | OK | Ping recupera automáticamente (~5 min) |
+| 2 | Caída worker-b56b35 | FALLA | Ping no recupera en 500s; arquitectura no reconverge automáticamente cuando el worker caído es parte indispensable del camino |
+| 3 | Caída enlace ens5 en worker-b56b35 | FALLA | Ping no recupera en 180s; VXLAN persiste por reachabilidad alterna y no se recalcula ruta |
+| 4 | Caída completa (todos los nodos) | OK | Recuperación automática tras ~7 minutos |
+
+### Análisis de Escenarios Fallidos
+
+#### Escenario 2: Caída de Worker
+
+**Problema identificado**: Cuando un worker falla, las entradas `mac_to_port` en otros switches siguen apuntando al túnel VXLAN del worker muerto. Los flujos instalados envían tráfico al peer caído. Los paquetes no generan `packet-in` porque匹配 flujos existentes, por lo que Ryu nunca recalcula la ruta.
+
+**Solución implementada** (commit `a403fd55`):
+- Ryu publica el DPID del switch muerto al canal Redis `switch:dead`
+- Todos los Ryu instances suscritos borran sus entradas `mac_to_port` que apuntan al peer muerto
+- El handler de flow stats también limpia `mac_to_port` al eliminar flujos hacia peers inactivos
+- El monitor detecta switches no responsivos tras 3 запросов fallidos y transmite proactivamente la muerte
+- Packet-in verifica liveness del puerto de salida antes de instalar flujos VXLAN
+
+#### Escenario 3: Caída de Enlace
+
+**Problema identificado**: Cuando un enlace físico falla, el túnel VXLAN puede persistir si hay reachabilidad de red alterna (ej. via `Mgmt-STP-Switch`). El grafo de adyacencia aún tiene el arco antiguo. Los paquetes no generan `packet-in` porque los flujos existentes redirigen el tráfico, y STP no recalcula la ruta SDN.
+
+**Interacción STP-VXLAN**: Los túneles VXLAN se crean sobre enlaces físicos `forwarding`. Si STP bloquea un enlace entre workers pero permite la comunicación IP (via Mgmt-STP-Switch), el túnel persiste. Cuando el enlace directo cae, la comunicación IP puede seguir via el switch de gestión, manteniendo el túnel VXLAN activo incluso cuando el camino físico ya no existe.
+
+**Consideraciones**: Este escenario es fundamentalmente difícil en una topología anillo donde cada par de nodos tiene exactamente un camino físico. Si el único enlace entre dos segmentos del anillo se cae, no existe ruta alternativa física para el tráfico SDN.
+
+### Decisiones Arquitectónicas
+
+1. **Propagación de muerte de switch**: Implementada via Redis pub/sub (`switch:dead`). Cuando un switch muere, todas las instancias Ryu limpian sus tablas `mac_to_port` hacia ese switch.
+
+2. **Fallback de flooding**: Cuando se detecta que el puerto de salida es hacia un peer muerto, se cae a flooding en lugar de instalar un flujo inútil.
+
+3. **Monitor de responsividad**: Cada 5 segundos, Ryu envía stats requests a sus switches. Tras 3 fallos consecutivos, se considera el switch muerto y se transmite su muerte.
+
+4. **VXLAN y STP**: Los túneles VXLAN se crean sobre enlaces físicos en estado `forwarding`. La arquitectura permite fallback vía `Mgmt-STP-Switch` cuando no hay forwarding directo pero ambos nodos tienen forwarding hacia el switch de gestión.
