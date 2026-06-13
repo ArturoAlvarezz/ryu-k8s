@@ -119,6 +119,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.monitor_thread = hub.spawn(self._monitor_datapaths)
         self.metrics_thread = hub.spawn(self._start_metrics_server)
         self.security_sync_thread = hub.spawn(self._sync_quarantine_flows)
+        self.dead_switch_sub_thread = hub.spawn(self._subscribe_dead_switches)
 
     def _record_redis_metric(self, operation, status, duration):
         key = (str(operation), str(status))
@@ -127,6 +128,77 @@ class DistributedL2Switch(app_manager.RyuApp):
         metric["seconds"] += duration
         if duration > metric["max"]:
             metric["max"] = duration
+
+    def _subscribe_dead_switches(self):
+        try:
+            sub = self.redis.pubsub()
+            sub.subscribe("switch:dead")
+            self.logger.info("Subscribed to switch:dead channel for dead switch propagation")
+            while True:
+                try:
+                    msg = sub.get_message(timeout=1.0)
+                    if msg and msg["type"] == "message":
+                        raw_dpid = msg["data"]
+                        self._clear_mac_to_port_for_dead_switch(raw_dpid)
+                except redis.RedisError as e:
+                    self.logger.warning("Redis error in dead switch subscriber: %s", e)
+                except Exception as e:
+                    self.logger.warning("Unexpected error in dead switch subscriber: %s", e)
+                hub.sleep(0.5)
+        except Exception as e:
+            self.logger.warning("Failed to subscribe to dead switch channel: %s", e)
+
+    def _clear_mac_to_port_for_dead_switch(self, raw_dpid):
+        try:
+            target_dpid = self._raw_dpid_to_decimal(raw_dpid)
+            self.logger.info("Clearing mac_to_port entries for dead switch %s", target_dpid)
+            self._cache_delete_prefix("path_next_hop:")
+            for dpid in list(self.datapaths.keys()):
+                mac_table_key = f"mac_to_port:{dpid}"
+                try:
+                    macs = self.redis.hkeys(mac_table_key) or []
+                except redis.RedisError:
+                    continue
+                for mac in macs:
+                    try:
+                        port = self.redis.hget(mac_table_key, mac)
+                    except redis.RedisError:
+                        continue
+                    if not port:
+                        continue
+                    try:
+                        ports = self._get_switch_ports(dpid)
+                    except redis.RedisError:
+                        continue
+                    port_name = str(ports.get(str(port), ""))
+                    if port_name.startswith("vx"):
+                        peer_ip = port_name[2:]
+                        ip_to_dpid = {
+                            str(ip).replace(".", ""): self._raw_dpid_to_decimal(k)
+                            for k, ip in self._get_node_ips().items()
+                        }
+                        peer_dpid = ip_to_dpid.get(peer_ip)
+                        if peer_dpid == target_dpid:
+                            try:
+                                self.redis.hdel(mac_table_key, mac)
+                                self.logger.info(
+                                    "Cleared mac_to_port for dead switch: dpid=%s mac=%s port=%s",
+                                    dpid, mac, port,
+                                )
+                            except redis.RedisError:
+                                pass
+                try:
+                    self.redis.delete(f"mac_to_port:{target_dpid}")
+                except redis.RedisError:
+                    pass
+        except Exception as e:
+            self.logger.warning("Error clearing mac_to_port for dead switch %s: %s", raw_dpid, e)
+
+    def _publish_switch_dead(self, raw_dpid):
+        try:
+            self.redis.publish("switch:dead", raw_dpid)
+        except redis.RedisError as e:
+            self.logger.warning("Failed to publish switch:dead for %s: %s", raw_dpid, e)
 
     def _is_metrics_exporter(self):
         return not METRICS_EXPORTER_NODE or NODE_NAME == METRICS_EXPORTER_NODE
@@ -444,6 +516,10 @@ class DistributedL2Switch(app_manager.RyuApp):
             if datapath.id is None:
                 return
             dpid = datapath.id
+            raw_dpid = self._decimal_dpid_to_raw(dpid)
+            self.logger.info("Switch disconnected, broadcasting death: dpid=%s", dpid)
+            self._publish_switch_dead(raw_dpid)
+            self._clear_mac_to_port_for_dead_switch(raw_dpid)
             self.datapaths.pop(dpid, None)
             self.installed_flows.pop(dpid, None)
             self.port_stats = {
@@ -451,13 +527,9 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if key[0] != dpid
             }
             self.logger.info("Switch disconnected, removing from Redis: dpid=%s", dpid)
-            
-            try:
-                # Borrar de la lista global de switches
-                self.redis.srem('topology:switches', dpid)
 
-                # Node metadata is owned by ovs-sdn-initializer heartbeats; do
-                # not delete it here on transient OpenFlow reconnects.
+            try:
+                self.redis.srem('topology:switches', dpid)
                 self.redis.delete(f"mac_to_port:{dpid}")
                 self.redis.delete(f"switch_ports:{dpid}")
                 self._cache_delete_prefix(f"switch_ports:{dpid}")
@@ -767,33 +839,61 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         # Install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
-            # Distributed Control Logic: Use Redis Locks to prevent two replicas
-            # from attempting to write contradictory flow rules for the same 
-            # Packet-In event. A lock unique to (dpid, src, dst) ensures safety.
-            lock_name = f"lock:flow:{dpid}:{src}:{dst}"
-            lock = None
-            acquired = False
-            try:
-                lock = self.redis.lock(lock_name, timeout=5, blocking_timeout=1)
-                acquired = lock.acquire()
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while acquiring flow lock %s: %s", lock_name, e)
-            if acquired:
-                try:
-                    match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-                    # Verify if a valid buffer_id is available
-                    if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                        self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                        return
-                    else:
-                        self.add_flow(datapath, 1, match, actions)
-                finally:
+            out_port_name = str(ports.get(str(out_port), ""))
+            if out_port_name.startswith("vx"):
+                peer_ip = out_port_name[2:]
+                node_ips = self._get_node_ips()
+                ip_to_dpid = {
+                    str(ip).replace(".", ""): self._raw_dpid_to_decimal(k)
+                    for k, ip in node_ips.items()
+                }
+                peer_dpid = ip_to_dpid.get(peer_ip)
+                if peer_dpid and not self._is_switch_alive(peer_dpid):
+                    self.logger.info(
+                        "Output port is VXLAN to dead switch: dpid=%s mac=%s port=%s peer=%s. Clearing MAC entry.",
+                        dpid, dst, out_port, peer_dpid,
+                    )
                     try:
-                        lock.release()
-                    except redis.RedisError as e:
-                        self.logger.warning("Redis unavailable while releasing flow lock %s: %s", lock_name, e)
-            else:
-                self.logger.info("Flow mod for %s->%s on %s is concurrently handled by another replica", src, dst, dpid)
+                        self.redis.hdel(mac_table_key, dst)
+                    except redis.RedisError:
+                        pass
+                    out_port = ofproto.OFPP_FLOOD
+                    actions = []
+                    for port_no, port_name in ports.items():
+                        try:
+                            port_no_int = int(port_no)
+                        except Exception:
+                            continue
+                        if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
+                            continue
+                        actions.append(parser.OFPActionOutput(port_no_int))
+                    if in_port != ofproto.OFPP_LOCAL:
+                        actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
+
+            if out_port != ofproto.OFPP_FLOOD:
+                lock_name = f"lock:flow:{dpid}:{src}:{dst}"
+                lock = None
+                acquired = False
+                try:
+                    lock = self.redis.lock(lock_name, timeout=5, blocking_timeout=1)
+                    acquired = lock.acquire()
+                except redis.RedisError as e:
+                    self.logger.warning("Redis unavailable while acquiring flow lock %s: %s", lock_name, e)
+                if acquired:
+                    try:
+                        match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+                        if msg.buffer_id != ofproto.OFP_NO_BUFFER:
+                            self.add_flow(datapath, 1, match, actions, msg.buffer_id)
+                            return
+                        else:
+                            self.add_flow(datapath, 1, match, actions)
+                    finally:
+                        try:
+                            lock.release()
+                        except redis.RedisError as e:
+                            self.logger.warning("Redis unavailable while releasing flow lock %s: %s", lock_name, e)
+                else:
+                    self.logger.info("Flow mod for %s->%s on %s is concurrently handled by another replica", src, dst, dpid)
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
@@ -804,6 +904,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         datapath.send_msg(out)
 
     def _monitor_datapaths(self):
+        unresponsive = {}
         while True:
             self.logger.debug("Ryu monitor heartbeat: datapaths=%d", len(self.datapaths))
             for datapath in list(self.datapaths.values()):
@@ -812,8 +913,16 @@ class DistributedL2Switch(app_manager.RyuApp):
                     datapath.send_msg(parser.OFPPortDescStatsRequest(datapath, 0))
                     datapath.send_msg(parser.OFPFlowStatsRequest(datapath))
                     datapath.send_msg(parser.OFPPortStatsRequest(datapath, 0, datapath.ofproto.OFPP_ANY))
+                    unresponsive.pop(datapath.id, None)
                 except Exception as e:
                     self.logger.warning("Error requesting OpenFlow stats: %s", e)
+                    unresponsive[datapath.id] = unresponsive.get(datapath.id, 0) + 1
+                    if unresponsive[datapath.id] >= 3:
+                        raw_dpid = self._decimal_dpid_to_raw(datapath.id)
+                        self.logger.warning("Switch %s unresponsive, broadcasting death", datapath.id)
+                        self._publish_switch_dead(raw_dpid)
+                        self._clear_mac_to_port_for_dead_switch(raw_dpid)
+                        unresponsive.pop(datapath.id, None)
             hub.sleep(MONITOR_INTERVAL_SECONDS)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
@@ -857,6 +966,13 @@ class DistributedL2Switch(app_manager.RyuApp):
                 "Deleted flow using inactive VXLAN peer: dpid=%s priority=%s match=%s",
                 dpid, stat.priority, stat.match,
             )
+            eth_dst = stat.match.get("eth_dst", "")
+            if eth_dst:
+                try:
+                    self.redis.hdel(f"mac_to_port:{dpid}", eth_dst)
+                    self.logger.info("Cleared mac_to_port for deleted flow: dpid=%s mac=%s", dpid, eth_dst)
+                except redis.RedisError as e:
+                    self.logger.warning("Redis error clearing mac_to_port for flow delete: %s", e)
         # Exclude table-miss when reporting installed forwarding flows.
         self.installed_flows[dpid] = sum(1 for stat in ev.msg.body if stat.priority > 0)
 
