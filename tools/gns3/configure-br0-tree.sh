@@ -9,8 +9,8 @@ ALL_PORTS=${ALL_PORTS:-"ens3 ens4 ens5 ens6"}
 STP_PORTS=${STP_PORTS:-$ALL_PORTS}
 PREFERRED_STP_PORTS=${PREFERRED_STP_PORTS:-$STP_PORTS}
 BR_PRIORITY=${BR_PRIORITY:-32768}
-STP_LOW_COST=${STP_LOW_COST:-10}
-STP_HIGH_COST=${STP_HIGH_COST:-$STP_LOW_COST}
+STP_LOW_COST=${STP_LOW_COST:-4}
+STP_HIGH_COST=${STP_HIGH_COST:-200}
 STP_EXPECTED_ROOT_PREFIX=${STP_EXPECTED_ROOT_PREFIX:-0000.}
 STP_STABLE_SECONDS=${STP_STABLE_SECONDS:-10}
 NODE_PREFIX=${NODE_PREFIX:-24}
@@ -75,8 +75,8 @@ ALL_PORTS=${ALL_PORTS:-"ens3 ens4 ens5 ens6"}
 STP_PORTS=${STP_PORTS:-$ALL_PORTS}
 PREFERRED_STP_PORTS=${PREFERRED_STP_PORTS:-$STP_PORTS}
 BR_PRIORITY=${BR_PRIORITY:-32768}
-STP_LOW_COST=${STP_LOW_COST:-10}
-STP_HIGH_COST=${STP_HIGH_COST:-$STP_LOW_COST}
+STP_LOW_COST=${STP_LOW_COST:-4}
+STP_HIGH_COST=${STP_HIGH_COST:-200}
 STP_EXPECTED_ROOT_PREFIX=${STP_EXPECTED_ROOT_PREFIX:-0000.}
 STP_STABLE_SECONDS=${STP_STABLE_SECONDS:-10}
 NODE_PREFIX=${NODE_PREFIX:-24}
@@ -190,10 +190,14 @@ for iface in $STP_PORTS; do
   if ip link show "$iface" >/dev/null 2>&1; then
     ip link set "$iface" master br0 2>/dev/null || true
     ip link set "$iface" up
+    # Los PREFERRED_STP_PORTS son los puertos que conectan con el mgmt-switch.
+    # Les asignamos coste ALTO para que STP los bloquee primero, manteniendo
+    # los enlaces internos del anillo SDN (coste bajo) en forwarding.
+    # Asi evitamos que STP bloquee conexiones criticas de la red SDN.
     if is_preferred_stp_port "$iface"; then
-      bridge link set dev "$iface" cost "$STP_LOW_COST" 2>/dev/null || true
-    else
       bridge link set dev "$iface" cost "$STP_HIGH_COST" 2>/dev/null || true
+    else
+      bridge link set dev "$iface" cost "$STP_LOW_COST" 2>/dev/null || true
     fi
   else
     echo "configure-br0-tree: expected interface $iface not found on $HOSTNAME" >&2

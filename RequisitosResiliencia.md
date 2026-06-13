@@ -77,6 +77,10 @@ La arquitectura SDN distribuida sobre K3s/GNS3 debe mantener la conectividad ent
 
 Los nodos solo pueden comunicarse con sus vecinos directos, simulando una arquitectura física real. No se permiten túneles VXLAN multi-salto a través de nodos intermedios.
 
+### Túneles VXLAN solo sobre enlaces STP forwarding
+
+Los túneles VXLAN solo pueden crearse sobre enlaces físicos que STP mantiene en estado `forwarding`. No es realista desplegar túneles VXLAN sobre enlaces que STP ha bloqueado, ya que en una arquitectura real STP garantiza que no haya loops en L2 y bloquear un enlace significa que el tráfico L2 entre esos dos nodos no está permitido por la red física.
+
 ### Topología fija de tipo anillo
 
 - La topología física del proyecto GNS3 no puede modificarse.
@@ -120,9 +124,27 @@ Los nodos solo pueden comunicarse con sus vecinos directos, simulando una arquit
 
 ### Interacción entre STP y VXLAN
 
-Un problema identificado previamente fue que STP bloqueaba ciertos caminos físicos que luego impedían la creación de túneles VXLAN necesarios para la comunicación entre Smart Meters. Esto ocurría porque `ovs-sdn-initializer` solo crea túneles VXLAN sobre enlaces que están en estado `forwarding` según STP.
+Un problema identificado previamente fue que STP bloqueaba ciertos caminos físicos **dentro del anillo SDN** que luego impedían la creación de túneles VXLAN necesarios para la comunicación entre Smart Meters. Esto ocurría porque `ovs-sdn-initializer` solo crea túneles VXLAN sobre enlaces que están en estado `forwarding` según STP. El resultado era que la topología SDN quedaba dividida en 3 segmentos desconectados (master-segmento, control-2-segmento, control-3-segmento) sin posibilidad de comunicación entre ellos.
 
-**Solución aplicada**: Se configuraron los costes STP para privilegiar las conexiones de los control planes hacia `Mgmt-STP-Switch` (coste 20) sobre las conexiones de los workers (coste 40). De esta forma, STP prefiere mantener activos los enlaces de los control planes y bloquea preferentemente enlaces entre workers, reduciendo la cantidad de túneles VXLAN bloqueados y mejorando la conectividad general entre Smart Meters.
+**Solución aplicada**: Se reconfiguraron los costes STP para que STP **bloquee primero los enlaces hacia el `Mgmt-STP-Switch`** (coste 200) en lugar de bloquear enlaces internos del anillo SDN (coste 4). De esta forma:
+
+- Los enlaces internos del anillo SDN permanecen en `forwarding`, permitiendo que `ovs-sdn-initializer` cree túneles VXLAN entre todos los nodos.
+- STP bloquea 2 de 3 enlaces al `Mgmt-STP-Switch`, manteniendo solo 1 activo para garantizar salida a internet/red de gestión.
+- Al menos un control plane (master, control-2 o control-3) queda con conexión activa al switch.
+- Los túneles VXLAN se crean exclusivamente entre vecinos físicos directos con STP `forwarding`, respetando la regla arquitectónica de no desplegar túneles sobre enlaces bloqueados.
+
+**Costes configurados:**
+- `STP_NODE_LINK_COST=4` (enlaces internos del anillo SDN entre nodos K3s)
+- `STP_SWITCH_CONTROL_COST=200` (enlaces de control planes hacia Mgmt-STP-Switch)
+- `STP_SWITCH_WORKER_COST=200` (enlaces de workers hacia Mgmt-STP-Switch, si los hubiera)
+- `STP_UNKNOWN_LINK_COST=80` (enlaces a switches L2 simples sin LLDP)
+
+**Validación de STP**: Se agregó la función `validate_stp_state()` en `ovs-sdn-initializer` que publica el estado de STP a Redis (`topology:stp_state:{dpid}`) y emite alertas cuando:
+- El root bridge no es `0000.*` (no es el Mgmt-STP-Switch)
+- Ningún puerto está en forwarding
+- Un control plane no tiene root port hacia el mgmt-switch
+
+**Tolerancia ante caídas**: Esta configuración debe garantizar la reconvergencia STP cuando un control plane conectado al switch cae. STP debe detectar la pérdida y abrir el camino de otro control plane al switch. Las pruebas de resiliencia validan este comportamiento.
 
 Esta configuración debe mantenerse durante las pruebas de resiliencia para garantizar que la reconvergencia STP no bloquee caminos críticos para la red SDN.
 
@@ -137,6 +159,16 @@ Esta configuración debe mantenerse durante las pruebas de resiliencia para gara
 | 2 | Caída worker-b56b35 | FALLA | Ping no recupera en 500s; arquitectura no reconverge automáticamente cuando el worker caído es parte indispensable del camino |
 | 3 | Caída enlace ens5 en worker-b56b35 | FALLA | Ping no recupera en 180s; VXLAN persiste por reachabilidad alterna y no se recalcula ruta |
 | 4 | Caída completa (todos los nodos) | OK | Recuperación automática tras ~7 minutos |
+
+### Pruebas de Validación STP
+
+Adicionalmente, se incluyen pruebas automatizadas de validación STP en `tools/gns3/test_stp_reconvergence.sh` que verifican:
+
+1. **Topología STP esperada**: Que STP bloquea primero los enlaces al Mgmt-STP-Switch (coste 200) antes que los enlaces internos del anillo SDN (coste 4).
+2. **Conectividad SDN completa**: Que todos los nodos del anillo SDN pueden comunicarse via túneles VXLAN.
+3. **Reconvergencia ante caída de control plane**: Que cuando un control plane conectado al switch cae, otro control plane toma el rol sin pérdida de conectividad.
+4. **Validación de costes**: Que los costes STP están configurados correctamente en cada nodo.
+5. **Estado STP en Redis**: Que el estado STP se publica correctamente para monitoreo.
 
 ### Análisis de Escenarios Fallidos
 

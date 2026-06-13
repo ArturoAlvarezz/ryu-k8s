@@ -53,6 +53,12 @@ spec:
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
+      dnsConfig:
+        nameservers:
+        - 10.43.0.10
+        options:
+        - name: ndots
+          value: "2"
       containers:
       - name: ovs-configurator
         image: arturoalvarez/ovs-sdn-initializer:latest
@@ -139,8 +145,8 @@ spec:
             LLDP_KV="$1"
             role=$(node_role)
             node_link_cost=${STP_NODE_LINK_COST:-4}
-            switch_control_cost=${STP_SWITCH_CONTROL_COST:-20}
-            switch_worker_cost=${STP_SWITCH_WORKER_COST:-40}
+            switch_control_cost=${STP_SWITCH_CONTROL_COST:-200}
+            switch_worker_cost=${STP_SWITCH_WORKER_COST:-200}
             unknown_cost=${STP_UNKNOWN_LINK_COST:-80}
 
             for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
@@ -166,6 +172,66 @@ spec:
                 echo "STP cost $stp_intf=$cost ($reason role=$role)"
               fi
             done
+          }
+
+          # Validar el estado de STP y publicar en Redis.
+          # Detecta cuando STP no ha convergido y alerta sobre problemas de
+          # reconvergencia que podrían dejar al nodo sin salida al mgmt-switch.
+          validate_stp_state() {
+            [ -n "$MASTER_IP" ] && [ -n "$DPID" ] || return 0
+            [ -n "$MASTER_IP" ] && redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1 || return 0
+
+            local root_id root_ok
+            root_id=$(cat /sys/class/net/br0/bridge/root_id 2>/dev/null || echo "")
+            root_ok=0
+            if [ -n "$root_id" ]; then
+              case "$root_id" in
+                0000.*) root_ok=1 ;;
+              esac
+            fi
+
+            local forwarding=0 blocking=0 disabled=0 listening=0 learning=0
+            local mgmt_forwarding=0
+            for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
+              local state
+              state=$(cat "/sys/class/net/br0/brif/$stp_intf/state" 2>/dev/null | tr -d ' \n\r' || echo "")
+              case "$state" in
+                0) disabled=$((disabled+1)) ;;
+                1) listening=$((listening+1)) ;;
+                2) learning=$((learning+1)) ;;
+                3)
+                  forwarding=$((forwarding+1))
+                  if is_root_port "$stp_intf"; then
+                    mgmt_forwarding=$((mgmt_forwarding+1))
+                  fi
+                  ;;
+                4) blocking=$((blocking+1)) ;;
+              esac
+            done
+
+            # Publicar estado de STP en Redis para monitoreo
+            redis-cli -h "$MASTER_IP" HSET "topology:stp_state:${DPID}" \
+              "root_id" "$root_id" \
+              "root_ok" "$root_ok" \
+              "forwarding" "$forwarding" \
+              "blocking" "$blocking" \
+              "disabled" "$disabled" \
+              "listening" "$listening" \
+              "learning" "$learning" \
+              "mgmt_forwarding" "$mgmt_forwarding" \
+              "role" "${role:-unknown}" \
+              "timestamp" "$(date +%s)" > /dev/null 2>&1 || true
+
+            # Alertar si STP no ha convergido correctamente
+            if [ "$root_ok" = "0" ]; then
+              echo "ALERTA STP: root_id no es 0000.* (actual: $root_id)"
+            fi
+            if [ "$forwarding" = "0" ] && [ "$disabled" = "0" ]; then
+              echo "ALERTA STP: ningun puerto en forwarding (forwarding=$forwarding blocking=$blocking listening=$listening learning=$learning)"
+            fi
+            if [ "$role" = "control-plane" ] && [ "$mgmt_forwarding" = "0" ]; then
+              echo "ALERTA STP: control-plane $NODE_NAME sin root port hacia mgmt-switch (root_port=$mgmt_forwarding)"
+            fi
           }
 
           wait_for_management_plane
@@ -293,8 +359,9 @@ spec:
             LOCAL_FORWARDING_PEERS=""
             LLDP_KV=$(lldpcli show neighbors -f keyvalue 2>/dev/null || true)
             apply_dynamic_stp_costs "$LLDP_KV"
+            validate_stp_state
             for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
-              STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null || echo "")
+              STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null | tr -d ' \n\r' || echo "")
               [ "$STATE_NUM" = "3" ] || continue
               remote_ip=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
               if [ -n "$remote_ip" ] && [ "$remote_ip" != "$MY_IP" ]; then
@@ -327,29 +394,54 @@ spec:
             done
             VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
 
-            # Fallback: si el grafo de forwarding directo está particionado, permitir túneles
-            # VXLAN vía Mgmt-STP-Switch para nodos que no tienen forwarding directo pero ambos
-            # tienen forwarding hacia el switch de gestión.
-            MY_HAS_MGMT_FORWARDING=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${DPID}:" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 ~ /^forwarding:mgmt-switch/ {print "yes"; exit}')
-
-            if [ "$MY_HAS_MGMT_FORWARDING" = "yes" ]; then
-              ALL_K3S_IPS=$(redis-cli -h "$MASTER_IP" HVALS topology:node_ips 2>/dev/null | grep -E "^192\.168\." || true)
-              for candidate_ip in $ALL_K3S_IPS; do
-                [ "$candidate_ip" != "$MY_IP" ] || continue
-                echo "$VXLAN_PEERS" | grep -qx "$candidate_ip" && continue
-
-                remote_raw=$(redis-cli -h "$MASTER_IP" HGETALL topology:node_ips 2>/dev/null | awk -v ip="$candidate_ip" 'NR % 2 == 1 {key=$0; next} $0 == ip {print key; exit}')
-                [ -n "$remote_raw" ] || continue
-
-                remote_has_mgmt_forwarding=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${remote_raw}:" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 ~ /^forwarding:mgmt-switch/ {print "yes"; exit}')
-
-                if [ "$remote_has_mgmt_forwarding" = "yes" ]; then
-                  echo "Fallback: $candidate_ip alcanzable via Mgmt-STP-Switch (sin forwarding directo)"
-                  VXLAN_PEERS=$(printf '%s\n%s\n' "$VXLAN_PEERS" "$candidate_ip")
-                fi
-              done
-              VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
+            # Fallback: Los peers de fallback se cargan de un archivo persistente y solo se
+            # regeneran si NO hay ningún peer directo (ni LOCAL_FORWARDING_PEERS ni
+            # REDIS_LOCAL_FORWARDING_PEERS) Y Redis está disponible, Y han pasado al menos
+            # 5 iteraciones (~50s) sin descubrir ningún vecino LLDP. Esto evita crear
+            # túneles de fallback en las primeras iteraciones del pod, antes de que lldpd
+            # haya tenido tiempo de descubrir los vecinos directos.
+            FALLBACK_PEERS_FILE="/run/ryu-vx-fallback-peers"
+            FALLBACK_PEERS=""
+            if [ -f "$FALLBACK_PEERS_FILE" ]; then
+              FALLBACK_PEERS=$(cat "$FALLBACK_PEERS_FILE" 2>/dev/null || true)
             fi
+
+            NO_NEIGHBOR_COUNTER_FILE="/run/ryu-no-neighbor-counter"
+            no_neighbor_count=0
+            if [ -f "$NO_NEIGHBOR_COUNTER_FILE" ]; then
+              no_neighbor_count=$(cat "$NO_NEIGHBOR_COUNTER_FILE" 2>/dev/null || echo 0)
+            fi
+            if [ -n "$LOCAL_FORWARDING_PEERS" ] || [ -n "$REDIS_LOCAL_FORWARDING_PEERS" ]; then
+              no_neighbor_count=0
+            else
+              no_neighbor_count=$((no_neighbor_count + 1))
+            fi
+            echo "$no_neighbor_count" > "$NO_NEIGHBOR_COUNTER_FILE"
+
+            if [ -z "$LOCAL_FORWARDING_PEERS" ] && [ -z "$REDIS_LOCAL_FORWARDING_PEERS" ] && [ "$no_neighbor_count" -ge 5 ] && [ -n "$MASTER_IP" ] && redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
+              MY_HAS_MGMT_FORWARDING=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${DPID}:" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 ~ /^forwarding:mgmt-switch/ {print "yes"; exit}')
+
+              if [ "$MY_HAS_MGMT_FORWARDING" = "yes" ]; then
+                ALL_K3S_IPS=$(redis-cli -h "$MASTER_IP" HVALS topology:node_ips 2>/dev/null | grep -E "^192\.168\." || true)
+                for candidate_ip in $ALL_K3S_IPS; do
+                  [ "$candidate_ip" != "$MY_IP" ] || continue
+
+                  remote_raw=$(redis-cli -h "$MASTER_IP" HGETALL topology:node_ips 2>/dev/null | awk -v ip="$candidate_ip" 'NR % 2 == 1 {key=$0; next} $0 == ip {print key; exit}')
+                  [ -n "$remote_raw" ] || continue
+
+                  remote_has_mgmt_forwarding=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${remote_raw}:" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 ~ /^forwarding:mgmt-switch/ {print "yes"; exit}')
+
+                  if [ "$remote_has_mgmt_forwarding" = "yes" ]; then
+                    echo "Fallback: $candidate_ip alcanzable via Mgmt-STP-Switch (sin vecino LLDP directo)"
+                    VXLAN_PEERS=$(printf '%s\n%s\n' "$VXLAN_PEERS" "$candidate_ip")
+                    FALLBACK_PEERS=$(printf '%s\n%s\n' "$FALLBACK_PEERS" "$candidate_ip")
+                  fi
+                done
+                VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
+                FALLBACK_PEERS=$(printf '%s\n' "$FALLBACK_PEERS" | grep -E "^192\.168\." | sort -u || true)
+              fi
+            fi
+            printf '%s\n' "$FALLBACK_PEERS" | grep -E "^192\.168\." | sort -u > "$FALLBACK_PEERS_FILE" 2>/dev/null || true
 
             for remote_ip in $VXLAN_PEERS; do
               # Validar IP
@@ -375,7 +467,11 @@ spec:
 
             for vx_port in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep "^vx" || true); do
               remote_ip=$(echo "$vx_port" | sed -E 's/^vx192168122([0-9]{1,3})$/192.168.122.\1/')
-              if echo "$VXLAN_PEERS" | grep -qx "$remote_ip"; then
+              if echo "$CANDIDATE_VXLAN_PEERS" | grep -qx "$remote_ip"; then
+                rm -f "/run/ryu-vx-stale/${vx_port}" 2>/dev/null || true
+                continue
+              fi
+              if echo "$FALLBACK_PEERS" | grep -qx "$remote_ip"; then
                 rm -f "/run/ryu-vx-stale/${vx_port}" 2>/dev/null || true
                 continue
               fi
@@ -386,6 +482,10 @@ spec:
               misses=$((misses + 1))
               echo "$misses" > "$miss_file"
               if [ "$misses" -ge 4 ]; then
+                if [ -z "$MASTER_IP" ] || ! redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
+                  echo "Redis no disponible; preservando túnel $remote_ip aunque haya perdido vecino LLDP"
+                  continue
+                fi
                 echo "Vecino LLDP perdido: $remote_ip ($vx_port). Eliminando túnel VXLAN obsoleto..."
                 OFPORT=$(ovs-vsctl get Interface "$vx_port" ofport 2>/dev/null || echo "")
                 if echo "$OFPORT" | grep -Eq '^[0-9]+$'; then
