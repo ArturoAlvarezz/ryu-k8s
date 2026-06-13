@@ -330,18 +330,9 @@ spec:
             # Fallback: si el grafo de forwarding directo está particionado, permitir túneles
             # VXLAN vía Mgmt-STP-Switch para nodos que no tienen forwarding directo pero ambos
             # tienen forwarding hacia el switch de gestión.
-            MY_HAS_MGMT_FORWARDING=""
-            for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
-              STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null || echo "")
-              [ "$STATE_NUM" = "3" ] || continue
-              REMOTE_NAME=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.name=" | cut -d= -f2 | head -n 1 || true)
-              if [ "$REMOTE_NAME" = "Mgmt-STP-Switch" ]; then
-                MY_HAS_MGMT_FORWARDING="yes"
-                break
-              fi
-            done
+            MY_HAS_MGMT_FORWARDING=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${DPID}:" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 ~ /^forwarding:mgmt-switch/ {print "yes"; exit}')
 
-            if [ -n "$MY_HAS_MGMT_FORWARDING" ]; then
+            if [ "$MY_HAS_MGMT_FORWARDING" = "yes" ]; then
               ALL_K3S_IPS=$(redis-cli -h "$MASTER_IP" HVALS topology:node_ips 2>/dev/null | grep -E "^192\.168\." || true)
               for candidate_ip in $ALL_K3S_IPS; do
                 [ "$candidate_ip" != "$MY_IP" ] || continue

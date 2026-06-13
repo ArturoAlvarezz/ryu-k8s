@@ -685,6 +685,12 @@ def forwarding_br0_links(redis, dpids, ip_to_dpid):
     }
 
 
+def vxlan_link_allowed(redis, local_dpid, remote_dpid, remote_ip, valid_br0_links):
+    if edge_link_id(local_dpid, remote_dpid) in valid_br0_links:
+        return True
+    return vxlan_peer_state(redis, local_dpid, remote_ip) == "up"
+
+
 def build_sdn_topology(redis):
     dpids = active_switch_dpids(redis)
     node_names = redis.hgetall("topology:node_names") or {}
@@ -759,11 +765,11 @@ def build_sdn_topology(redis):
             if not remote_dpid or remote_dpid not in dpids or str(remote_dpid) == str(dpid):
                 continue
             source, target = sorted([str(dpid), str(remote_dpid)])
-            if edge_link_id(source, target) not in valid_br0_links:
-                continue
             edge_id = f"vxlan:{source}:{target}"
             remote_ip = ".".join([remote_key[0:3], remote_key[3:6], remote_key[6:9], remote_key[9:]]) if len(remote_key) == 12 else remote_key
             state = vxlan_peer_state(redis, dpid, remote_ip)
+            if not vxlan_link_allowed(redis, dpid, remote_dpid, remote_ip, valid_br0_links):
+                continue
             existing = edges_by_id.get(edge_id)
             status = "down" if state == "down" or (existing and existing.get("status") == "down") else ("up" if state == "up" else "unknown")
             edges_by_id[edge_id] = {
@@ -895,7 +901,8 @@ def trace_sdn_path(redis, src_guest, dst_guest):
         if not next_switch or next_switch not in dpids:
             path = []
             break
-        if edge_link_id(current, next_switch) not in valid_br0_links:
+        remote_ip = ".".join([str(port_name)[2:5], str(port_name)[5:8], str(port_name)[8:11], str(port_name)[11:]])
+        if not vxlan_link_allowed(redis, current, next_switch, remote_ip, valid_br0_links):
             path = []
             break
         path.append(next_switch)
@@ -908,8 +915,11 @@ def trace_sdn_path(redis, src_guest, dst_guest):
                 if not str(port_name).startswith("vx"):
                     continue
                 target = ip_to_dpid.get(str(port_name)[2:])
-                if target and target in dpids and edge_link_id(dpid, target) in valid_br0_links:
-                    adjacency[dpid].append(target)
+                if target and target in dpids:
+                    remote_key = str(port_name)[2:]
+                    remote_ip = ".".join([remote_key[0:3], remote_key[3:6], remote_key[6:9], remote_key[9:]]) if len(remote_key) == 12 else remote_key
+                    if vxlan_link_allowed(redis, dpid, target, remote_ip, valid_br0_links):
+                        adjacency[dpid].append(target)
         queue = [(src_switch, [src_switch])]
         seen = {src_switch}
         while queue:

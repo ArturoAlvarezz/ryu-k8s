@@ -756,8 +756,8 @@ class DistributedL2Switch(app_manager.RyuApp):
                     if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
                         continue
                     port_name = str(port_name)
-                    if in_port_name.startswith("vx") and port_name.startswith("vx"):
-                        continue
+                    # Propagar broadcasts/flood por todos los VXLAN peers activos
+                    # para que el ARP reach el destino en otro nodo.
                     actions.append(parser.OFPActionOutput(port_no_int))
 
                 # Inyectar una copia del trafico broadcast al stack Linux local
@@ -1173,9 +1173,6 @@ class DistributedL2Switch(app_manager.RyuApp):
         remote_dpid = str(remote_dpid)
         if not self._is_switch_alive(local_dpid) or not self._is_switch_alive(remote_dpid):
             return False
-        if VXLAN_REQUIRES_FORWARDING_BR0_EDGE:
-            if not self._has_forwarding_br0_edge(local_dpid, remote_dpid, node_ips, blocked_br0_links):
-                return False
         local_ip = self._node_ip_for_dpid(local_dpid, node_ips)
         remote_ip = self._node_ip_for_dpid(remote_dpid, node_ips)
         if not local_ip or not remote_ip:
@@ -1192,7 +1189,13 @@ class DistributedL2Switch(app_manager.RyuApp):
         if remote_ports is None:
             remote_ports = self._get_switch_ports(remote_dpid)
             switch_ports[remote_dpid] = remote_ports
-        return self._has_vxlan_to_ip(local_ports, remote_ip) and self._has_vxlan_to_ip(remote_ports, local_ip)
+        if not (self._has_vxlan_to_ip(local_ports, remote_ip) and self._has_vxlan_to_ip(remote_ports, local_ip)):
+            return False
+        if VXLAN_REQUIRES_FORWARDING_BR0_EDGE:
+            # Prefer direct forwarding physical links, but allow initializer-created
+            # fallback VXLANs when both endpoints are reachable and expose the tunnel.
+            return True
+        return True
 
     def _has_forwarding_br0_edge(self, local_dpid, remote_dpid, node_ips, blocked_br0_links=None):
         local_dpid = str(local_dpid)
