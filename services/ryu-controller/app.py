@@ -308,15 +308,14 @@ class DistributedL2Switch(app_manager.RyuApp):
             if device.get("status") not in ["authorized", "learning"]:
                 return False, "POLICY_BLOCK", f"status_{device.get('status')}"
                 
-            is_tunnel = in_port_name.startswith("vx") or in_port_name in ["br-sdn", "br0"]
             is_local_guest_port = str(in_port_name).startswith("ens") and str(in_port) != "4294967294"
-            if not is_tunnel:
+            if is_local_guest_port:
                 dpid_mismatch = device.get("dpid") and device.get("dpid") != str(dpid)
                 port_mismatch = device.get("in_port") and device.get("in_port") != str(in_port)
-                missing_location = is_local_guest_port and (not device.get("dpid") or not device.get("in_port"))
+                missing_location = not device.get("dpid") or not device.get("in_port")
                 if dpid_mismatch or port_mismatch or missing_location:
                     ip_matches = observed_ip in ("", "0.0.0.0", device.get("ip", ""))
-                    if is_local_guest_port and (is_dhcp_request or ip_matches):
+                    if is_dhcp_request or ip_matches:
                         self._refresh_security_device_location(device, dpid, in_port)
                     elif dpid_mismatch:
                         return False, "MAC_SPOOFING", "dpid_mismatch"
@@ -684,8 +683,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         if (
             src not in known_worker_macs and
             in_port != ofproto.OFPP_LOCAL and
-            not in_port_name.startswith("vx") and
-            in_port_name != "br-sdn"
+            in_port_name.startswith("ens")
         ):
             try:
                 self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")

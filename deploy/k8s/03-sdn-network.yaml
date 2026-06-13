@@ -135,34 +135,13 @@ spec:
             printf '%s' "$role"
           }
 
-          elected_control_plane_gateway() {
-            token_file=/var/run/secrets/kubernetes.io/serviceaccount/token
-            ca_file=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-            if command -v curl >/dev/null 2>&1 && [ -r "$token_file" ] && [ -r "$ca_file" ] && [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
-              token=$(cat "$token_file" 2>/dev/null || true)
-              curl -fsS --connect-timeout 1 --max-time 2 --cacert "$ca_file" \
-                -H "Authorization: Bearer $token" \
-                "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes" 2>/dev/null \
-                | jq -r '
-                    .items[]
-                    | select(.metadata.labels["node-role.kubernetes.io/control-plane"] != null or .metadata.labels["node-role.kubernetes.io/master"] != null)
-                    | {name:.metadata.name, ip:(.status.addresses[]? | select(.type=="InternalIP") | .address)}
-                    | select(.ip != null)
-                    | [.ip, .name] | @tsv
-                  ' 2>/dev/null \
-                | sort -V \
-                | awk 'NR == 1 {print $2}'
-            fi
-          }
-
           apply_dynamic_stp_costs() {
             LLDP_KV="$1"
             role=$(node_role)
             node_link_cost=${STP_NODE_LINK_COST:-4}
+            switch_control_cost=${STP_SWITCH_CONTROL_COST:-20}
             switch_worker_cost=${STP_SWITCH_WORKER_COST:-40}
-            switch_control_cost=${STP_SWITCH_CONTROL_COST:-2000}
             unknown_cost=${STP_UNKNOWN_LINK_COST:-80}
-            control_gateway=$(elected_control_plane_gateway)
 
             for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
               remote_ip=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.mgmt-ip=" | cut -d= -f2 | grep -E "^192\.168\." | head -n 1 || true)
@@ -170,10 +149,7 @@ spec:
                 cost=$node_link_cost
                 reason="k3s-neighbor"
               elif is_root_port "$stp_intf" || printf '%s\n' "$LLDP_KV" | grep -q "^lldp.${stp_intf}.chassis.name=Mgmt-STP-Switch$"; then
-                if [ "$role" = "control-plane" ] && [ -n "$control_gateway" ] && [ "$NODE_NAME" = "$control_gateway" ]; then
-                  cost=$switch_worker_cost
-                  reason="mgmt-switch-elected-control-plane-gateway"
-                elif [ "$role" = "control-plane" ]; then
+                if [ "$role" = "control-plane" ]; then
                   cost=$switch_control_cost
                   reason="mgmt-switch-control-plane"
                 else
@@ -351,6 +327,39 @@ spec:
             done
             VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
 
+            # Fallback: si el grafo de forwarding directo está particionado, permitir túneles
+            # VXLAN vía Mgmt-STP-Switch para nodos que no tienen forwarding directo pero ambos
+            # tienen forwarding hacia el switch de gestión.
+            MY_HAS_MGMT_FORWARDING=""
+            for stp_intf in $(ls /sys/class/net/br0/brif 2>/dev/null || true); do
+              STATE_NUM=$(cat /sys/class/net/br0/brif/$stp_intf/state 2>/dev/null || echo "")
+              [ "$STATE_NUM" = "3" ] || continue
+              REMOTE_NAME=$(printf '%s\n' "$LLDP_KV" | grep "^lldp.${stp_intf}.chassis.name=" | cut -d= -f2 | head -n 1 || true)
+              if [ "$REMOTE_NAME" = "Mgmt-STP-Switch" ]; then
+                MY_HAS_MGMT_FORWARDING="yes"
+                break
+              fi
+            done
+
+            if [ -n "$MY_HAS_MGMT_FORWARDING" ]; then
+              ALL_K3S_IPS=$(redis-cli -h "$MASTER_IP" HVALS topology:node_ips 2>/dev/null | grep -E "^192\.168\." || true)
+              for candidate_ip in $ALL_K3S_IPS; do
+                [ "$candidate_ip" != "$MY_IP" ] || continue
+                echo "$VXLAN_PEERS" | grep -qx "$candidate_ip" && continue
+
+                remote_raw=$(redis-cli -h "$MASTER_IP" HGETALL topology:node_ips 2>/dev/null | awk -v ip="$candidate_ip" 'NR % 2 == 1 {key=$0; next} $0 == ip {print key; exit}')
+                [ -n "$remote_raw" ] || continue
+
+                remote_has_mgmt_forwarding=$(redis-cli -h "$MASTER_IP" HGETALL topology:br0_stp_ports 2>/dev/null | awk -v prefix="${remote_raw}:" 'NR % 2 == 1 {key=$0; next} index(key, prefix) == 1 && $0 ~ /^forwarding:mgmt-switch/ {print "yes"; exit}')
+
+                if [ "$remote_has_mgmt_forwarding" = "yes" ]; then
+                  echo "Fallback: $candidate_ip alcanzable via Mgmt-STP-Switch (sin forwarding directo)"
+                  VXLAN_PEERS=$(printf '%s\n%s\n' "$VXLAN_PEERS" "$candidate_ip")
+                fi
+              done
+              VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
+            fi
+
             for remote_ip in $VXLAN_PEERS; do
               # Validar IP
               if [ -z "$remote_ip" ] || [ "$remote_ip" = "$MY_IP" ]; then continue; fi
@@ -427,7 +436,6 @@ spec:
                 for guest_mac in $(ovs-appctl fdb/show br-sdn 2>/dev/null | awk -v port="$OFPORT" '$1 == port {print $3}'); do
                   if echo "$KNOWN_GUESTS" | grep -qx "$guest_mac"; then
                     redis-cli -h $MASTER_IP HSET "mac_to_port:${DPID_DEC}" "$guest_mac" "$OFPORT" > /dev/null 2>&1 || true
-                    redis-cli -h $MASTER_IP HSET topology:guest_locations "$guest_mac" "${DPID_DEC}:${OFPORT}" > /dev/null 2>&1 || true
                   fi
                 done
               done

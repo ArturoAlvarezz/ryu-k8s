@@ -447,6 +447,7 @@ def observed_guests(redis):
     guest_names = redis.hgetall("topology:guest_names")
     node_names = redis.hgetall("topology:node_names")
     worker_macs = registry.known_worker_macs(redis)
+    registered_macs = {registry.normalize_mac(device.get("mac", "")) for device in registry.list_devices(redis)}
     guests = {}
     active_mac_locations = {}
 
@@ -459,6 +460,9 @@ def observed_guests(redis):
         if redis.exists(f"health:{mac}"):
             return True
         return mac in active_mac_locations
+
+    def guest_is_registered(mac):
+        return mac in registered_macs or bool(registry.get_by_index(redis, registry.KEY_MAC_TO_DEVICE, mac))
 
     def raw_dpid_from(dpid):
         return "0000" + hex(int(dpid))[2:].zfill(12) if str(dpid).isdigit() else str(dpid)
@@ -566,10 +570,14 @@ def observed_guests(redis):
     live_meter_ips = set(meter_by_ip)
 
     rejected_meter_by_ip = {}
+    recent_rejection_cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
     for raw_event in redis.lrange("meter:hmac:events", 0, 199) or []:
         try:
             event = json.loads(raw_event)
+            event_time = datetime.fromisoformat(str(event.get("time", "")).replace("Z", "+00:00"))
         except Exception:
+            continue
+        if event_time < recent_rejection_cutoff:
             continue
         source_ip = str(event.get("source_ip", "")).strip()
         device_id = str(event.get("device_id", "")).strip()
@@ -602,9 +610,11 @@ def observed_guests(redis):
             guest["name"] = guest["telemetry_device_id"]
     current_guests = [
         guest for guest in guests.values()
-        if guest.get("telemetry_device_id")
-        or guest.get("ip") in live_meter_ips
-        or guest.get("port_name") == "registered"
+        if guest.get("ip") in live_meter_ips
+        or (
+            not guest_is_registered(guest["mac"]) and
+            guest.get("telemetry_device_id")
+        )
     ]
     return sorted(current_guests, key=lambda item: (item.get("ip") or "", item["mac"]))
 
