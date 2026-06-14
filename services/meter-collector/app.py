@@ -342,6 +342,8 @@ def sync_security_identity(device_id: str, source_ip: str):
         old_id = device.get("device_id", current_id or device_id)
         old_ip = device.get("ip", "")
         old_mac = registry.normalize_mac(device.get("mac", ""))
+        old_dpid = device.get("dpid", "")
+        old_in_port = device.get("in_port", "")
         observed = _observed_guest_for_ip(redis, source_ip) or {}
         observed_mac = registry.normalize_mac(observed.get("mac", ""))
         device["device_id"] = device_id
@@ -355,8 +357,8 @@ def sync_security_identity(device_id: str, source_ip: str):
             old_id == device_id
             and old_ip == source_ip
             and old_mac == mac
-            and (not observed.get("dpid") or str(device.get("dpid", "")) == str(observed.get("dpid", "")))
-            and (not observed.get("in_port") or str(device.get("in_port", "")) == str(observed.get("in_port", "")))
+            and (not observed.get("dpid") or old_dpid == str(observed.get("dpid", "")))
+            and (not observed.get("in_port") or old_in_port == str(observed.get("in_port", "")))
         ):
             return
         pipe = redis.pipeline()
@@ -375,7 +377,7 @@ def sync_security_identity(device_id: str, source_ip: str):
             pipe.delete(f"security:device:{old_id}")
         pipe.execute()
         _cleanup_recreated_meter(redis, device_id, mac, source_ip)
-        log.info("Registro AMI sincronizado source=%s old_device=%s device=%s", source_ip, old_id, device_id)
+        log.info("Registro AMI sincronizado source=%s old_device=%s device=%s old_dpid=%s new_dpid=%s old_in_port=%s new_in_port=%s", source_ip, old_id, device_id, old_dpid, device.get("dpid"), old_in_port, device.get("in_port"))
     except Exception as e:
         log.warning("No se pudo sincronizar identidad AMI source=%s device=%s: %s", source_ip, device_id, e)
 
@@ -1356,6 +1358,19 @@ def udp_listener():
             reading["source_ip"] = addr[0]
             device_id = reading.get("device_id", "unknown")
             allowed, reason = telemetry_source_authorization(addr[0], str(device_id))
+
+            if not allowed and reason in (
+                "mac_not_registered",
+                "source_not_observed",
+                "port_mismatch",
+                "dpid_mismatch",
+            ):
+                try:
+                    sync_security_identity(str(device_id), addr[0])
+                    allowed, reason = telemetry_source_authorization(addr[0], str(device_id))
+                except Exception as sync_exc:
+                    log.warning("Auto-registro fallido para %s: %s", device_id, sync_exc)
+
             if not allowed:
                 if _is_policy_rejection(reason):
                     _record_policy_rejection(reason, str(device_id), addr[0])

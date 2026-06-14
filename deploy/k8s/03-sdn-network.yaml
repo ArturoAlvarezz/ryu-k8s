@@ -213,6 +213,7 @@ spec:
           COST_INTERVAL=${COST_INTERVAL:-30}
 
           while true; do
+            refresh_table_miss
             refresh_gateway_flows
 
             MY_IP=$(get_br0_ip)

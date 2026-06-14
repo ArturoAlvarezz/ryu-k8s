@@ -814,7 +814,11 @@ class DistributedL2Switch(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         self.datapaths[datapath.id] = datapath
 
-        self.logger.info("Switch connected: dpid=%s ports=%s", datapath.id, ev.msg.ports)
+        try:
+            n_ports = len(ev.msg.ports) if hasattr(ev.msg, 'ports') else 0
+        except Exception:
+            n_ports = 0
+        self.logger.info("Switch connected: dpid=%s ports=%s", datapath.id, n_ports)
 
         try:
             self.redis.sadd("topology:switches", str(datapath.id))
@@ -829,7 +833,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.logger.warning("Redis error registering switch: %s", e)
 
         ports = {}
-        for port_no, port in ev.msg.ports.items():
+        ports_iter = getattr(ev.msg, 'ports', None) or {}
+        for port_no, port in ports_iter.items():
             if port_no > 0xffffff00:
                 continue
             port_name = port.name.decode() if isinstance(port.name, bytes) else port.name

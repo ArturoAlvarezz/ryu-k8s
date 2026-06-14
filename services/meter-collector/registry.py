@@ -197,9 +197,9 @@ def validate_observed_device(redis_client, mac, ip, dpid, in_port):
         return False, f"status_{device['status']}", device
     if device["ip"] != ip:
         return False, "ip_mismatch", device
-    if device["dpid"] and device["dpid"] != str(dpid):
+    if device["dpid"] and str(dpid) and device["dpid"] != str(dpid):
         return False, "dpid_mismatch", device
-    if device["in_port"] and device["in_port"] != str(in_port):
+    if device["in_port"] and str(in_port) and device["in_port"] != str(in_port):
         return False, "port_mismatch", device
     return True, "authorized", device
 
