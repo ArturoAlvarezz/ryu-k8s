@@ -52,7 +52,7 @@ spec:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
         # FIX: IfNotPresent evita intentos de pull fallidos en lab GNS3 aislado sin internet
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         command:
         - /bin/sh
         - -c

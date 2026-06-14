@@ -160,36 +160,95 @@ Esta configuración debe mantenerse durante las pruebas de resiliencia para gara
 | 3 | Caída enlace ens5 en worker-b56b35 | FALLA | Ping no recupera en 180s; VXLAN persiste por reachabilidad alterna y no se recalcula ruta |
 | 4 | Caída completa (todos los nodos) | OK | Recuperación automática tras ~7 minutos |
 
-### Pruebas de Validación STP
+### Estado de Conectividad SDN Actual (Jun 2026: nueva arquitectura sin STP)
 
-Adicionalmente, se incluyen pruebas automatizadas de validación STP en `tools/gns3/test_stp_reconvergence.sh` que verifican:
+Tras eliminar STP del plano SDN (`br-sdn`) y reemplazarlo por MST (Prim) + Dijkstra multi-hop + ARP proxy + flood controlado, se verificó conectividad entre nodos y entre Smart Meters:
 
-1. **Topología STP esperada**: Que STP bloquea primero los enlaces al Mgmt-STP-Switch (coste 200) antes que los enlaces internos del anillo SDN (coste 4).
-2. **Conectividad SDN completa**: Que todos los nodos del anillo SDN pueden comunicarse via túneles VXLAN.
-3. **Reconvergencia ante caída de control plane**: Que cuando un control plane conectado al switch cae, otro control plane toma el rol sin pérdida de conectividad.
-4. **Validación de costes**: Que los costes STP están configurados correctamente en cada nodo.
-5. **Estado STP en Redis**: Que el estado STP se publica correctamente para monitoreo.
+**Topología VXLAN por nodo (vecinos LLDP, no full mesh):**
+- master (192.168.122.100): 4 VXLAN (control-3, worker-b56b35, worker-24cf41, worker-ea7e34)
+- control-2 (192.168.122.106): 4 VXLAN (control-3, worker-b0ff27, worker-b56b35, worker-24cf41)
+- control-3 (192.168.122.130): 4 VXLAN (control-2, worker-b0ff27, worker-b56b35, worker-24cf41, worker-ea7e34)
+- worker-b0ff27 (192.168.122.115): 4 VXLAN (control-2, control-3, worker-b56b35, worker-24cf41, worker-ea7e34)
+- worker-b56b35 (192.168.122.145): 4 VXLAN (master, control-2, control-3, worker-b0ff27, worker-24cf41, worker-ea7e34)
+- worker-ea7e34 (192.168.122.70): 4 VXLAN (master, control-2, control-3, worker-b0ff27, worker-b56b35)
+- worker-24cf41 (192.168.122.170): 4 VXLAN (master, control-2, control-3, worker-b0ff27, worker-b56b35, worker-ea7e34)
 
-### Análisis de Escenarios Fallidos
+Cada nodo crea VXLAN SOLO a sus vecinos LLDP directos (no full mesh). Para alcanzar nodos no-adyacentes, Ryu hace path stitching multi-hop vía Dijkstra sobre el MST. El grafo es disperso (4-6 edges por nodo) y el MST tiene 6 edges (n-1 para 7 nodos).
+
+**Plano de management (br0):** Sigue siendo Linux bridge con STP activo en `Mgmt-STP-Switch` (GNS3) como root. Los nodos K3s ejecutan `gns3-br0-tree.service` (configurable, modo `tree` solo como fallback). STP en `br0` es independiente del plano SDN y previene loops accidentales en el cableado físico de management. NO depende de STP para prevenir loops en el plano SDN (`br-sdn`).
+
+**Pruebas de conectividad entre Smart Meters (Jun 2026):**
+- SDNSmartMeter-1 (master, 10.0.0.14) → 10.0.0.11 (control-2): OK (31-60ms, MST flood con duplicados)
+- SDNSmartMeter-1 → 10.0.0.19 (otro nodo): OK (5-27ms, ruta directa)
+- SDNSmartMeter-1 → 10.0.0.1 (gateway Ryu): OK (<1ms, local en br-sdn)
+- Resultados variables para guests en nodos donde Ryu aún está aprendiendo MAC (puede requerir 30-60s tras boot del pod para tener tabla FDB completa)
+
+### Arquitectura del Plano de Control SDN
+
+**Componentes principales en `services/ryu-controller/app.py`:**
+
+1. **TopologyManager** — Lee `topology:links` (SET Redis) con enlaces LLDP descubiertos, construye grafo NetworkX, calcula MST con `nx.minimum_spanning_tree()` (Prim), publica `topology:mst_edges` (6 edges para 7 nodos). Recomputa cada 5s.
+
+2. **ForwardingEngine** — Para cada destino MAC, ejecuta Dijkstra sobre el grafo full, llama `install_path_flows()` que instala flows explícitos en cada hop de la ruta vía `OFPInstructionActions(OFPIT_APPLY_ACTIONS)`. Sin OFPP_FLOOD.
+
+3. **ArpHandler** — Proxy ARP con dedup via ZSET Redis (`topology:arp_dedup` con ventana 5s). Responde por la gateway IP `10.0.0.1` con la MAC del nodo local. Sintetiza ARP replies para guests conocidos.
+
+4. **BroadcastController** — Flood SOLO por puertos MST (no MST edges hacia el mismo nodo origen). Genera `bcast_ports` = VXLAN ports a MST neighbors + ports físicos de guests. Sin OFPP_FLOOD.
+
+5. **EventLinkAdd/Delete** — Handler de `ryu.topology.event` que actualiza `topology:links` y `topology:link_cost` en Redis. Invalida flows hacia peers muertos (conecta a `switch:dead` pub/sub).
+
+**Flujos OpenFlow instalados:**
+- Priority 65535: LLDP (dl_dst=01:80:c2:00:00:0e) → CONTROLLER
+- Priority 200: ARP hacia 10.0.0.1 → CONTROLLER (para ARP proxy)
+- Priority 200: IP hacia 10.0.0.1 → LOCAL (gateway del nodo)
+- Priority 10: MAC learning flows (eth_dst → port específico)
+- Priority 1: Path stitching flows (multi-hop vía VXLAN)
+
+### Cambios de Implementación Recientes (Jun 2026)
+
+**Eliminar STP del plano SDN:** La nueva arquitectura elimina STP/RSTP del plano `br-sdn` (datos SDN). Los loops se previenen con MST calculado por Ryu en lugar de spanning tree distribuido. `br0` (management) sigue siendo Linux bridge y mantiene STP activo vía `Mgmt-STP-Switch` como root (independiente del plano SDN).
+
+**Topología VXLAN de vecinos LLDP (no full mesh):** Se modificó `deploy/k8s/03-sdn-network.yaml` para que cada nodo cree VXLAN solo a sus vecinos LLDP directos, leyendo `topology:links` de Redis en lugar de `HVALS topology:node_ips`. Esto:
+- Reduce túneles de O(n²) a O(n) por nodo
+- Permite multi-hop Dijkstra real con path stitching entre 2-3 saltos
+- Hace MST computacionalmente eficiente (grafo disperso de 4-6 edges por nodo)
+- Escala a >50 nodos sin saturar VXLAN port count
+
+**Servicio STP deshabilitado en nodos K3s:** `gns3-br0-tree.service` queda `disabled` en cada nodo. El script `configure-br0-tree.sh` se mantiene como referencia pero no se ejecuta automáticamente. STP solo existe como fallback determinístico. Ver `AGENTS.md` bullet "VXLAN topology is neighbor-only (LLDP), NOT full mesh".
+
+**Métricas Prometheus nuevas:** `ryu_topology_node_info`, `ryu_topology_edge_info`, `ryu_mst_edges`, `ryu_topology_version`, `ryu_topology_diameter` (cuando grafo conectado). Grafana Node Graph usa estas métricas para visualizar la topología y los paths activos (filtrable por `src_guest` y `dst_guest`).
+
+**Limpieza de Redis legacy:** Eliminadas las keys `topology:stp_state:*` y `topology:br0_stp_ports` (ya no se usan en la nueva arquitectura).
+
+### Análisis de Escenarios Fallidos (Jun 2026: nueva arquitectura)
 
 #### Escenario 2: Caída de Worker
 
-**Problema identificado**: Cuando un worker falla, las entradas `mac_to_port` en otros switches siguen apuntando al túnel VXLAN del worker muerto. Los flujos instalados envían tráfico al peer caído. Los paquetes no generan `packet-in` porque匹配 flujos existentes, por lo que Ryu nunca recalcula la ruta.
+**Problema identificado**: Cuando un worker falla, las entradas `mac_to_port` en otros switches siguen apuntando al túnel VXLAN del worker muerto. Los flujos instalados envían tráfico al peer caído. Los paquetes no generan `packet-in` porque matching flujos existentes, por lo que Ryu nunca recalcula la ruta.
 
-**Solución implementada** (commit `a403fd55`):
+**Solución implementada** (commit `a403fd55`, mejorada en Jun 2026):
 - Ryu publica el DPID del switch muerto al canal Redis `switch:dead`
 - Todos los Ryu instances suscritos borran sus entradas `mac_to_port` que apuntan al peer muerto
 - El handler de flow stats también limpia `mac_to_port` al eliminar flujos hacia peers inactivos
-- El monitor detecta switches no responsivos tras 3 запросов fallidos y transmite proactivamente la muerte
+- El monitor detecta switches no responsivos tras 3 fallos consecutivos y transmite proactivamente la muerte
 - Packet-in verifica liveness del puerto de salida antes de instalar flujos VXLAN
+
+**Mejora con MST/Dijkstra (Jun 2026)**: Cuando un Ryu publica la muerte de un nodo, todos los Ryu instances recalculan el MST sin ese nodo. Las entradas `topology:mst_edges` se actualizan automáticamente y los flows instalados hacia peers muertos se invalidan. El nuevo Dijkstra encuentra rutas alternativas automáticamente (2-3 saltos típicos en grafo disperso).
 
 #### Escenario 3: Caída de Enlace
 
-**Problema identificado**: Cuando un enlace físico falla, el túnel VXLAN puede persistir si hay reachabilidad de red alterna (ej. via `Mgmt-STP-Switch`). El grafo de adyacencia aún tiene el arco antiguo. Los paquetes no generan `packet-in` porque los flujos existentes redirigen el tráfico, y STP no recalcula la ruta SDN.
+**Problema identificado**: Cuando un enlace físico entre dos nodos cae, el túnel VXLAN entre ellos se invalida. El handler `EventLinkDelete` de Ryu debe detectar la caída y actualizar `topology:links`, lo que fuerza un recompute del MST y Dijkstra.
 
-**Interacción STP-VXLAN**: Los túneles VXLAN se crean sobre enlaces físicos `forwarding`. Si STP bloquea un enlace entre workers pero permite la comunicación IP (via Mgmt-STP-Switch), el túnel persiste. Cuando el enlace directo cae, la comunicación IP puede seguir via el switch de gestión, manteniendo el túnel VXLAN activo incluso cuando el camino físico ya no existe.
+**Comportamiento con nueva arquitectura (Jun 2026):**
+1. `EventLinkDelete` se dispara cuando Ryu pierde la adyacencia LLDP
+2. Ryu elimina el link de `topology:links` y limpia flows que usaban ese VXLAN
+3. MST se recomputa sin ese edge
+4. Dijkstra encuentra nuevas rutas (posiblemente vía otros vecinos)
+5. Si la nueva ruta no existe (grafo queda desconectado), el tráfico al nodo aislado se trata como destino inalcanzable
 
-**Consideraciones**: Este escenario es fundamentalmente difícil en una topología anillo donde cada par de nodos tiene exactamente un camino físico. Si el único enlace entre dos segmentos del anillo se cae, no existe ruta alternativa física para el tráfico SDN.
+**Limitaciones de la topología**: Si el grafo LLDP queda completamente desconectado por la caída de un enlace crítico, algunos nodos quedan aislados del SDN. Esto es aceptable en topología anillo/cadena donde cada enlace es indispensable.
+
+**Interacción con Mgmt-STP-Switch**: Si STP en `br0` re-balancea puertos por una caída, eso afecta la reachability IP de los nodos K3s (no del SDN), pero no impacta directamente la topología SDN porque Ryu ya no depende de STP para el plano de datos.
 
 ### Decisiones Arquitectónicas
 
@@ -199,4 +258,8 @@ Adicionalmente, se incluyen pruebas automatizadas de validación STP en `tools/g
 
 3. **Monitor de responsividad**: Cada 5 segundos, Ryu envía stats requests a sus switches. Tras 3 fallos consecutivos, se considera el switch muerto y se transmite su muerte.
 
-4. **VXLAN y STP**: Los túneles VXLAN se crean sobre enlaces físicos en estado `forwarding`. La arquitectura permite fallback vía `Mgmt-STP-Switch` cuando no hay forwarding directo pero ambos nodos tienen forwarding hacia el switch de gestión.
+4. **MST para prevención de loops en el plano SDN**: Ryu calcula un Minimum Spanning Tree (Prim) sobre el grafo de `topology:links` (vecinos LLDP). Broadcast (ARP, DHCP) se hace SOLO por puertos MST edges, no por flooding genérico. Esto previene loops en `br-sdn` sin necesidad de STP.
+
+5. **Path stitching multi-hop (Dijkstra)**: Para tráfico unicast, Ryu corre Dijkstra sobre el grafo LLDP y computa la ruta completa. En cada hop instala un flow explícito `eth_dst=<mac> → output=<puerto al siguiente hop>`. Esto da rutas multi-hop de 2-3 saltos típicos sin necesidad de rutas estáticas o shortest-path bridges.
+
+6. **Topología VXLAN sparse (vecinos LLDP)**: Cada nodo crea VXLAN solo a sus vecinos LLDP directos. Para alcanzar nodos no adyacentes, Ryu hace path stitching multi-hop. Esto evita O(n²) VXLAN tunnels y permite multi-hop real. Ver `AGENTS.md` para la decisión arquitectónica completa.

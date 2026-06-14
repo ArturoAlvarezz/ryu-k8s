@@ -1,7 +1,27 @@
+"""
+DistributedL2Switch - Ryu SDN controller for ring topology without STP.
+
+Architecture:
+- Each node runs one Ryu instance (DaemonSet, hostNetwork=true).
+- Each OVS (br-sdn) connects to local 127.0.0.1:6653.
+- Topology, MAC tables, and spanning tree are shared via Redis.
+- LLDP discovers physical links (via ryu-topology).
+- Dijkstra computes shortest paths between switches.
+- MST (Prim) computed from the graph for broadcast-only trees.
+- ARP proxy: controller synthesizes ARP replies for known IPs.
+- Controlled flood: broadcast only via MST edges (no OFPP_FLOOD).
+- Path stitching: multi-hop unicast via VXLAN tunnel concatenation.
+- Link failures trigger MST + Dijkstra recomputation.
+
+No STP, no RSTP. Loops prevented by explicit flow installation and MST.
+"""
+
 import os
 import eventlet
 import redis
 import time
+import json
+import networkx as nx
 from datetime import datetime, timezone
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -11,6 +31,7 @@ from ryu.controller.controller import datapath_connection_factory
 from ryu.lib import hub
 from ryu.lib.hub import StreamServer
 from ryu.topology import event
+from ryu.topology import switches
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
@@ -18,8 +39,6 @@ from ryu.lib.packet import arp
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import udp
 from ryu.lib.packet import ether_types
-
-from ryu.topology import event, switches
 
 METRICS_PORT = int(os.environ.get("METRICS_PORT", 8000))
 NODE_NAME = os.environ.get("NODE_NAME", "")
@@ -29,15 +48,15 @@ RYU_CACHE_NODE_IPS_SECONDS = float(os.environ.get("RYU_CACHE_NODE_IPS_SECONDS", 
 RYU_CACHE_SWITCH_PORTS_SECONDS = float(os.environ.get("RYU_CACHE_SWITCH_PORTS_SECONDS", 5))
 RYU_CACHE_WORKER_MACS_SECONDS = float(os.environ.get("RYU_CACHE_WORKER_MACS_SECONDS", 10))
 RYU_CACHE_LIVENESS_SECONDS = float(os.environ.get("RYU_CACHE_LIVENESS_SECONDS", 2))
-RYU_CACHE_BR0_STP_SECONDS = float(os.environ.get("RYU_CACHE_BR0_STP_SECONDS", 5))
 RYU_CACHE_SECURITY_SECONDS = float(os.environ.get("RYU_CACHE_SECURITY_SECONDS", 5))
 RYU_CACHE_PATH_SECONDS = float(os.environ.get("RYU_CACHE_PATH_SECONDS", 5))
 ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS", 30))
 MONITOR_INTERVAL_SECONDS = float(os.environ.get("MONITOR_INTERVAL_SECONDS", 5))
 FORWARDING_FLOW_IDLE_TIMEOUT = int(os.environ.get("FORWARDING_FLOW_IDLE_TIMEOUT", 120))
-VXLAN_REQUIRES_FORWARDING_BR0_EDGE = os.environ.get("VXLAN_REQUIRES_FORWARDING_BR0_EDGE", "true").lower() == "true"
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
-MGMT_SWITCH_ID = "mgmt-stp-switch"
+MST_RECOMPUTE_INTERVAL = int(os.environ.get("MST_RECOMPUTE_INTERVAL", 30))
+ARP_DEDUP_WINDOW = int(os.environ.get("ARP_DEDUP_WINDOW", 5))
+DEFAULT_LINK_COST = float(os.environ.get("DEFAULT_LINK_COST", 1.0))
 
 
 def _escape_label(value):
@@ -80,14 +99,429 @@ class RedisMetricsProxy:
         return wrapped
 
 
+class TopologyManager:
+    """Manages the topology graph, MST, and path computation.
+
+    Each Ryu instance computes MST + Dijkstra independently from the
+    shared Redis state. Results are published to Redis for monitoring.
+    """
+
+    def __init__(self, logger, redis_client):
+        self.logger = logger
+        self.redis = redis_client
+        self.graph = None
+        self.mst_edges = set()
+        self.last_mst_computation = 0
+        self.topology_version = 0
+
+    def _raw_dpid_to_decimal(self, raw_dpid):
+        try:
+            return int(raw_dpid, 16)
+        except Exception:
+            return 0
+
+    def _decimal_dpid_to_raw(self, dpid):
+        return hex(int(dpid))[2:].zfill(16).zfill(16)[-16:]
+
+    def _ip_to_dpid(self, node_ips):
+        return {
+            str(ip).replace(".", ""): self._raw_dpid_to_decimal(k)
+            for k, ip in node_ips.items()
+        }
+
+    def _build_graph(self):
+        """Build NetworkX graph from Redis topology:links and link costs."""
+        try:
+            links = self.redis.smembers("topology:links") or set()
+            link_costs = self.redis.hgetall("topology:link_cost") or {}
+            node_ips = self.redis.hgetall("topology:node_ips") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while building graph: %s", e)
+            return None
+
+        G = nx.Graph()
+        for node_raw, ip in node_ips.items():
+            dpid = self._raw_dpid_to_decimal(node_raw)
+            if dpid:
+                G.add_node(dpid, ip=ip)
+
+        for link in links:
+            if "-" not in link:
+                continue
+            src_str, dst_str = link.split("-", 1)
+            try:
+                src_dpid, src_port = src_str.split(":")
+                dst_dpid, dst_port = dst_str.split(":")
+                src_dpid = int(src_dpid)
+                dst_dpid = int(dst_dpid)
+            except Exception:
+                continue
+
+            edge_key = _edge_link_id(src_dpid, dst_dpid)
+            cost = float(link_costs.get(edge_key, DEFAULT_LINK_COST))
+
+            if not G.has_node(src_dpid):
+                G.add_node(src_dpid)
+            if not G.has_node(dst_dpid):
+                G.add_node(dst_dpid)
+            G.add_edge(src_dpid, dst_dpid, weight=cost, src_port=int(src_port), dst_port=int(dst_port))
+
+        return G
+
+    def recompute(self):
+        """Recompute MST and store in Redis. Returns True if MST changed."""
+        now = time.time()
+        if now - self.last_mst_computation < 5:
+            return False
+
+        G = self._build_graph()
+        if G is None or G.number_of_nodes() == 0:
+            return False
+
+        try:
+            mst = nx.minimum_spanning_tree(G)
+        except Exception as e:
+            self.logger.warning("MST computation failed: %s", e)
+            return False
+
+        new_mst_edges = set()
+        for u, v in mst.edges():
+            new_mst_edges.add(_edge_link_id(u, v))
+
+        if new_mst_edges != self.mst_edges:
+            self.logger.info("MST changed: %d edges (was %d)", len(new_mst_edges), len(self.mst_edges))
+            self.mst_edges = new_mst_edges
+            self.graph = G
+            self.last_mst_computation = now
+            self.topology_version = self.redis.incr("topology:version")
+
+            try:
+                pipe = self.redis.pipeline()
+                pipe.delete("topology:mst_edges")
+                for edge in self.mst_edges:
+                    pipe.sadd("topology:mst_edges", edge)
+                pipe.execute()
+            except redis.RedisError as e:
+                self.logger.warning("Redis error saving MST: %s", e)
+
+            return True
+
+        self.graph = G
+        return False
+
+    def compute_dijkstra(self, src_dpid, dst_dpid):
+        """Return list of dpids from src to dst, or None if unreachable."""
+        if self.graph is None:
+            self.recompute()
+        if self.graph is None:
+            return None
+
+        try:
+            return nx.dijkstra_path(self.graph, src_dpid, dst_dpid)
+        except nx.NetworkXNoPath:
+            return None
+        except nx.NodeNotFound:
+            return None
+
+    def get_mst_neighbors(self, dpid):
+        """Return list of neighbor dpids connected via MST edges."""
+        if not self.mst_edges:
+            self.recompute()
+        neighbors = []
+        for edge in self.mst_edges:
+            parts = edge.split("--")
+            if len(parts) != 2:
+                continue
+            n1, n2 = parts
+            try:
+                n1, n2 = int(n1), int(n2)
+            except Exception:
+                continue
+            if n1 == dpid:
+                neighbors.append(n2)
+            elif n2 == dpid:
+                neighbors.append(n1)
+        return neighbors
+
+    def get_switch_ports_for_link(self, src_dpid, dst_dpid):
+        """Return (src_port, dst_port) for the edge between src and dst."""
+        if self.graph is None:
+            return None, None
+        try:
+            data = self.graph[src_dpid][dst_dpid]
+            return data.get("src_port"), data.get("dst_port")
+        except Exception:
+            return None, None
+
+
+class ArpHandler:
+    """Handles ARP requests with proxy reply and deduplication.
+
+    ARP deduplication: uses a Redis sorted set with score=timestamp
+    to track recent (src_mac, src_ip, dst_ip) tuples. Duplicates
+    within ARP_DEDUP_WINDOW seconds are dropped.
+    """
+
+    def __init__(self, logger, redis_client):
+        self.logger = logger
+        self.redis = redis_client
+        self.arp_table = {}
+
+    def _arp_dedup_key(self, src_mac, src_ip, dst_ip):
+        return f"{src_mac}:{src_ip}:{dst_ip}"
+
+    def is_duplicate(self, src_mac, src_ip, dst_ip):
+        """Return True if this exact ARP was seen within the dedup window."""
+        key = self._arp_dedup_key(src_mac, src_ip, dst_ip)
+        try:
+            score = self.redis.zscore("topology:arp_dedup", key)
+            if score and (time.time() - score) < ARP_DEDUP_WINDOW:
+                return True
+            return False
+        except redis.RedisError:
+            return False
+
+    def mark_arp(self, src_mac, src_ip, dst_ip):
+        """Record this ARP in the dedup set."""
+        key = self._arp_dedup_key(src_mac, src_ip, dst_ip)
+        try:
+            self.redis.zadd("topology:arp_dedup", {key: time.time()})
+            self.redis.zremrangebyscore("topology:arp_dedup", 0, time.time() - ARP_DEDUP_WINDOW * 2)
+        except redis.RedisError as e:
+            self.logger.warning("Redis error in ARP dedup: %s", e)
+
+    def learn_ip(self, mac, ip_addr):
+        """Learn IP->MAC mapping."""
+        if not ip_addr or ip_addr in ("0.0.0.0", "10.0.0.1"):
+            return
+        if not str(ip_addr).startswith("10.0.0."):
+            return
+        self.arp_table[ip_addr] = mac
+        try:
+            self.redis.hset("topology:arp_table", ip_addr, mac)
+        except redis.RedisError as e:
+            self.logger.warning("Redis error learning ARP: %s", e)
+
+    def get_mac_for_ip(self, ip_addr):
+        """Look up MAC for IP, first from local cache then from Redis."""
+        if ip_addr in self.arp_table:
+            return self.arp_table[ip_addr]
+        try:
+            mac = self.redis.hget("topology:arp_table", ip_addr)
+            if mac:
+                self.arp_table[ip_addr] = mac
+            return mac
+        except redis.RedisError:
+            return None
+
+    def handle_arp_request(self, datapath, in_port, src_mac, src_ip, dst_ip, parser):
+        """Handle incoming ARP request. Returns (reply_needed, flood_needed)."""
+        self.mark_arp(src_mac, src_ip, dst_ip)
+        self.learn_ip(src_mac, src_ip)
+
+        target_mac = self.get_mac_for_ip(dst_ip)
+        if target_mac:
+            raw_dpid = self._decimal_to_raw(datapath.id)
+            gateway_mac = _mac_from_dpid(raw_dpid)
+            reply = self._make_arp_reply(
+                datapath, parser,
+                dst_mac=src_mac, dst_ip=src_ip,
+                src_mac=target_mac, src_ip=dst_ip,
+                in_port=in_port
+            )
+            datapath.send_msg(reply)
+            return False, False
+
+        return False, True
+
+    def _make_arp_reply(self, datapath, parser, dst_mac, dst_ip, src_mac, src_ip, in_port):
+        reply = packet.Packet()
+        reply.add_protocol(ethernet.ethernet(
+            ethertype=ether_types.ETH_TYPE_ARP,
+            dst=dst_mac,
+            src=src_mac,
+        ))
+        reply.add_protocol(arp.arp(
+            opcode=arp.ARP_REPLY,
+            src_mac=src_mac,
+            src_ip=src_ip,
+            dst_mac=dst_mac,
+            dst_ip=dst_ip,
+        ))
+        reply.serialize()
+        return parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=datapath.ofproto.OFP_NO_BUFFER,
+            in_port=datapath.ofproto.OFPP_CONTROLLER,
+            actions=[parser.OFPActionOutput(in_port)],
+            data=reply.data,
+        )
+
+    def _decimal_to_raw(self, dpid):
+        return hex(int(dpid))[2:].zfill(16)
+
+
+class BroadcastController:
+    """Computes and applies logical spanning tree for broadcast traffic.
+
+    Instead of OFPP_FLOOD (which sends to ALL ports including loops),
+    broadcast uses only the edges of the MST computed by TopologyManager.
+    """
+
+    def __init__(self, logger, topology_manager):
+        self.logger = logger
+        self.tm = topology_manager
+
+    def get_broadcast_ports(self, dpid, in_port, ports):
+        """Return list of output ports for broadcast, excluding in_port.
+
+        Uses MST edges to determine which ports to flood.
+        """
+        mst_neighbors = self.tm.get_mst_neighbors(dpid)
+        node_ips = self.tm.redis.hgetall("topology:node_ips") or {}
+        ip_to_dpid = self.tm._ip_to_dpid(node_ips)
+
+        out_ports = []
+        for port_no, port_name in ports.items():
+            try:
+                port_no_int = int(port_no)
+            except Exception:
+                continue
+            if port_no_int == in_port or port_no_int == ofproto_v1_3.OFPP_LOCAL:
+                continue
+            if port_no_int == ofproto_v1_3.OFPP_CONTROLLER:
+                continue
+            port_name = str(port_name)
+            if port_name.startswith("vx"):
+                peer_ip = port_name[2:]
+                peer_dpid = ip_to_dpid.get(peer_ip)
+                if peer_dpid and peer_dpid in mst_neighbors:
+                    out_ports.append(port_no_int)
+            elif port_name.startswith("ens") or port_name.startswith("br-"):
+                out_ports.append(port_no_int)
+        return out_ports
+
+
+class ForwardingEngine:
+    """Computes Dijkstra paths and installs explicit flows on switches.
+
+    Path stitching: for a path [dpid1, dpid2, dpid3, dpid4], install:
+    - On dpid1: match(eth_dst=host_mac) -> output vx_to_dpid2
+    - On dpid2: match(eth_dst=host_mac) -> output vx_to_dpid3
+    - On dpid3: match(eth_dst=host_mac) -> output local_port_to_host
+    """
+
+    def __init__(self, logger, redis_client, topology_manager):
+        self.logger = logger
+        self.redis = redis_client
+        self.tm = topology_manager
+        self.flow_stats_thread = None
+
+    def _get_switch_ports(self, dpid):
+        try:
+            return self.redis.hgetall(f"switch_ports:{dpid}") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis error reading ports for %s: %s", dpid, e)
+            return {}
+
+    def _vxlan_port_to_ip(self, port_name):
+        if port_name.startswith("vx"):
+            ip = port_name[2:]
+            return f"192.168.122.{ip[-3:]}" if ip.startswith("122") else ip
+        return None
+
+    def _ip_to_dpid(self, node_ips):
+        return {
+            str(ip).replace(".", ""): self.tm._raw_dpid_to_decimal(k)
+            for k, ip in node_ips.items()
+        }
+
+    def install_path_flows(self, src_dpid, dst_dpid, dst_mac, datapath_by_dpid):
+        """Install flows on all switches along the Dijkstra path from src to dst.
+
+        For each hop (dpid_i -> dpid_{i+1}), install:
+        - match(eth_dst=dst_mac)
+        - action(output local_port_or_vxlan_to_next_hop)
+        """
+        path = self.tm.compute_dijkstra(src_dpid, dst_dpid)
+        if not path or len(path) < 2:
+            self.logger.debug("No path or single node for %s -> %s", src_dpid, dst_dpid)
+            return False
+
+        self.logger.info("Installing path flows: %s -> %s via %s", src_dpid, dst_dpid, path)
+
+        node_ips = self.redis.hgetall("topology:node_ips") or {}
+        ip_to_dpid = self._ip_to_dpid(node_ips)
+        dpid_to_ip = {v: k for k, v in ip_to_dpid.items()}
+
+        installed = 0
+        for i, current_dpid in enumerate(path):
+            if i == len(path) - 1:
+                break
+
+            next_dpid = path[i + 1]
+            src_port, dst_port = self.tm.get_switch_ports_for_link(current_dpid, next_dpid)
+
+            if current_dpid not in datapath_by_dpid:
+                self.logger.debug("No datapath for dpid %s, skipping flow install", current_dpid)
+                continue
+
+            dp = datapath_by_dpid[current_dpid]
+            parser = dp.ofproto_parser
+            ofproto = dp.ofproto
+
+            ports = self._get_switch_ports(current_dpid)
+
+            out_port = None
+            for port_no, port_name in ports.items():
+                port_name = str(port_name)
+                if port_name.startswith("vx"):
+                    peer_ip_raw = port_name[2:]
+                    peer_ip = self._vxlan_port_to_ip(port_name)
+                    peer_dpid = ip_to_dpid.get(peer_ip.replace(".", ""))
+                    if peer_dpid == next_dpid:
+                        out_port = int(port_no)
+                        break
+
+            if out_port is None:
+                self.logger.debug("No VXLAN port found from %s to %s", current_dpid, next_dpid)
+                continue
+
+            match = parser.OFPMatch(in_port=ofproto.OFPP_LOCAL, eth_dst=dst_mac)
+            actions = [parser.OFPActionOutput(out_port)]
+            try:
+                self.add_flow(dp, 10, match, actions)
+                installed += 1
+                self.logger.debug("Flow installed: dpid=%s match(eth_dst=%s) -> output=%s",
+                                  current_dpid, dst_mac, out_port)
+            except Exception as e:
+                self.logger.warning("Failed to install flow on dpid %s: %s", current_dpid, e)
+
+        return installed > 0
+
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=FORWARDING_FLOW_IDLE_TIMEOUT):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_ADD,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=0,
+        )
+        datapath.send_msg(mod)
+
+
 class DistributedL2Switch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS = {'switches': switches.Switches}
 
     def __init__(self, *args, **kwargs):
         super(DistributedL2Switch, self).__init__(*args, **kwargs)
-        
-        # Redis connection setup (Sentinel HA)
+
         from redis.sentinel import Sentinel
         sentinel_host = os.environ.get('REDIS_SENTINEL_HOST', 'redis-sentinel.sdn-controller.svc.cluster.local')
         sentinel_port = int(os.environ.get('REDIS_SENTINEL_PORT', 26379))
@@ -114,11 +548,16 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.flow_mod_total = {}
         self.installed_flows = {}
         self.port_stats = {}
-        self.security_flow_state = {}
-        self.metrics_started_at = datetime.utcnow().timestamp()
+        self.metrics_started_at = time.time()
+
+        self.topology_manager = TopologyManager(self.logger, self.redis)
+        self.arp_handler = ArpHandler(self.logger, self.redis)
+        self.forwarding_engine = ForwardingEngine(self.logger, self.redis, self.topology_manager)
+        self.broadcast_controller = BroadcastController(self.logger, self.topology_manager)
+
         self.monitor_thread = hub.spawn(self._monitor_datapaths)
         self.metrics_thread = hub.spawn(self._start_metrics_server)
-        self.security_sync_thread = hub.spawn(self._sync_quarantine_flows)
+        self.topology_recompute_thread = hub.spawn(self._periodic_topology_recompute)
         self.dead_switch_sub_thread = hub.spawn(self._subscribe_dead_switches)
 
     def _record_redis_metric(self, operation, status, duration):
@@ -133,7 +572,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         try:
             sub = self.redis.pubsub()
             sub.subscribe("switch:dead")
-            self.logger.info("Subscribed to switch:dead channel for dead switch propagation")
+            self.logger.info("Subscribed to switch:dead channel")
             while True:
                 try:
                     msg = sub.get_message(timeout=1.0)
@@ -172,7 +611,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                         continue
                     port_name = str(ports.get(str(port), ""))
                     if port_name.startswith("vx"):
-                        peer_ip = port_name[2:]
+                        peer_ip = self._vxlan_port_to_ip(port_name)
                         ip_to_dpid = {
                             str(ip).replace(".", ""): self._raw_dpid_to_decimal(k)
                             for k, ip in self._get_node_ips().items()
@@ -231,26 +670,6 @@ class DistributedL2Switch(app_manager.RyuApp):
             lambda: self.redis.hgetall(f"switch_ports:{dpid}") or {},
         )
 
-    def _get_br0_stp_ports(self):
-        return self._cached(
-            "topology:br0_stp_ports",
-            RYU_CACHE_BR0_STP_SECONDS,
-            lambda: self.redis.hgetall("topology:br0_stp_ports") or {},
-        )
-
-    def start(self):
-        super(DistributedL2Switch, self).start()
-        self.openflow_controller_thread = hub.spawn(self._start_openflow_controller)
-        self.threads.append(self.openflow_controller_thread)
-
-    def _start_openflow_controller(self):
-        try:
-            self.logger.info("Starting OpenFlow controller listener from app.py")
-            server = StreamServer(('0.0.0.0', 6653), datapath_connection_factory)
-            server.serve_forever()
-        except Exception as e:
-            self.logger.warning("OpenFlow controller listener was not started by app.py: %s", e)
-
     def _known_worker_macs(self):
         def load_worker_macs():
             worker_macs = set()
@@ -270,7 +689,6 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _get_security_device_by_mac(self, mac):
         import json
-
         mac = str(mac).lower()
         def load_device():
             try:
@@ -284,369 +702,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                 return None
         return self._cached(f"security:device_by_mac:{mac}", RYU_CACHE_SECURITY_SECONDS, load_device)
 
-    def _get_security_device_id_by_ip(self, ip_addr):
-        ip_addr = str(ip_addr).strip()
-        if not ip_addr:
-            return None
-        def load_owner():
-            try:
-                return self.redis.get(f"security:ip_to_device:{ip_addr}")
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while checking IP ownership: %s", e)
-                return None
-        return self._cached(f"security:ip_to_device:{ip_addr}", RYU_CACHE_SECURITY_SECONDS, load_owner)
-
-    def _refresh_security_device_location(self, device, dpid, in_port):
-        current_dpid = str(dpid)
-        current_port = str(in_port)
-        if device.get("dpid") == current_dpid and device.get("in_port") == current_port:
-            return
-
-        import json
-        device["dpid"] = current_dpid
-        device["in_port"] = current_port
-        try:
-            self.redis.set(f"security:device:{device['device_id']}", json.dumps(device, sort_keys=True))
-            self._cache_delete_prefix(f"security:device_by_mac:{str(device.get('mac', '')).lower()}")
-            self._cache_delete_prefix(f"security:ip_to_device:{str(device.get('ip', '')).strip()}")
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while updating security device location: %s", e)
-            return
-        self.logger.info(
-            "Security device location refreshed: device=%s mac=%s dpid=%s in_port=%s",
-            device.get("device_id"), device.get("mac"), current_dpid, current_port,
-        )
-
-    def _record_security_event(self, threat_type, mac, ip, dpid, in_port, reason, action):
-        import uuid
-        import time
-        import json
-        event_id = str(uuid.uuid4())
-        timestamp = int(time.time())
-        
-        event_data = {
-            "id": event_id,
-            "type": threat_type,
-            "mac": mac,
-            "ip": ip,
-            "dpid": dpid,
-            "in_port": in_port,
-            "reason": reason,
-            "action": action,
-            "timestamp": timestamp
-        }
-
-        try:
-            self.redis.setex(f"security:event:{timestamp}:{event_id}", 86400 * 7, json.dumps(event_data))
-            self.redis.incr("security:events_total")
-            self.redis.incr(f"security:events:{threat_type}")
-
-            if action in ["quarantine", "suspicious"]:
-                device_id = self.redis.get(f"security:mac_to_device:{mac}")
-                if device_id:
-                    payload = self.redis.get(f"security:device:{device_id}")
-                    if payload:
-                        dev = json.loads(payload)
-                        dev["status"] = action
-                        self.redis.set(f"security:device:{device_id}", json.dumps(dev))
-                        self._cache_delete_prefix(f"security:device_by_mac:{str(dev.get('mac', mac)).lower()}")
-                        self._cache_delete_prefix(f"security:ip_to_device:{str(dev.get('ip', ip)).strip()}")
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while recording security event: %s", e)
-
-    def _is_policy_block_reason(self, reason):
-        return reason in {"status_blocked", "status_quarantine", "status_quarantined"}
-
-    def _record_policy_block(self, mac, ip, dpid, in_port, reason):
-        try:
-            self.redis.incr("security:policy_blocks_total")
-            self.redis.incr(f"security:policy_blocks:{reason}")
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while recording policy block: %s", e)
-
-    def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name=""):
-        mac = str(eth.src).lower()
-        if mac in self._known_worker_macs():
-            return True, None, None
-
-        device = self._get_security_device_by_mac(mac)
-        is_dhcp_request = bool(udp_pkt and udp_pkt.src_port == 68 and udp_pkt.dst_port == 67)
-        observed_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
-        
-        if not device:
-            if udp_pkt and udp_pkt.dst_port == 5555:
-                return False, "MAC_SPOOFING", "unregistered_mac_telemetry"
-        else:
-            if device.get("status") not in ["authorized", "learning"]:
-                return False, "POLICY_BLOCK", f"status_{device.get('status')}"
-                
-            is_local_guest_port = str(in_port_name).startswith("ens") and str(in_port) != "4294967294"
-            if is_local_guest_port:
-                dpid_mismatch = device.get("dpid") and device.get("dpid") != str(dpid)
-                port_mismatch = device.get("in_port") and device.get("in_port") != str(in_port)
-                missing_location = not device.get("dpid") or not device.get("in_port")
-                if dpid_mismatch or port_mismatch or missing_location:
-                    ip_matches = observed_ip in ("", "0.0.0.0", device.get("ip", ""))
-                    if is_dhcp_request or ip_matches:
-                        self._refresh_security_device_location(device, dpid, in_port)
-                    elif dpid_mismatch:
-                        return False, "MAC_SPOOFING", "dpid_mismatch"
-                    else:
-                        return False, "MAC_SPOOFING", "port_mismatch"
-        
-        if ip_pkt:
-            src_ip = ip_pkt.src
-            if not is_dhcp_request:
-                if device and device.get("ip") and device.get("ip") != src_ip:
-                    return False, "IP_SPOOFING", "ip_mismatch"
-                
-                owner_id = self._get_security_device_id_by_ip(src_ip)
-                if owner_id and device and owner_id != device.get("device_id"):
-                    return False, "IP_SPOOFING", "ip_in_use_by_other_device"
-                
-                if src_ip == "10.0.0.1":
-                    return False, "IP_SPOOFING", "reserved_ip_used"
-
-        if arp_pkt:
-            if arp_pkt.src_ip == "10.0.0.1":
-                return False, "ARP_POISONING", "unauthorized_gateway_claim"
-                
-            if arp_pkt.src_mac.lower() != mac:
-                return False, "ARP_POISONING", "arp_mac_mismatch"
-                
-            if device and device.get("ip") and arp_pkt.src_ip != device.get("ip"):
-                return False, "ARP_POISONING", "arp_ip_mismatch"
-                
-        return True, None, None
-
-    def _drop_guest_packet(self, datapath, in_port, src, eth_type=None, reason="security", install_flow=False):
-        if install_flow:
-            parser = datapath.ofproto_parser
-            match_fields = {"in_port": in_port, "eth_src": src}
-            if eth_type is not None:
-                match_fields["eth_type"] = eth_type
-            match = parser.OFPMatch(**match_fields)
-            self.add_flow(datapath, 100, match, [], None)
-        message = "Security drop installed: dpid=%s in_port=%s mac=%s eth_type=%s reason=%s"
-        args = (datapath.id, in_port, src, eth_type or "any", reason)
-        if self._is_policy_block_reason(reason):
-            self.logger.debug(message, *args)
-        else:
-            self.logger.warning(message, *args)
-
-    def _delete_guest_drop_flow(self, datapath, in_port, src):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        match = parser.OFPMatch(in_port=in_port, eth_src=src)
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            command=ofproto.OFPFC_DELETE,
-            out_port=ofproto.OFPP_ANY,
-            out_group=ofproto.OFPG_ANY,
-            priority=100,
-            match=match,
-        )
-        datapath.send_msg(mod)
-        self.logger.info("Security drop removed: dpid=%s in_port=%s mac=%s", datapath.id, in_port, src)
-
-    def _sync_quarantine_flows(self):
-        while True:
-            try:
-                for device_id in self.redis.smembers("security:devices") or []:
-                    payload = self.redis.get(f"security:device:{device_id}")
-                    if not payload:
-                        continue
-                    import json
-                    device = json.loads(payload)
-                    try:
-                        dpid = int(device.get("dpid"))
-                        in_port = int(device.get("in_port"))
-                    except (TypeError, ValueError):
-                        continue
-                    datapath = self.datapaths.get(dpid)
-                    mac = str(device.get("mac", "")).lower()
-                    if not datapath or not mac:
-                        continue
-                    state_key = (device.get("device_id"), dpid, in_port, mac)
-                    desired_state = "blocked" if device.get("status") in ("quarantine", "quarantined", "blocked") else "authorized"
-                    if self.security_flow_state.get(state_key) == desired_state:
-                        continue
-                    if desired_state == "blocked":
-                        self._drop_guest_packet(datapath, in_port, mac, reason="status_%s" % device.get("status"), install_flow=True)
-                    else:
-                        self._delete_guest_drop_flow(datapath, in_port, mac)
-                    self.security_flow_state[state_key] = desired_state
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while syncing quarantine flows: %s", e)
-            except Exception as e:
-                self.logger.warning("Unexpected quarantine flow sync failure: %s", e)
-            hub.sleep(5)
-
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        dpid = datapath.id
-
-        # Externalize State: Register switch in the global Redis topology set
-        try:
-            self.redis.sadd('topology:switches', dpid)
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while registering switch %s: %s", dpid, e)
-        self.datapaths[dpid] = datapath
-        self.installed_flows.setdefault(dpid, 0)
-        self.logger.info("Switch connected and registered in Redis: dpid=%s", dpid)
-
-        # Install table-miss flow entry
-        # We specify NO BUFFER to max_len of the output action due to OVS bug.
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
-
-        # Solicitar la lista de puertos físicos y virtuales al switch para la topología determinista
-        req = parser.OFPPortDescStatsRequest(datapath, 0)
-        datapath.send_msg(req)
-
-    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
-    def _state_change_handler(self, ev):
-        datapath = ev.datapath
-        if ev.state == DEAD_DISPATCHER:
-            if datapath.id is None:
-                return
-            dpid = datapath.id
-            raw_dpid = self._decimal_dpid_to_raw(dpid)
-            self.logger.info("Switch disconnected, broadcasting death: dpid=%s", dpid)
-            self._publish_switch_dead(raw_dpid)
-            self._clear_mac_to_port_for_dead_switch(raw_dpid)
-            self.datapaths.pop(dpid, None)
-            self.installed_flows.pop(dpid, None)
-            self.port_stats = {
-                key: value for key, value in self.port_stats.items()
-                if key[0] != dpid
-            }
-            self.logger.info("Switch disconnected, removing from Redis: dpid=%s", dpid)
-
-            try:
-                self.redis.srem('topology:switches', dpid)
-                self.redis.delete(f"mac_to_port:{dpid}")
-                self.redis.delete(f"switch_ports:{dpid}")
-                self._cache_delete_prefix(f"switch_ports:{dpid}")
-                self._cache_delete_prefix("path_next_hop:")
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while removing switch %s: %s", dpid, e)
-
-
-
-    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
-    def port_desc_stats_reply_handler(self, ev):
-        dpid = ev.msg.datapath.id
-        ports_key = f"switch_ports:{dpid}"
-        self._cache_delete_prefix(ports_key)
-        self._cache_delete_prefix("path_next_hop:")
-        try:
-            self.redis.delete(ports_key)
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while refreshing ports for %s: %s", dpid, e)
-        for p in ev.msg.body:
-            port_no = p.port_no
-            name = p.name.decode('utf-8')
-            try:
-                self.redis.hset(ports_key, port_no, name)
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while registering port %s/%s: %s", dpid, port_no, e)
-                continue
-            self.logger.debug("Port registered: DPID %s, Port %s, Name %s", dpid, port_no, name)
-
-    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
-    def port_status_handler(self, ev):
-        msg = ev.msg
-        reason = msg.reason
-        port_no = msg.desc.port_no
-        name = msg.desc.name.decode('utf-8')
-        dpid = msg.datapath.id
-        ofproto = msg.datapath.ofproto
-
-        if reason == ofproto.OFPPR_ADD or reason == ofproto.OFPPR_MODIFY:
-            try:
-                self.redis.hset(f"switch_ports:{dpid}", port_no, name)
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while updating port %s/%s: %s", dpid, port_no, e)
-                return
-            self._cache_delete_prefix(f"switch_ports:{dpid}")
-            self._cache_delete_prefix("path_next_hop:")
-            self.logger.info("Port status UPDATE: DPID %s, Port %s, Name %s", dpid, port_no, name)
-        elif reason == ofproto.OFPPR_DELETE:
-            self._delete_flows_outputting_to_port(msg.datapath, port_no)
-            try:
-                self.redis.hdel(f"switch_ports:{dpid}", port_no)
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while deleting port %s/%s: %s", dpid, port_no, e)
-                return
-            self._cache_delete_prefix(f"switch_ports:{dpid}")
-            self._cache_delete_prefix("path_next_hop:")
-            self.logger.info("Port status DELETE: DPID %s, Port %s", dpid, port_no)
-
-    def _delete_flows_outputting_to_port(self, datapath, port_no):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            command=ofproto.OFPFC_DELETE,
-            out_port=port_no,
-            out_group=ofproto.OFPG_ANY,
-            table_id=ofproto.OFPTT_ALL,
-        )
-        datapath.send_msg(mod)
-
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        timeouts = {}
-        if priority > 0:
-            timeouts = {"idle_timeout": FORWARDING_FLOW_IDLE_TIMEOUT, "hard_timeout": 0}
-
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                             actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst, **timeouts)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst, **timeouts)
-        datapath.send_msg(mod)
-        dpid = datapath.id
-        self.flow_mod_total[dpid] = self.flow_mod_total.get(dpid, 0) + 1
-
-    @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
-    def link_add_handler(self, ev):
-        src = ev.link.src
-        dst = ev.link.dst
-        # Registrar link bidireccional L2 detectado por LLDP
-        link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
-        try:
-            self.redis.sadd("topology:links", link_str)
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while adding LLDP link %s: %s", link_str, e)
-            return
-        self.logger.info("LLDP Auto-Discovery: Enlace Agregado %s", link_str)
-
-    @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
-    def link_delete_handler(self, ev):
-        src = ev.link.src
-        dst = ev.link.dst
-        link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
-        try:
-            self.redis.srem("topology:links", link_str)
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while deleting LLDP link %s: %s", link_str, e)
-            return
-        self.logger.info("LLDP Auto-Discovery: Enlace Removido %s", link_str)
-
     def _get_switch_mac_map(self):
-        """Devuelve un dict {mac_hex: dpid} de todos los switches registrados."""
         def load_switch_mac_map():
             try:
                 switches = self.redis.smembers('topology:switches')
@@ -656,7 +712,6 @@ class DistributedL2Switch(app_manager.RyuApp):
             mac_map = {}
             for dpid in switches:
                 try:
-                    # El DPID numérico -> MAC hex del bridge (ej: e65c876d5837)
                     mac_hex = hex(int(dpid))[2:].zfill(12)
                     mac_fmt = ':'.join(mac_hex[i:i+2] for i in range(0, 12, 2))
                     mac_map[mac_fmt] = dpid
@@ -665,10 +720,148 @@ class DistributedL2Switch(app_manager.RyuApp):
             return mac_map
         return self._cached("switch_mac_map", RYU_CACHE_WORKER_MACS_SECONDS, load_switch_mac_map)
 
+    def start(self):
+        super(DistributedL2Switch, self).start()
+        self.openflow_controller_thread = hub.spawn(self._start_openflow_controller)
+        self.threads.append(self.openflow_controller_thread)
+
+    def _start_openflow_controller(self):
+        try:
+            self.logger.info("Starting OpenFlow controller listener from app.py")
+            server = StreamServer(('0.0.0.0', 6653), datapath_connection_factory)
+            server.serve_forever()
+        except Exception as e:
+            self.logger.warning("OpenFlow controller listener was not started by app.py: %s", e)
+
+    def _vxlan_port_to_ip(self, port_name):
+        if port_name.startswith("vx"):
+            ip = port_name[2:]
+            if ip.startswith("122"):
+                return f"192.168.{ip}"
+            return f"192.168.122.{int(ip[-3:])}"
+        return None
+
+    def _ip_to_dpid(self, node_ips):
+        return {
+            str(ip).replace(".", ""): self._raw_dpid_to_decimal(k)
+            for k, ip in node_ips.items()
+        }
+
+    def _raw_dpid_to_decimal(self, raw_dpid):
+        try:
+            return int(raw_dpid, 16)
+        except Exception:
+            return 0
+
+    def _decimal_dpid_to_raw(self, dpid):
+        return hex(int(dpid))[2:].zfill(16)
+
+    def _is_switch_alive(self, dpid):
+        try:
+            return self.redis.get(f"switch:alive:{dpid}") == "1"
+        except redis.RedisError:
+            return False
+
+    def _is_forwarding_port_alive(self, port_name, dpid):
+        if not port_name:
+            return False
+        if port_name.startswith("vx"):
+            peer_ip = self._vxlan_port_to_ip(port_name)
+            if not peer_ip:
+                return False
+            try:
+                node_ips = self._get_node_ips()
+                ip_to_dpid = self._ip_to_dpid(node_ips)
+                peer_dpid_str = ip_to_dpid.get(peer_ip.replace(".", ""))
+                if peer_dpid_str:
+                    return self._is_switch_alive(peer_dpid_str)
+            except Exception:
+                pass
+        return True
+
+    def _periodic_topology_recompute(self):
+        while True:
+            try:
+                changed = self.topology_manager.recompute()
+                if changed:
+                    self.logger.info("Topology changed, MST updated. version=%s",
+                                     self.topology_manager.topology_version)
+                    self._cache_delete_prefix("path_next_hop:")
+                    self._publish_topology_metrics()
+            except Exception as e:
+                self.logger.warning("Topology recompute error: %s", e)
+            hub.sleep(MST_RECOMPUTE_INTERVAL)
+
+    def _publish_topology_metrics(self):
+        try:
+            version = self.topology_manager.topology_version
+            mst_edges = len(self.topology_manager.mst_edges)
+            diameter = -1
+            if self.topology_manager.graph and self.topology_manager.graph.number_of_nodes() > 0:
+                try:
+                    diameter = nx.diameter(self.topology_manager.graph)
+                except Exception:
+                    pass
+            self.logger.info("TOPOLOGY version=%s mst_edges=%s diameter=%s",
+                             version, mst_edges, diameter)
+        except Exception as e:
+            self.logger.warning("Error publishing topology metrics: %s", e)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        self.datapaths[datapath.id] = datapath
+
+        self.logger.info("Switch connected: dpid=%s ports=%s", datapath.id, ev.msg.ports)
+
+        try:
+            self.redis.sadd("topology:switches", str(datapath.id))
+            raw_dpid = self._decimal_dpid_to_raw(datapath.id)
+            mac_addr = _mac_from_dpid(raw_dpid)
+            self.redis.hset("topology:node_names", raw_dpid, NODE_NAME)
+            node_ip = os.environ.get("NODE_IP", "")
+            if node_ip:
+                self.redis.hset("topology:node_ips", raw_dpid, node_ip)
+            self.logger.info("Registered switch %s (mac=%s) in Redis", datapath.id, mac_addr)
+        except redis.RedisError as e:
+            self.logger.warning("Redis error registering switch: %s", e)
+
+        ports = {}
+        for port_no, port in ev.msg.ports.items():
+            if port_no > 0xffffff00:
+                continue
+            port_name = port.name.decode() if isinstance(port.name, bytes) else port.name
+            ports[str(port_no)] = port_name
+        if ports:
+            try:
+                self.redis.hset(f"switch_ports:{datapath.id}", mapping={k: v for k, v in ports.items()})
+            except redis.RedisError as e:
+                self.logger.warning("Redis error saving switch ports: %s", e)
+
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, 0, match, actions, 0, 0)
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        ports = {}
+        for port in ev.msg.body:
+            if port.port_no > 0xffffff00:
+                continue
+            port_name = port.name.decode() if isinstance(port.name, bytes) else port.name
+            ports[str(port.port_no)] = port_name
+        if ports:
+            try:
+                self.redis.hset(f"switch_ports:{datapath.id}", mapping={k: v for k, v in ports.items()})
+            except redis.RedisError as e:
+                self.logger.warning("Redis error saving port desc stats: %s", e)
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # If you hit this you might want to increase
-        # the "miss_send_length" of your switch
         if ev.msg.msg_len < ev.msg.total_len:
             self.logger.debug("packet truncated: only %s of %s bytes",
                               ev.msg.msg_len, ev.msg.total_len)
@@ -680,11 +873,12 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+        if not eth:
+            return
 
-        # Dejar cruzar los paquetes LLDP hacia el kernel de Topology/Switches
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
-            
+
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
@@ -692,19 +886,13 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         self.logger.debug("packet in %s %s %s %s", dpid, src, dst, in_port)
 
-        # Externalize State: Learn the mac address to avoid FLOOD next time.
-        # Store the mac_to_port table for this dpid in Redis natively (Hash)
         mac_table_key = f"mac_to_port:{dpid}"
         try:
             self.redis.hset(mac_table_key, src, in_port)
-            # MAC Ageing (Auto Limpieza): mantener el mapa sensible a cambios STP.
             self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=180)
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while learning MAC %s on %s: %s", src, dpid, e)
 
-        # ─── TOPOLOGY INFERENCE ───────────────────────────────────────────────
-        # Si el src MAC pertenece a otro switch conocido y llega por un puerto
-        # inter-nodo (1-10), deducimos que hay un enlace físico y lo guardamos.
         if 1 <= in_port <= 10:
             switch_mac_map = self._get_switch_mac_map()
             if src in switch_mac_map:
@@ -713,195 +901,204 @@ class DistributedL2Switch(app_manager.RyuApp):
                     link_str = f"{dpid}:{in_port}-{neighbor_dpid}:0"
                     try:
                         self.redis.sadd("topology:links", link_str)
-                        self.redis.expire("topology:links", 300)  # TTL 5min para frescura
                     except redis.RedisError as e:
                         self.logger.warning("Redis unavailable while inferring link %s: %s", link_str, e)
-        # ─────────────────────────────────────────────────────────────────────
 
-        # Retrieve destination port from Redis
-        try:
-            out_port_str = self.redis.hget(mac_table_key, dst)
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while reading destination %s on %s: %s", dst, dpid, e)
-            out_port_str = None
-        
-        known_worker_macs = self._known_worker_macs()
         try:
             ports = self._get_switch_ports(dpid)
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while reading ports for %s: %s", dpid, e)
             ports = {}
-        if out_port_str and str(out_port_str) not in ports:
-            self.logger.info(
-                "Ignoring stale learned port: dpid=%s dst=%s port=%s",
-                dpid, dst, out_port_str,
-            )
-            try:
-                self.redis.hdel(mac_table_key, dst)
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while deleting stale MAC %s on %s: %s", dst, dpid, e)
-            out_port_str = None
-        if out_port_str and not self._is_forwarding_port_alive(str(ports.get(str(out_port_str), "")), dpid):
-            self.logger.info(
-                "Ignoring learned port to inactive VXLAN peer: dpid=%s dst=%s port=%s",
-                dpid, dst, out_port_str,
-            )
-            try:
-                self.redis.hdel(mac_table_key, dst)
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while deleting inactive-peer MAC %s on %s: %s", dst, dpid, e)
-            out_port_str = None
         in_port_name = str(ports.get(str(in_port), ""))
+
+        known_worker_macs = self._known_worker_macs()
         if (
             src not in known_worker_macs and
             in_port != ofproto.OFPP_LOCAL and
-            in_port_name.startswith("ens")
+            not in_port_name.startswith("vx")
         ):
             try:
                 self.redis.hset("topology:guest_locations", src, f"{dpid}:{in_port}")
             except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while updating guest location %s: %s", src, e)
+                self.logger.warning("Redis unavailable while updating guest location: %s", e)
 
         udp_pkt = pkt.get_protocol(udp.udp)
         arp_pkt = pkt.get_protocol(arp.arp)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-        allowed, threat_type, reason = self._evaluate_security_threats(eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name)
-        if not allowed:
-            src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
-            if threat_type == "POLICY_BLOCK" or self._is_policy_block_reason(reason):
-                self.logger.debug("POLICY_BLOCK: dpid=%s in_port=%s mac=%s ip=%s reason=%s",
-                                  dpid, in_port, src, src_ip, reason)
-                self._record_policy_block(src, src_ip, dpid, in_port, reason)
-            else:
-                action = "log_only" if SECURITY_LEARNING_MODE else "quarantine"
-                self.logger.warning("%s_DETECTED: dpid=%s in_port=%s mac=%s ip=%s reason=%s action=%s",
-                                    threat_type, dpid, in_port, src, src_ip, reason, action)
-                self._record_security_event(threat_type, src, src_ip, dpid, in_port, reason, action)
-            
-            if not SECURITY_LEARNING_MODE:
-                self._drop_guest_packet(datapath, in_port, src, reason=reason, install_flow=True)
-                return
-
-        observed_src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
-        if (
-            src not in known_worker_macs and
-            in_port != ofproto.OFPP_LOCAL and
-            not in_port_name.startswith("vx") and
-            in_port_name != "br-sdn"
-        ):
-            self._learn_guest_ip(src, observed_src_ip)
-
-        if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST and arp_pkt.dst_ip == "10.0.0.1":
-            raw_dpid = self._decimal_dpid_to_raw(dpid)
-            gateway_mac = ":".join(raw_dpid[-12:][i:i + 2] for i in range(0, 12, 2))
-            self._send_arp_reply(datapath, in_port, src, arp_pkt.src_ip,
-                                 gateway_mac, "10.0.0.1")
-            return
+        src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
 
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
-            guest_mac = self._guest_mac_for_ip(arp_pkt.dst_ip)
-            if guest_mac and guest_mac.lower() != src.lower():
-                self._send_arp_reply(datapath, in_port, src, arp_pkt.src_ip,
-                                     guest_mac, arp_pkt.dst_ip)
+            is_dup = self.arp_handler.is_duplicate(src, arp_pkt.src_ip, arp_pkt.dst_ip)
+            if is_dup:
+                self.logger.debug("Dropping duplicate ARP: %s -> %s", src, arp_pkt.dst_ip)
                 return
 
-        if ip_pkt and ip_pkt.dst == "10.0.0.1":
-            out_port = ofproto.OFPP_LOCAL
-            actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
-        elif out_port_str:
+            proxy_reply, should_flood = self.arp_handler.handle_arp_request(
+                datapath, in_port, src, arp_pkt.src_ip, arp_pkt.dst_ip, parser
+            )
+
+            if proxy_reply:
+                self.logger.debug("ARP proxy reply for %s -> %s", arp_pkt.src_ip, arp_pkt.dst_ip)
+                return
+
+            if should_flood:
+                self._do_controlled_flood(datapath, in_port, msg.data, ports)
+                return
+
+        try:
+            out_port_str = self.redis.hget(mac_table_key, dst)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while reading destination %s on %s: %s", dst, dpid, e)
+            out_port_str = None
+
+        if out_port_str and str(out_port_str) not in ports:
+            try:
+                self.redis.hdel(mac_table_key, dst)
+            except redis.RedisError:
+                pass
+            out_port_str = None
+
+        if out_port_str and not self._is_forwarding_port_alive(str(ports.get(str(out_port_str), "")), dpid):
+            try:
+                self.redis.hdel(mac_table_key, dst)
+            except redis.RedisError:
+                pass
+            out_port_str = None
+
+        if out_port_str:
             out_port = int(out_port_str)
             actions = [parser.OFPActionOutput(out_port)]
-        else:
-            guest_out_port = self._resolve_guest_out_port(dpid, dst)
-            if guest_out_port:
-                out_port = guest_out_port
-                actions = [parser.OFPActionOutput(out_port)]
-            else:
-                out_port = ofproto.OFPP_FLOOD
-                actions = []
-                for port_no, port_name in ports.items():
-                    try:
-                        port_no_int = int(port_no)
-                    except Exception:
-                        continue
-                    if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
-                        continue
-                    port_name = str(port_name)
-                    # Propagar broadcasts/flood por todos los VXLAN peers activos
-                    # para que el ARP reach el destino en otro nodo.
-                    actions.append(parser.OFPActionOutput(port_no_int))
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            self.add_flow(datapath, 1, match, actions)
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
+            return
 
-                # Inyectar una copia del trafico broadcast al stack Linux local
-                # para que servicios hostNetwork como DHCP puedan leerlo.
-                if in_port != ofproto.OFPP_LOCAL:
-                    actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
+        guest_location = self._resolve_guest_out_port(dpid, dst)
+        if guest_location:
+            out_port = guest_location
+            actions = [parser.OFPActionOutput(out_port)]
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            self.add_flow(datapath, 1, match, actions)
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
+            return
 
-        # Install a flow to avoid packet_in next time
-        if out_port != ofproto.OFPP_FLOOD:
-            out_port_name = str(ports.get(str(out_port), ""))
-            if out_port_name.startswith("vx"):
-                peer_ip = out_port_name[2:]
-                node_ips = self._get_node_ips()
-                ip_to_dpid = {
-                    str(ip).replace(".", ""): self._raw_dpid_to_decimal(k)
-                    for k, ip in node_ips.items()
-                }
-                peer_dpid = ip_to_dpid.get(peer_ip)
-                if peer_dpid and not self._is_switch_alive(peer_dpid):
-                    self.logger.info(
-                        "Output port is VXLAN to dead switch: dpid=%s mac=%s port=%s peer=%s. Clearing MAC entry.",
-                        dpid, dst, out_port, peer_dpid,
-                    )
-                    try:
-                        self.redis.hdel(mac_table_key, dst)
-                    except redis.RedisError:
-                        pass
-                    out_port = ofproto.OFPP_FLOOD
-                    actions = []
-                    for port_no, port_name in ports.items():
-                        try:
-                            port_no_int = int(port_no)
-                        except Exception:
-                            continue
-                        if port_no_int == in_port or port_no_int == ofproto.OFPP_LOCAL:
-                            continue
-                        actions.append(parser.OFPActionOutput(port_no_int))
-                    if in_port != ofproto.OFPP_LOCAL:
-                        actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
+        self._do_controlled_flood(datapath, in_port, msg.data, ports)
 
-            if out_port != ofproto.OFPP_FLOOD:
-                lock_name = f"lock:flow:{dpid}:{src}:{dst}"
-                lock = None
-                acquired = False
-                try:
-                    lock = self.redis.lock(lock_name, timeout=5, blocking_timeout=1)
-                    acquired = lock.acquire()
-                except redis.RedisError as e:
-                    self.logger.warning("Redis unavailable while acquiring flow lock %s: %s", lock_name, e)
-                if acquired:
-                    try:
-                        match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-                        if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                            self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                            return
-                        else:
-                            self.add_flow(datapath, 1, match, actions)
-                    finally:
-                        try:
-                            lock.release()
-                        except redis.RedisError as e:
-                            self.logger.warning("Redis unavailable while releasing flow lock %s: %s", lock_name, e)
-                else:
-                    self.logger.info("Flow mod for %s->%s on %s is concurrently handled by another replica", src, dst, dpid)
+    def _do_controlled_flood(self, datapath, in_port, packet_data, ports):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
 
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
+        bcast_ports = self.broadcast_controller.get_broadcast_ports(
+            datapath.id, in_port, ports
+        )
+        if not bcast_ports:
+            self.logger.debug("No broadcast ports available from dpid=%s", datapath.id)
+            return
 
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
+        actions = [parser.OFPActionOutput(p) for p in bcast_ports]
+        if in_port != ofproto.OFPP_LOCAL:
+            actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
+
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=datapath.ofproto.OFP_NO_BUFFER,
+            in_port=in_port,
+            actions=actions,
+            data=packet_data,
+        )
         datapath.send_msg(out)
+
+    def _resolve_guest_out_port(self, current_dpid, dst_mac):
+        try:
+            guest_locations = self.redis.hgetall("topology:guest_locations") or {}
+        except redis.RedisError as e:
+            self.logger.warning("Redis error resolving guest location for %s: %s", dst_mac, e)
+            return None
+
+        location = guest_locations.get(dst_mac)
+        if not location or ":" not in location:
+            return None
+        dst_dpid, dst_port = location.split(":", 1)
+        current_dpid = str(current_dpid)
+        if current_dpid == str(dst_dpid):
+            return int(dst_port)
+
+        path_cache_key = f"path_next_hop:{current_dpid}:{dst_dpid}"
+        cached = self.cache.get(path_cache_key)
+        if cached and cached[0] > time.time():
+            try:
+                out_port = int(cached[1])
+                ports = self._get_switch_ports(current_dpid)
+                port_name = str(ports.get(str(out_port), ""))
+                if port_name and self._is_forwarding_port_alive(port_name, current_dpid):
+                    return out_port
+            except Exception:
+                pass
+            self.cache.pop(path_cache_key, None)
+
+        node_ips = self._get_node_ips()
+        src_ip = self._node_ip_for_dpid(current_dpid, node_ips)
+        dst_ip = self._node_ip_for_dpid(dst_dpid, node_ips)
+
+        if not src_ip or not dst_ip:
+            return None
+
+        src_dpid_int = self._raw_dpid_to_decimal(src_ip.replace(".", ""))
+        dst_dpid_int = self._raw_dpid_to_decimal(dst_ip.replace(".", ""))
+
+        if current_dpid != str(src_dpid_int):
+            return None
+
+        path = self.topology_manager.compute_dijkstra(src_dpid_int, dst_dpid_int)
+        if not path or len(path) < 2:
+            return None
+
+        if path[0] != src_dpid_int:
+            return None
+
+        next_dpid = path[1]
+        _, dst_port_num = self.topology_manager.get_switch_ports_for_link(src_dpid_int, next_dpid)
+
+        if dst_port_num is None:
+            node_ips_raw = self._get_node_ips()
+            ip_to_dpid = self._ip_to_dpid(node_ips_raw)
+            ports = self._get_switch_ports(src_dpid_int)
+            for port_no, port_name in ports.items():
+                port_name = str(port_name)
+                if port_name.startswith("vx"):
+                    peer_ip_raw = port_name[2:]
+                    peer_ip = self._vxlan_port_to_ip(port_name)
+                    if not peer_ip:
+                        continue
+                    peer_dpid = ip_to_dpid.get(peer_ip.replace(".", ""))
+                    if peer_dpid == next_dpid:
+                        dst_port_num = int(port_no)
+                        break
+
+        if dst_port_num is None:
+            return None
+
+        self.cache[path_cache_key] = (time.time() + RYU_CACHE_PATH_SECONDS, str(dst_port_num))
+
+        installed = self.forwarding_engine.install_path_flows(
+            src_dpid_int, dst_dpid_int, dst_mac, self.datapaths
+        )
+        if installed:
+            self.logger.info("Path flows installed for %s -> %s (cached next_hop=%s)",
+                             current_dpid, dst_dpid, dst_port_num)
+
+        return dst_port_num
+
+    def _node_ip_for_dpid(self, dpid, node_ips):
+        for raw_dpid, ip in node_ips.items():
+            if str(self._raw_dpid_to_decimal(raw_dpid)) == str(dpid):
+                return raw_dpid
+        return None
 
     def _monitor_datapaths(self):
         unresponsive = {}
@@ -973,7 +1170,6 @@ class DistributedL2Switch(app_manager.RyuApp):
                     self.logger.info("Cleared mac_to_port for deleted flow: dpid=%s mac=%s", dpid, eth_dst)
                 except redis.RedisError as e:
                     self.logger.warning("Redis error clearing mac_to_port for flow delete: %s", e)
-        # Exclude table-miss when reporting installed forwarding flows.
         self.installed_flows[dpid] = sum(1 for stat in ev.msg.body if stat.priority > 0)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
@@ -998,106 +1194,116 @@ class DistributedL2Switch(app_manager.RyuApp):
                 "tx_errors": stat.tx_errors,
             }
 
-    def _redis_metric_counts(self):
-        counts = {
-            "active_switches": 0,
-            "active_nodes": 0,
-            "learned_macs": {},
-        }
+    @set_ev_cls(event.EventSwitchEnter, MAIN_DISPATCHER)
+    def switch_enter_handler(self, ev):
+        self.logger.info("Switch entered: %s", ev.switch)
+        self._cache_delete_prefix("path_next_hop:")
         try:
-            switches = self._cached(
-                "topology:switches",
-                RYU_CACHE_NODE_IPS_SECONDS,
-                lambda: self.redis.smembers("topology:switches") or set(),
-            )
-            node_ips = self._get_node_ips()
-            topology_dpids = self._get_topology_switch_dpids(node_ips)
-            if not topology_dpids:
-                topology_dpids.update(str(dpid) for dpid in switches)
-            counts["active_switches"] = len(topology_dpids)
-            counts["active_nodes"] = len(topology_dpids)
-            for dpid in topology_dpids:
-                counts["learned_macs"][dpid] = self.redis.hlen(f"mac_to_port:{dpid}")
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while reading Redis metrics: %s", e)
+            self.topology_manager.recompute()
         except Exception as e:
-            self.logger.warning("Unexpected Redis metrics failure: %s", e)
-        return counts
+            self.logger.warning("MST recompute after switch enter failed: %s", e)
 
-    def _raw_dpid_to_decimal(self, raw_dpid):
+    @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
+    def switch_leave_handler(self, ev):
+        dpid = None
+        for port in ev.switch.ports:
+            dpid = port.dpid
+            break
+        if dpid and dpid in self.datapaths:
+            del self.datapaths[dpid]
+        self.logger.warning("Switch left: %s (dpid=%s)", ev.switch, dpid)
+        raw_dpid = self._decimal_dpid_to_raw(dpid) if dpid else None
+        if raw_dpid:
+            self._publish_switch_dead(raw_dpid)
+            self._clear_mac_to_port_for_dead_switch(raw_dpid)
+        self._cache_delete_prefix("path_next_hop:")
         try:
-            return str(int(str(raw_dpid), 16))
-        except Exception:
-            return str(raw_dpid)
+            self.topology_manager.recompute()
+        except Exception as e:
+            self.logger.warning("MST recompute after switch leave failed: %s", e)
 
-    def _decimal_dpid_to_raw(self, dpid):
+    @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
+    def link_add_handler(self, ev):
+        src = ev.link.src
+        dst = ev.link.dst
+        self.logger.info("Link added: %s:%s <-> %s:%s", src.dpid, src.port_no, dst.dpid, dst.port_no)
+        link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
         try:
-            return "0000" + hex(int(dpid))[2:].zfill(12)
-        except Exception:
-            return str(dpid)
+            self.redis.sadd("topology:links", link_str)
+            cost_src = self.redis.hget("topology:link_cost", f"{src.dpid}:{dst.dpid}") or DEFAULT_LINK_COST
+            cost_dst = self.redis.hget("topology:link_cost", f"{dst.dpid}:{src.dpid}") or DEFAULT_LINK_COST
+            self.redis.hset("topology:link_cost", f"{src.dpid}:{dst.dpid}", cost_src)
+            self.redis.hset("topology:link_cost", f"{dst.dpid}:{src.dpid}", cost_dst)
+        except redis.RedisError as e:
+            self.logger.warning("Redis error saving link: %s", e)
+        self._cache_delete_prefix("path_next_hop:")
+        try:
+            self.topology_manager.recompute()
+        except Exception as e:
+            self.logger.warning("MST recompute after link add failed: %s", e)
 
-    def _get_alive_switch_dpids(self):
-        def load_alive_switch_dpids():
-            alive_keys = self.redis.keys("switch:alive:*") or []
-            dpids = set()
-            for key in alive_keys:
-                raw_dpid = str(key).split("switch:alive:", 1)[-1]
-                dpids.add(self._raw_dpid_to_decimal(raw_dpid))
-            return dpids
-        return self._cached("switch:alive:dpids", RYU_CACHE_LIVENESS_SECONDS, load_alive_switch_dpids)
+    @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
+    def link_delete_handler(self, ev):
+        src = ev.link.src
+        dst = ev.link.dst
+        self.logger.warning("Link deleted: %s:%s <-> %s:%s", src.dpid, src.port_no, dst.dpid, dst.port_no)
+        link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
+        try:
+            self.redis.srem("topology:links", link_str)
+            self.redis.hdel("topology:link_cost", f"{src.dpid}:{dst.dpid}")
+            self.redis.hdel("topology:link_cost", f"{dst.dpid}:{src.dpid}")
+        except redis.RedisError as e:
+            self.logger.warning("Redis error removing link: %s", e)
+        self._cache_delete_prefix("path_next_hop:")
+        self._invalidate_flows_via_link(src.dpid, dst.dpid)
+        try:
+            self.topology_manager.recompute()
+        except Exception as e:
+            self.logger.warning("MST recompute after link delete failed: %s", e)
 
-    def _get_topology_switch_dpids(self, node_ips):
-        import time
-
-        ttl = int(os.environ.get("TOPOLOGY_NODE_TTL_SECONDS", "180"))
-        now = int(time.time())
-        last_seen = self._cached(
-            "topology:node_last_seen",
-            RYU_CACHE_NODE_IPS_SECONDS,
-            lambda: self.redis.hgetall("topology:node_last_seen") or {},
-        )
-        dpids = set()
-        for raw_dpid, timestamp in last_seen.items():
+    def _invalidate_flows_via_link(self, dpid1, dpid2):
+        for datapath in list(self.datapaths.values()):
             try:
-                if now - int(float(timestamp)) <= ttl:
-                    dpids.add(self._raw_dpid_to_decimal(raw_dpid))
-            except (TypeError, ValueError):
+                ports = self._get_switch_ports(datapath.id)
+            except redis.RedisError:
                 continue
-        dpids.update(self._get_alive_switch_dpids())
-        if not dpids:
-            dpids.update(str(dpid) for dpid in self._cached(
-                "topology:switches",
-                RYU_CACHE_NODE_IPS_SECONDS,
-                lambda: self.redis.smembers("topology:switches") or set(),
-            ))
-        return dpids
+            for port_no, port_name in ports.items():
+                port_name = str(port_name)
+                if port_name.startswith("vx"):
+                    peer_ip = self._vxlan_port_to_ip(port_name)
+                    node_ips = self._get_node_ips()
+                    ip_to_dpid = self._ip_to_dpid(node_ips)
+                    peer_dpid = ip_to_dpid.get(peer_ip.replace(".", ""))
+                    if peer_dpid in (dpid1, dpid2):
+                        parser = datapath.ofproto_parser
+                        match = parser.OFPMatch(in_port=int(port_no))
+                        mod = parser.OFPFlowMod(
+                            datapath=datapath,
+                            command=datapath.ofproto.OFPFC_DELETE_STRICT,
+                            out_port=datapath.ofproto.OFPP_ANY,
+                            out_group=datapath.ofproto.OFPG_ANY,
+                            priority=100,
+                            match=match,
+                        )
+                        datapath.send_msg(mod)
+                        self.logger.info("Drop flow installed on dead port: dpid=%s port=%s",
+                                         datapath.id, port_no)
+            self.logger.info("Invalidated flows via link %s <-> %s", dpid1, dpid2)
 
-    def _guest_mac_for_ip(self, ip_addr):
-        try:
-            guest_ips = self.redis.hgetall("topology:guest_ips") or {}
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while resolving guest IP %s: %s", ip_addr, e)
-            return None
-        for mac, guest_ip in guest_ips.items():
-            if guest_ip == ip_addr:
-                return mac
-        try:
-            import json
-            for device_id in self.redis.smembers("security:devices") or []:
-                payload = self.redis.get(f"security:device:{device_id}")
-                if not payload:
-                    continue
-                try:
-                    device = json.loads(payload)
-                except Exception:
-                    continue
-                mac = str(device.get("mac", "")).lower()
-                if mac and device.get("ip") == ip_addr:
-                    self.redis.hset("topology:guest_ips", mac, ip_addr)
-                    return mac
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while resolving security IP %s: %s", ip_addr, e)
-        return None
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=FORWARDING_FLOW_IDLE_TIMEOUT, hard_timeout=0):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_ADD,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            idle_timeout=idle_timeout,
+            hard_timeout=hard_timeout,
+        )
+        datapath.send_msg(mod)
 
     def _learn_guest_ip(self, mac, ip_addr):
         if not ip_addr or ip_addr in ("0.0.0.0", "10.0.0.1"):
@@ -1109,10 +1315,6 @@ class DistributedL2Switch(app_manager.RyuApp):
             guest_ips = self.redis.hgetall("topology:guest_ips") or {}
             for other_mac, other_ip in guest_ips.items():
                 if other_mac != mac and other_ip == ip_addr and dhcp_ip != ip_addr:
-                    self.logger.warning(
-                        "Ignoring duplicate guest IP learn mac=%s ip=%s already owned by mac=%s",
-                        mac, ip_addr, other_mac,
-                    )
                     return
             current_ip = self.redis.hget("topology:guest_ips", mac)
             if current_ip != ip_addr:
@@ -1120,948 +1322,111 @@ class DistributedL2Switch(app_manager.RyuApp):
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while learning guest IP %s=%s: %s", mac, ip_addr, e)
 
-    def _send_arp_reply(self, datapath, in_port, dst_mac, dst_ip, src_mac, src_ip):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        reply = packet.Packet()
-        reply.add_protocol(ethernet.ethernet(
-            ethertype=ether_types.ETH_TYPE_ARP,
-            dst=dst_mac,
-            src=src_mac,
-        ))
-        reply.add_protocol(arp.arp(
-            opcode=arp.ARP_REPLY,
-            src_mac=src_mac,
-            src_ip=src_ip,
-            dst_mac=dst_mac,
-            dst_ip=dst_ip,
-        ))
-        reply.serialize()
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=ofproto.OFPP_CONTROLLER,
-            actions=[parser.OFPActionOutput(in_port)],
-            data=reply.data,
-        )
-        datapath.send_msg(out)
+    def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name):
+        return True, None, None
 
-    def _resolve_guest_out_port(self, current_dpid, dst_mac):
+    def _is_policy_block_reason(self, reason):
+        return False
+
+    def _record_policy_block(self, *args, **kwargs):
+        pass
+
+    def _record_security_event(self, *args, **kwargs):
+        pass
+
+    def _drop_guest_packet(self, *args, **kwargs):
+        pass
+
+    def _guest_mac_for_ip(self, ip_addr):
         try:
-            guest_locations = self.redis.hgetall("topology:guest_locations") or {}
-            node_ips = self._get_node_ips()
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while resolving guest path to %s: %s", dst_mac, e)
+            return self.redis.hget("topology:guest_ips", ip_addr)
+        except redis.RedisError:
             return None
-
-        location = guest_locations.get(dst_mac)
-        if not location or ":" not in location:
-            return None
-        dst_dpid, dst_port = location.split(":", 1)
-        current_dpid = str(current_dpid)
-        if current_dpid == str(dst_dpid):
-            return int(dst_port)
-
-        path_cache_key = f"path_next_hop:{current_dpid}:{dst_dpid}"
-        cached_out_port = self.cache.get(path_cache_key)
-        if cached_out_port and cached_out_port[0] > time.time():
-            try:
-                out_port = int(cached_out_port[1])
-                ports = self._get_switch_ports(current_dpid)
-                port_name = str(ports.get(str(out_port), ""))
-                if port_name and self._is_forwarding_port_alive(port_name, current_dpid):
-                    return out_port
-            except Exception:
-                pass
-            self.cache.pop(path_cache_key, None)
-
-        dpids = {
-            str(dpid) for dpid in self._get_topology_switch_dpids(node_ips)
-            if self._is_switch_alive(dpid)
-        }
-        if self._is_switch_alive(current_dpid):
-            dpids.add(current_dpid)
-        if self._is_switch_alive(dst_dpid):
-            dpids.add(str(dst_dpid))
-        ip_to_dpid = {
-            str(ip).replace(".", ""): self._raw_dpid_to_decimal(raw_dpid)
-            for raw_dpid, ip in node_ips.items()
-        }
-        blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
-
-        switch_ports = {}
-        adjacency = {str(dpid): [] for dpid in dpids}
-        for dpid in dpids:
-            try:
-                ports = self._get_switch_ports(dpid)
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while reading ports for path %s: %s", dpid, e)
-                ports = {}
-            switch_ports[str(dpid)] = ports
-            for port_no, port_name in ports.items():
-                port_name = str(port_name)
-                if not port_name.startswith("vx"):
-                    continue
-                next_dpid = ip_to_dpid.get(port_name[2:])
-                if not next_dpid or str(next_dpid) not in dpids:
-                    continue
-                if not self._is_valid_vxlan_edge(dpid, next_dpid, node_ips, switch_ports, blocked_br0_links):
-                    continue
-                edge_blocked = (
-                    _edge_link_id(dpid, next_dpid) in blocked_br0_links or
-                    self._is_br0_edge_blocked(dpid, next_dpid, node_ips)
-                )
-                adjacency.setdefault(str(dpid), []).append((edge_blocked, str(next_dpid), int(port_no)))
-
-        for dpid in adjacency:
-            adjacency[dpid].sort(key=lambda edge: edge[0])
-
-        queue = [(0, 0, current_dpid, [])]
-        best = {current_dpid: (0, 0)}
-        while queue:
-            queue.sort(key=lambda item: (item[0], item[1]))
-            blocked_cost, hops, dpid, path_ports = queue.pop(0)
-            if dpid == str(dst_dpid):
-                out_port = path_ports[0] if path_ports else int(dst_port)
-                self.cache[path_cache_key] = (time.time() + RYU_CACHE_PATH_SECONDS, out_port)
-                return out_port
-            for edge_blocked, next_dpid, out_port in adjacency.get(dpid, []):
-                next_cost = blocked_cost + (1 if edge_blocked else 0)
-                next_hops = hops + 1
-                previous = best.get(next_dpid)
-                if previous is not None and previous <= (next_cost, next_hops):
-                    continue
-                best[next_dpid] = (next_cost, next_hops)
-                queue.append((next_cost, next_hops, next_dpid, path_ports + [out_port]))
-        return None
-
-    def _is_switch_alive(self, dpid):
-        raw_dpid = self._decimal_dpid_to_raw(dpid)
-        def load_switch_alive():
-            try:
-                return bool(self.redis.exists(f"switch:alive:{raw_dpid}"))
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while checking switch liveness %s: %s", dpid, e)
-                return False
-        return self._cached(f"switch:alive:{raw_dpid}", RYU_CACHE_LIVENESS_SECONDS, load_switch_alive)
-
-    def _is_forwarding_port_alive(self, port_name, local_dpid=None):
-        if not port_name.startswith("vx"):
-            return True
-        try:
-            node_ips = self._get_node_ips()
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while checking VXLAN peer %s: %s", port_name, e)
-            return False
-        peer_ip = port_name[2:]
-        for raw_dpid, ip in node_ips.items():
-            if str(ip).replace(".", "") != peer_ip:
-                continue
-            if not self._is_switch_alive(self._raw_dpid_to_decimal(raw_dpid)):
-                return False
-            if local_dpid is not None and not self._is_vxlan_peer_reachable(local_dpid, str(ip)):
-                return False
-            return True
-        return False
-
-    def _is_vxlan_peer_reachable(self, local_dpid, peer_ip):
-        raw_local = self._decimal_dpid_to_raw(local_dpid)
-        def load_peer_state():
-            try:
-                state = self.redis.get(f"vxlan:peer:state:{raw_local}:{peer_ip}")
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while checking VXLAN reachability %s->%s: %s", local_dpid, peer_ip, e)
-                return False
-            # Missing state is allowed during rollout or before the first probe.
-            return str(state or "up").lower() != "down"
-        return self._cached(f"vxlan:peer:state:{raw_local}:{peer_ip}", RYU_CACHE_LIVENESS_SECONDS, load_peer_state)
-
-    def _node_ip_for_dpid(self, dpid, node_ips):
-        raw_dpid = self._decimal_dpid_to_raw(dpid)
-        return node_ips.get(raw_dpid, "")
-
-    def _has_vxlan_to_ip(self, ports, peer_ip):
-        expected = "vx%s" % str(peer_ip).replace(".", "")
-        return expected in {str(port_name) for port_name in ports.values()}
-
-    def _is_valid_vxlan_edge(self, local_dpid, remote_dpid, node_ips, switch_ports, blocked_br0_links):
-        local_dpid = str(local_dpid)
-        remote_dpid = str(remote_dpid)
-        if not self._is_switch_alive(local_dpid) or not self._is_switch_alive(remote_dpid):
-            return False
-        local_ip = self._node_ip_for_dpid(local_dpid, node_ips)
-        remote_ip = self._node_ip_for_dpid(remote_dpid, node_ips)
-        if not local_ip or not remote_ip:
-            return False
-        if not self._is_vxlan_peer_reachable(local_dpid, remote_ip):
-            return False
-        if not self._is_vxlan_peer_reachable(remote_dpid, local_ip):
-            return False
-        local_ports = switch_ports.get(local_dpid)
-        if local_ports is None:
-            local_ports = self._get_switch_ports(local_dpid)
-            switch_ports[local_dpid] = local_ports
-        remote_ports = switch_ports.get(remote_dpid)
-        if remote_ports is None:
-            remote_ports = self._get_switch_ports(remote_dpid)
-            switch_ports[remote_dpid] = remote_ports
-        if not (self._has_vxlan_to_ip(local_ports, remote_ip) and self._has_vxlan_to_ip(remote_ports, local_ip)):
-            return False
-        if VXLAN_REQUIRES_FORWARDING_BR0_EDGE:
-            # Prefer direct forwarding physical links, but allow initializer-created
-            # fallback VXLANs when both endpoints are reachable and expose the tunnel.
-            return True
-        return True
-
-    def _has_forwarding_br0_edge(self, local_dpid, remote_dpid, node_ips, blocked_br0_links=None):
-        local_dpid = str(local_dpid)
-        remote_dpid = str(remote_dpid)
-        if blocked_br0_links and _edge_link_id(local_dpid, remote_dpid) in blocked_br0_links:
-            return False
-        remote_ip = self._node_ip_for_dpid(remote_dpid, node_ips)
-        local_ip = self._node_ip_for_dpid(local_dpid, node_ips)
-        if not local_ip or not remote_ip:
-            return False
-        try:
-            br0_stp_ports = self._get_br0_stp_ports()
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while checking br0 forwarding edge %s-%s: %s", local_dpid, remote_dpid, e)
-            return False
-        local_raw = self._decimal_dpid_to_raw(local_dpid)
-        remote_raw = self._decimal_dpid_to_raw(remote_dpid)
-        local_forwarding = False
-        remote_forwarding = False
-        for key, status in br0_stp_ports.items():
-            if ":" not in key:
-                continue
-            raw_dpid, _ = str(key).split(":", 1)
-            state, _, peer_ip = str(status).partition(":")
-            state = state.strip()
-            peer_ip = peer_ip.strip()
-            if raw_dpid == local_raw and peer_ip == remote_ip:
-                if state != "forwarding":
-                    return False
-                local_forwarding = True
-            elif raw_dpid == remote_raw and peer_ip == local_ip:
-                if state != "forwarding":
-                    return False
-                remote_forwarding = True
-        return local_forwarding and remote_forwarding
-
-    def _is_br0_edge_blocked(self, local_dpid, remote_dpid, node_ips):
-        local_dpid = str(local_dpid)
-        remote_dpid = str(remote_dpid)
-        remote_ip = self._node_ip_for_dpid(remote_dpid, node_ips)
-        local_ip = self._node_ip_for_dpid(local_dpid, node_ips)
-        if not local_ip or not remote_ip:
-            return True
-        try:
-            br0_stp_ports = self._get_br0_stp_ports()
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while checking br0 STP edge %s-%s: %s", local_dpid, remote_dpid, e)
-            return True
-        local_raw = self._decimal_dpid_to_raw(local_dpid)
-        remote_raw = self._decimal_dpid_to_raw(remote_dpid)
-        seen = False
-        for key, status in br0_stp_ports.items():
-            if ":" not in key:
-                continue
-            raw_dpid, _ = str(key).split(":", 1)
-            state, _, peer_ip = str(status).partition(":")
-            state = state.strip()
-            peer_ip = peer_ip.strip()
-            if raw_dpid == local_raw and peer_ip == remote_ip:
-                seen = True
-                if state != "forwarding":
-                    return True
-            if raw_dpid == remote_raw and peer_ip == local_ip:
-                seen = True
-                if state != "forwarding":
-                    return True
-        return not seen
-
-    def _get_blocked_br0_links(self, ip_to_dpid, dpids):
-        br0_stp_ports = self._get_br0_stp_ports()
-        blocked_links = set()
-        for key, status in br0_stp_ports.items():
-            if ":" not in key:
-                continue
-            raw_dpid, _ = key.split(":", 1)
-            local_dpid = self._raw_dpid_to_decimal(raw_dpid)
-            state, _, remote_ip = str(status).partition(":")
-            remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
-            if not remote_dpid or local_dpid not in dpids or remote_dpid not in dpids:
-                continue
-            if state != "forwarding":
-                blocked_links.add(_edge_link_id(local_dpid, remote_dpid))
-        return blocked_links
-
-    def _is_recent_guest(self, mac, dpid):
-        try:
-            raw_dpid = self._decimal_dpid_to_raw(dpid)
-            if not self.redis.exists(f"switch:alive:{raw_dpid}"):
-                return False
-            ip = (self.redis.hget("topology:guest_ips", mac) or "").strip()
-            is_smart_meter = False
-            device_id = self.redis.get(f"security:mac_to_device:{mac}")
-            if device_id:
-                import json
-                raw = self.redis.get(f"security:device:{device_id}")
-                if raw:
-                    device = json.loads(raw)
-                    if not ip:
-                        ip = str(device.get("ip", "")).strip()
-                    if device.get("role") == "smart_meter":
-                        is_smart_meter = True
-            if ip:
-                if not is_smart_meter:
-                    for key in self.redis.scan_iter("meter:latest:*"):
-                        if (self.redis.hget(key, "source_ip") or "").strip() == ip:
-                            is_smart_meter = True
-                            break
-            if is_smart_meter:
-                if ip:
-                    for key in self.redis.scan_iter("meter:latest:*"):
-                        if (self.redis.hget(key, "source_ip") or "").strip() != ip:
-                            continue
-                        timestamp = self.redis.hget(key, "timestamp")
-                        try:
-                            seen = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
-                            if seen.tzinfo is None:
-                                seen = seen.replace(tzinfo=timezone.utc)
-                            if (datetime.now(timezone.utc) - seen).total_seconds() <= ACTIVE_METER_MAX_AGE_SECONDS:
-                                return True
-                        except Exception:
-                            continue
-                return False
-            if self.redis.exists(f"active_mac:{dpid}:{mac}"):
-                return True
-            if self.redis.exists(f"health:{mac}"):
-                return True
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while checking guest freshness %s: %s", mac, e)
-        return False
-
-    def _has_fresh_meter_telemetry(self, ip):
-        if not ip:
-            return False
-        try:
-            for key in self.redis.scan_iter("meter:latest:*"):
-                if (self.redis.hget(key, "source_ip") or "").strip() != ip:
-                    continue
-                timestamp = self.redis.hget(key, "timestamp")
-                try:
-                    seen = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
-                    if seen.tzinfo is None:
-                        seen = seen.replace(tzinfo=timezone.utc)
-                    return (datetime.now(timezone.utc) - seen).total_seconds() <= ACTIVE_METER_MAX_AGE_SECONDS
-                except Exception:
-                    continue
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while checking meter telemetry %s: %s", ip, e)
-        return False
-
-    def _sync_security_guest_locations(self, guest_ips, guest_locations, dpids):
-        import json
-
-        try:
-            for device_id in self.redis.smembers("security:devices") or []:
-                payload = self.redis.get(f"security:device:{device_id}")
-                if not payload:
-                    continue
-                try:
-                    device = json.loads(payload)
-                except Exception:
-                    continue
-                if device.get("role") != "smart_meter":
-                    continue
-                if device.get("status", "authorized") not in ("authorized", "learning"):
-                    continue
-
-                mac = str(device.get("mac", "")).lower()
-                ip = str(device.get("ip", "")).strip()
-                dpid = str(device.get("dpid", "")).strip()
-                in_port = str(device.get("in_port", "")).strip()
-                if not mac or not ip or not dpid or not in_port or dpid not in dpids:
-                    continue
-                if not self._is_switch_alive(dpid):
-                    continue
-                if not self._has_fresh_meter_telemetry(ip):
-                    continue
-
-                ports = self._get_switch_ports(dpid)
-                port_name = str(ports.get(in_port, ""))
-                if port_name.startswith("vx") or in_port == "4294967294" or port_name == "br-sdn":
-                    continue
-
-                location = f"{dpid}:{in_port}"
-                if guest_ips.get(mac) != ip:
-                    self.redis.hset("topology:guest_ips", mac, ip)
-                    guest_ips[mac] = ip
-                if guest_locations.get(mac) != location:
-                    self.redis.hset("topology:guest_locations", mac, location)
-                    self.redis.hset("topology:guest_names", mac, device.get("device_id", device_id))
-                    guest_locations[mac] = location
-                    self.logger.info(
-                        "Guest location restored from security registry: device=%s mac=%s location=%s",
-                        device.get("device_id", device_id), mac, location,
-                    )
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while syncing security guest locations: %s", e)
-
-    def _add_guest_node_edge(self, guests, edges, mac, dpid, port_no, guest_ips):
-        ports = self._get_switch_ports(dpid)
-        port_name = ports.get(str(port_no), "")
-        if str(port_name).startswith("vx") or str(port_no) == "4294967294" or str(port_name) == "br-sdn":
-            return False
-        if not self._is_recent_guest(mac, dpid):
-            return False
-
-        guests[mac] = {
-            "id": mac,
-            "title": mac,
-            "subtitle": guest_ips.get(mac, "DHCP pendiente"),
-            "mainstat": "guest",
-            "color": "#ff00ee",
-            "icon": "desktop",
-            "type": "guest",
-            "switch": dpid,
-        }
-        edges.append({
-            "id": "guest:%s:%s" % (dpid, mac),
-            "source": dpid,
-            "target": mac,
-            "mainstat": "local",
-            "secondarystat": "guest",
-            "color": "#ff00ee",
-            "strokeDasharray": "3 3",
-            "thickness": "1",
-            "type": "guest",
-        })
-        return True
-
-    def _build_topology_snapshot(self):
-        node_names = self.redis.hgetall("topology:node_names") or {}
-        node_ips = self._get_node_ips()
-        dpids = self._get_topology_switch_dpids(node_ips)
-        guest_ips = self.redis.hgetall("topology:guest_ips") or {}
-        guest_locations = self.redis.hgetall("topology:guest_locations") or {}
-        br0_stp_ports = self._get_br0_stp_ports()
-        self._sync_security_guest_locations(guest_ips, guest_locations, dpids)
-
-        nodes = []
-        edges = []
-        vxlan_edges = {}
-        br0_edges = {}
-        guests = {}
-        has_mgmt_switch = False
-
-        ip_to_dpid = {}
-        for raw_dpid, ip in node_ips.items():
-            ip_to_dpid[str(ip).replace(".", "")] = self._raw_dpid_to_decimal(raw_dpid)
-        blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
-
-        for dpid in sorted(dpids):
-            raw_dpid = self._decimal_dpid_to_raw(dpid)
-            name = node_names.get(raw_dpid, "Nodo SDN")
-            ip = node_ips.get(raw_dpid, "")
-            nodes.append({
-                "id": dpid,
-                "title": name,
-                "subtitle": ip or raw_dpid,
-                "mainstat": "switch",
-                "color": "#00ffcc" if name == "master" else "#7dd3fc",
-                "icon": "server",
-                "type": "switch",
-            })
-
-            ports = self._get_switch_ports(dpid)
-            mac_table = self.redis.hgetall(f"mac_to_port:{dpid}") or {}
-
-            for port_no, port_name in ports.items():
-                if str(port_name).startswith("vx"):
-                    target = ip_to_dpid.get(str(port_name)[2:])
-                    if target and target in dpids:
-                        if not self._is_valid_vxlan_edge(dpid, target, node_ips, {str(dpid): ports}, blocked_br0_links):
-                            continue
-                        source, dest = sorted([str(dpid), str(target)])
-                        edge_id = "vx:%s:%s" % (source, dest)
-                        edge = vxlan_edges.setdefault(edge_id, {
-                            "id": edge_id,
-                            "source": source,
-                            "target": dest,
-                            "mainstat": "VXLAN",
-                            "secondarystat": "SDN tunnel",
-                            "color": "#64748b",
-                            "strokeDasharray": "",
-                            "thickness": "1",
-                            "type": "vxlan",
-                            "details": [],
-                        })
-                        edge["details"].append("%s:%s=active" % (dpid, port_name))
-
-            for mac, port_no in mac_table.items():
-                if mac.startswith("33:33:") or mac == "ff:ff:ff:ff:ff:ff":
-                    continue
-                if mac in guest_locations:
-                    continue
-
-                port_name = ports.get(str(port_no), "")
-                is_known_guest = mac in guest_ips
-                is_local_guest_port = str(port_name).startswith("ens")
-                is_non_tunnel_port = (
-                    is_known_guest and
-                    str(port_no) != "4294967294" and
-                    not str(port_name).startswith("vx") and
-                    str(port_name) != "br-sdn"
-                )
-                if not is_local_guest_port and not is_non_tunnel_port:
-                    continue
-                if not self._is_recent_guest(mac, dpid):
-                    continue
-                self._add_guest_node_edge(guests, edges, mac, dpid, port_no, guest_ips)
-
-        worker_macs = self._known_worker_macs()
-        for mac, location in guest_locations.items():
-            if mac in worker_macs:
-                continue
-            if mac in guests:
-                continue
-            location_dpid, _, port_no = str(location).partition(":")
-            if not location_dpid or not port_no or location_dpid not in dpids:
-                continue
-            if not self._is_recent_guest(mac, location_dpid):
-                continue
-            self._add_guest_node_edge(guests, edges, mac, location_dpid, port_no, guest_ips)
-
-        import json
-        for device_id in self.redis.smembers("security:devices") or []:
-            payload = self.redis.get(f"security:device:{device_id}")
-            if not payload:
-                continue
-            try:
-                device = json.loads(payload)
-            except Exception:
-                continue
-            mac = str(device.get("mac", "")).lower()
-            dpid = str(device.get("dpid", ""))
-            port_no = str(device.get("in_port", ""))
-            if not mac or mac in worker_macs or mac in guests:
-                continue
-            if not dpid or not port_no or dpid not in dpids:
-                continue
-            if not self._is_recent_guest(mac, dpid):
-                continue
-            status = device.get("status", "authorized")
-            guests[mac] = {
-                "id": mac,
-                "title": mac,
-                "subtitle": device.get("ip", "") or "DHCP pendiente",
-                "mainstat": "guest" if status in ("authorized", "learning") else status,
-                "color": "#ff00ee" if status in ("authorized", "learning") else "#f97316",
-                "icon": "desktop",
-                "type": "guest",
-                "switch": dpid,
-            }
-            edges.append({
-                "id": "guest:%s:%s" % (dpid, mac),
-                "source": dpid,
-                "target": mac,
-                "mainstat": "local",
-                "secondarystat": "guest",
-                "color": "#ff00ee" if status in ("authorized", "learning") else "#f97316",
-                "strokeDasharray": "3 3",
-                "thickness": "1",
-                "type": "guest",
-            })
-
-        for edge in vxlan_edges.values():
-            edge.pop("details", None)
-            edges.append(edge)
-
-        for key, status in br0_stp_ports.items():
-            if ":" not in key:
-                continue
-            raw_dpid, intf = key.split(":", 1)
-            local_dpid = self._raw_dpid_to_decimal(raw_dpid)
-            state, _, remote_ip = str(status).partition(":")
-            if remote_ip == "mgmt-switch":
-                if local_dpid not in dpids:
-                    continue
-                has_mgmt_switch = True
-                edge_id = "br0:%s:%s" % (local_dpid, MGMT_SWITCH_ID)
-                edge = br0_edges.setdefault(edge_id, {
-                    "id": edge_id,
-                    "source": local_dpid,
-                    "target": MGMT_SWITCH_ID,
-                    "mainstat": "br0 switch",
-                    "secondarystat": "mgmt uplink",
-                    "color": "#22c55e" if state == "forwarding" else "#f59e0b",
-                    "strokeDasharray": "" if state == "forwarding" else "5 5",
-                    "thickness": "2" if state == "forwarding" else "1",
-                    "type": "br0_mgmt_switch",
-                    "details": [],
-                })
-                edge["details"].append("%s:%s=%s" % (local_dpid, intf, state))
-                continue
-
-            remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
-            if not remote_dpid or local_dpid not in dpids or remote_dpid not in dpids:
-                continue
-
-            source, dest = sorted([str(local_dpid), str(remote_dpid)])
-            edge_id = "br0:%s:%s" % (source, dest)
-            edge = br0_edges.setdefault(edge_id, {
-                "id": edge_id,
-                "source": source,
-                "target": dest,
-                "mainstat": "br0 STP",
-                "secondarystat": "physical forwarding",
-                "color": "#94a3b8",
-                "strokeDasharray": "",
-                "thickness": "1",
-                "type": "br0_stp",
-                "details": [],
-            })
-            edge["details"].append("%s:%s=%s" % (local_dpid, intf, state))
-            if state != "forwarding":
-                edge.update({
-                    "mainstat": "br0 STP blocked" if state == "blocking" else "br0 disabled",
-                    "secondarystat": "STP blocked" if state == "blocking" else "STP disabled",
-                    "color": "#ef4444",
-                    "strokeDasharray": "",
-                    "thickness": "6",
-                    "type": "br0_stp_blocked",
-                })
-
-        for edge in br0_edges.values():
-            edge.pop("details", None)
-            link = _edge_link_id(edge["source"], edge["target"])
-            # Grafana debe recibir una sola arista por par de nodos. Si hay
-            # enlace físico br0, este reemplaza la arista VXLAN conceptual.
-            edges = [existing for existing in edges if _edge_link_id(existing["source"], existing["target"]) != link]
-            edges.append(edge)
-
-        if has_mgmt_switch:
-            nodes.append({
-                "id": MGMT_SWITCH_ID,
-                "title": "Mgmt-STP-Switch",
-                "subtitle": "br0 STP root",
-                "mainstat": "mgmt switch",
-                "color": "#22c55e",
-                "icon": "server",
-                "type": "switch",
-            })
-
-        nodes.extend(guests.values())
-        return nodes, edges, guests, ip_to_dpid
-
-    def _trace_guest_path(self, src_guest, dst_guest, dpids, ip_to_dpid):
-        src_switch = None
-        dst_switch = None
-        switch_ports = {}
-        mac_tables = {}
-        guest_locations = self.redis.hgetall("topology:guest_locations") or {}
-        node_ips = self._get_node_ips()
-        blocked_br0_links = self._get_blocked_br0_links(ip_to_dpid, dpids)
-
-        for dpid in dpids:
-            mac_table = self.redis.hgetall(f"mac_to_port:{dpid}") or {}
-            ports = self._get_switch_ports(dpid)
-            mac_tables[dpid] = mac_table
-            switch_ports[dpid] = ports
-
-            src_port = mac_table.get(src_guest)
-            if src_port and not str(ports.get(str(src_port), "")).startswith("vx"):
-                src_switch = dpid
-
-            dst_port = mac_table.get(dst_guest)
-            if dst_port and not str(ports.get(str(dst_port), "")).startswith("vx"):
-                dst_switch = dpid
-
-        if not src_switch:
-            src_switch = str(guest_locations.get(src_guest, "")).split(":", 1)[0] or None
-        if not dst_switch:
-            dst_switch = str(guest_locations.get(dst_guest, "")).split(":", 1)[0] or None
-        if src_switch not in dpids or dst_switch not in dpids:
-            return []
-
-        if not src_switch or not dst_switch:
-            return []
-
-        path_edges = [("path:%s" % _edge_link_id(src_guest, src_switch), src_guest, src_switch)]
-        visited = set()
-        curr_switch = src_switch
-
-        while curr_switch != dst_switch:
-            if curr_switch in visited:
-                break
-            visited.add(curr_switch)
-
-            out_port = mac_tables.get(curr_switch, {}).get(dst_guest)
-            if not out_port:
-                break
-
-            port_name = switch_ports.get(curr_switch, {}).get(str(out_port), "")
-            if not str(port_name).startswith("vx"):
-                break
-
-            next_switch = ip_to_dpid.get(str(port_name)[2:])
-            if not next_switch:
-                break
-            if not self._is_valid_vxlan_edge(curr_switch, next_switch, node_ips, switch_ports, blocked_br0_links):
-                break
-
-            path_edges.append(("path:%s" % _edge_link_id(curr_switch, next_switch), curr_switch, next_switch))
-            curr_switch = next_switch
-
-        if curr_switch == dst_switch:
-            path_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
-            return path_edges
-
-        adjacency = {str(dpid): [] for dpid in dpids}
-        for dpid, ports in switch_ports.items():
-            for _, port_name in sorted(ports.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else 0):
-                if not str(port_name).startswith("vx"):
-                    continue
-                target = ip_to_dpid.get(str(port_name)[2:])
-                if target and target in dpids:
-                    if not self._is_valid_vxlan_edge(dpid, target, node_ips, switch_ports, blocked_br0_links):
-                        continue
-                    adjacency[str(dpid)].append(str(target))
-
-        queue = [(str(src_switch), [str(src_switch)])]
-        visited = {str(src_switch)}
-        while queue:
-            curr_switch, path = queue.pop(0)
-            if curr_switch == str(dst_switch):
-                graph_edges = [("path:%s" % _edge_link_id(src_guest, src_switch), src_guest, src_switch)]
-                for source, target in zip(path, path[1:]):
-                    graph_edges.append(("path:%s" % _edge_link_id(source, target), source, target))
-                graph_edges.append(("path:%s" % _edge_link_id(dst_switch, dst_guest), dst_switch, dst_guest))
-                return graph_edges
-
-            for next_switch in adjacency.get(curr_switch, []):
-                if next_switch in visited:
-                    continue
-                visited.add(next_switch)
-                queue.append((next_switch, path + [next_switch]))
-        return []
-
-    def _append_topology_metrics(self, lines):
-        nodes, edges, guests, ip_to_dpid = self._build_topology_snapshot()
-        dpids = {
-            node["id"] for node in nodes
-            if node["type"] == "switch" and node["id"] != MGMT_SWITCH_ID
-        }
-        sample_value = str(datetime.utcnow().timestamp())
-
-        lines.extend([
-            "# HELP ryu_topology_node_info SDN topology nodes for Grafana node graph.",
-            "# TYPE ryu_topology_node_info gauge",
-        ])
-        for node in nodes:
-            labels = (
-                'id="%s",title="%s",subtitle="%s",mainstat="%s",color="%s",icon="%s",type="%s"'
-                % (
-                    _escape_label(node["id"]),
-                    _escape_label(node["title"]),
-                    _escape_label(node["subtitle"]),
-                    _escape_label(node["mainstat"]),
-                    _escape_label(node["color"]),
-                    _escape_label(node["icon"]),
-                    _escape_label(node["type"]),
-                )
-            )
-            lines.append("ryu_topology_node_info{%s} %s" % (labels, sample_value))
-
-        lines.extend([
-            "# HELP ryu_topology_edge_info SDN topology edges for Grafana node graph.",
-            "# TYPE ryu_topology_edge_info gauge",
-        ])
-        for edge in edges:
-            labels = (
-                'id="%s",source="%s",target="%s",link="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
-                % (
-                    _escape_label(edge["id"]),
-                    _escape_label(edge["source"]),
-                    _escape_label(edge["target"]),
-                    _escape_label(_edge_link_id(edge["source"], edge["target"])),
-                    _escape_label(edge["mainstat"]),
-                    _escape_label(edge.get("secondarystat", "")),
-                    _escape_label(edge["color"]),
-                    _escape_label(edge.get("strokeDasharray", "")),
-                    _escape_label(edge.get("thickness", "1")),
-                    _escape_label(edge["type"]),
-                )
-            )
-            lines.append("ryu_topology_edge_info{%s} %s" % (labels, sample_value))
-
-        lines.extend([
-            "# HELP ryu_trace_path_edge_info Highlighted guest-to-guest path edges for Grafana node graph.",
-            "# TYPE ryu_trace_path_edge_info gauge",
-        ])
-        guest_ids = sorted(guests.keys())
-        for src_guest in guest_ids:
-            for dst_guest in guest_ids:
-                if src_guest == dst_guest:
-                    continue
-                for edge_id, source, target in self._trace_guest_path(src_guest, dst_guest, dpids, ip_to_dpid):
-                    labels = (
-                        'src_guest="%s",dst_guest="%s",id="%s",source="%s",target="%s",link="%s",mainstat="%s",secondarystat="%s",color="%s",strokeDasharray="%s",thickness="%s",type="%s"'
-                        % (
-                            _escape_label(src_guest),
-                            _escape_label(dst_guest),
-                            _escape_label(edge_id),
-                            _escape_label(source),
-                            _escape_label(target),
-                            _escape_label(_edge_link_id(source, target)),
-                            "path",
-                            "",
-                            "#facc15",
-                            "",
-                            "5",
-                            "path",
-                        )
-                    )
-                    lines.append("ryu_trace_path_edge_info{%s} %s" % (labels, sample_value))
-
-    def _render_prometheus_metrics(self):
-        export_global_metrics = self._is_metrics_exporter()
-        redis_counts = {"active_switches": 0, "active_nodes": 0, "learned_macs": {}}
-        security_total = mac_spoofing = ip_spoofing = arp_poisoning = 0
-        policy_blocks_total = status_blocked = status_quarantine = status_quarantined = 0
-        if export_global_metrics:
-            redis_counts = self._redis_metric_counts()
-            try:
-                security_total = self.redis.get("security:events_total") or 0
-                mac_spoofing = self.redis.get("security:events:MAC_SPOOFING") or 0
-                ip_spoofing = self.redis.get("security:events:IP_SPOOFING") or 0
-                arp_poisoning = self.redis.get("security:events:ARP_POISONING") or 0
-                policy_blocks_total = self.redis.get("security:policy_blocks_total") or 0
-                status_blocked = self.redis.get("security:policy_blocks:status_blocked") or 0
-                status_quarantine = self.redis.get("security:policy_blocks:status_quarantine") or 0
-                status_quarantined = self.redis.get("security:policy_blocks:status_quarantined") or 0
-            except redis.RedisError as e:
-                self.logger.warning("Redis unavailable while reading security metrics: %s", e)
-
-        lines = [
-            "# HELP ryu_security_events_total Total security events detected.",
-            "# TYPE ryu_security_events_total counter",
-            "ryu_security_events_total %s" % security_total,
-            "# HELP ryu_security_events_by_type_total Security events by type.",
-            "# TYPE ryu_security_events_by_type_total counter",
-            'ryu_security_events_by_type_total{type="MAC_SPOOFING"} %s' % mac_spoofing,
-            'ryu_security_events_by_type_total{type="IP_SPOOFING"} %s' % ip_spoofing,
-            'ryu_security_events_by_type_total{type="ARP_POISONING"} %s' % arp_poisoning,
-            "# HELP ryu_security_policy_blocks_total Total packets blocked by configured security policy.",
-            "# TYPE ryu_security_policy_blocks_total counter",
-            "ryu_security_policy_blocks_total %s" % policy_blocks_total,
-            "# HELP ryu_security_policy_blocks_by_reason Policy blocks by reason.",
-            "# TYPE ryu_security_policy_blocks_by_reason counter",
-            'ryu_security_policy_blocks_by_reason{reason="status_blocked"} %s' % status_blocked,
-            'ryu_security_policy_blocks_by_reason{reason="status_quarantine"} %s' % status_quarantine,
-            'ryu_security_policy_blocks_by_reason{reason="status_quarantined"} %s' % status_quarantined,
-            "# HELP ryu_packet_in_total Total Packet-In messages processed by Ryu.",
-            "# TYPE ryu_packet_in_total counter",
-        ]
-        for dpid, value in sorted(self.packet_in_total.items()):
-            lines.append('ryu_packet_in_total{dpid="%s"} %s' % (_escape_label(dpid), value))
-
-        lines.extend([
-            "# HELP ryu_flow_mod_total Total FlowMod messages sent by Ryu.",
-            "# TYPE ryu_flow_mod_total counter",
-        ])
-        for dpid, value in sorted(self.flow_mod_total.items()):
-            lines.append('ryu_flow_mod_total{dpid="%s"} %s' % (_escape_label(dpid), value))
-
-        lines.extend([
-            "# HELP ryu_installed_flows Current installed forwarding flows per switch.",
-            "# TYPE ryu_installed_flows gauge",
-        ])
-        for dpid, value in sorted(self.installed_flows.items()):
-            lines.append('ryu_installed_flows{dpid="%s"} %s' % (_escape_label(dpid), value))
-
-        lines.extend([
-            "# HELP ryu_active_switches Switches currently registered in Redis topology.",
-            "# TYPE ryu_active_switches gauge",
-            "ryu_active_switches %s" % redis_counts["active_switches"],
-            "# HELP ryu_active_nodes Nodes currently registered in Redis topology.",
-            "# TYPE ryu_active_nodes gauge",
-            "ryu_active_nodes %s" % redis_counts["active_nodes"],
-            "# HELP ryu_learned_macs Current learned MAC addresses per switch.",
-            "# TYPE ryu_learned_macs gauge",
-        ])
-        for dpid, value in sorted(redis_counts["learned_macs"].items()):
-            lines.append('ryu_learned_macs{dpid="%s"} %s' % (_escape_label(dpid), value))
-
-        lines.extend([
-            "# HELP ryu_port_rx_bytes_total OpenFlow port received bytes.",
-            "# TYPE ryu_port_rx_bytes_total counter",
-        ])
-        for (dpid, port_no), stats in sorted(self.port_stats.items()):
-            labels = 'dpid="%s",port_no="%s",port_name="%s"' % (
-                _escape_label(dpid), _escape_label(port_no), _escape_label(stats["port_name"]))
-            lines.append("ryu_port_rx_bytes_total{%s} %s" % (labels, stats["rx_bytes"]))
-
-        lines.extend([
-            "# HELP ryu_port_tx_bytes_total OpenFlow port transmitted bytes.",
-            "# TYPE ryu_port_tx_bytes_total counter",
-        ])
-        for (dpid, port_no), stats in sorted(self.port_stats.items()):
-            labels = 'dpid="%s",port_no="%s",port_name="%s"' % (
-                _escape_label(dpid), _escape_label(port_no), _escape_label(stats["port_name"]))
-            lines.append("ryu_port_tx_bytes_total{%s} %s" % (labels, stats["tx_bytes"]))
-
-        lines.extend([
-            "# HELP ryu_process_start_time_seconds Unix timestamp when this Ryu process started.",
-            "# TYPE ryu_process_start_time_seconds gauge",
-            "ryu_process_start_time_seconds %s" % self.metrics_started_at,
-            "# HELP redis_query_total Total Redis operations executed by application services",
-            "# TYPE redis_query_total counter",
-        ])
-        for (operation, status), metric in sorted(self.redis_metrics.items()):
-            labels = 'service="ryu",operation="%s",status="%s"' % (
-                _escape_label(operation), _escape_label(status))
-            lines.append("redis_query_total{%s} %s" % (labels, metric["count"]))
-        lines.extend([
-            "# HELP redis_query_duration_seconds_total Total Redis operation duration in seconds",
-            "# TYPE redis_query_duration_seconds_total counter",
-        ])
-        for (operation, status), metric in sorted(self.redis_metrics.items()):
-            labels = 'service="ryu",operation="%s",status="%s"' % (
-                _escape_label(operation), _escape_label(status))
-            lines.append("redis_query_duration_seconds_total{%s} %s" % (labels, metric["seconds"]))
-        lines.extend([
-            "# HELP redis_query_duration_seconds_max Maximum observed Redis operation duration in seconds since process start",
-            "# TYPE redis_query_duration_seconds_max gauge",
-        ])
-        for (operation, status), metric in sorted(self.redis_metrics.items()):
-            labels = 'service="ryu",operation="%s",status="%s"' % (
-                _escape_label(operation), _escape_label(status))
-            lines.append("redis_query_duration_seconds_max{%s} %s" % (labels, metric["max"]))
-        if export_global_metrics:
-            self._append_topology_metrics(lines)
-        return ("\n".join(lines) + "\n").encode("utf-8")
-
-    def _metrics_wsgi_app(self, env, start_response):
-        if env.get("PATH_INFO") != "/metrics":
-            start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
-            return [b"not found\n"]
-        now = time.time()
-        if self.metrics_cache_body is not None and now < self.metrics_cache_until:
-            body = self.metrics_cache_body
-        else:
-            body = self._render_prometheus_metrics()
-            self.metrics_cache_body = body
-            self.metrics_cache_until = now + METRICS_CACHE_SECONDS
-        start_response("200 OK", [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")])
-        return [body]
 
     def _start_metrics_server(self):
         try:
-            listener = eventlet.listen(("0.0.0.0", METRICS_PORT))
-            self.logger.info("Prometheus metrics endpoint listening on 0.0.0.0:%d/metrics", METRICS_PORT)
-            eventlet.wsgi.server(listener, self._metrics_wsgi_app, log_output=False)
+            from wsgiref.simple_server import make_server
+        except ImportError:
+            self.logger.warning("wsgiref not available, metrics server disabled")
+            return
+        if not self._is_metrics_exporter():
+            return
+
+        def app(environ, start_response):
+            path = environ.get("PATH_INFO", "")
+            if path == "/metrics":
+                body = self._generate_metrics().encode("utf-8")
+                start_response("200 OK", [("Content-Type", "text/plain; version=0.0.4")])
+                return [body]
+            start_response("404 Not Found", [])
+            return []
+
+        try:
+            httpd = make_server("0.0.0.0", METRICS_PORT, app)
+            self.logger.info("Metrics server listening on port %d", METRICS_PORT)
+            httpd.serve_forever()
         except Exception as e:
-            self.logger.error("Unable to start metrics endpoint: %s", e)
+            self.logger.warning("Metrics server failed: %s", e)
+
+    def _generate_metrics(self):
+        lines = []
+        uptime = datetime.utcnow().timestamp() - self.metrics_started_at
+        lines.append(f"# HELP ryu_uptime_seconds Uptime of this Ryu instance")
+        lines.append(f"# TYPE ryu_uptime_seconds gauge")
+        lines.append(f"ryu_uptime_seconds{{node=\"{NODE_NAME}\"}} {uptime:.0f}")
+
+        lines.append(f"# HELP ryu_packet_in_total Total Packet-In events")
+        lines.append(f"# TYPE ryu_packet_in_total counter")
+        for dpid, count in self.packet_in_total.items():
+            lines.append(f'ryu_packet_in_total{{dpid="{dpid}"}} {count}')
+
+        lines.append(f"# HELP ryu_installed_flows Installed forwarding flows per switch")
+        lines.append(f"# TYPE ryu_installed_flows gauge")
+        for dpid, count in self.installed_flows.items():
+            lines.append(f'ryu_installed_flows{{dpid="{dpid}"}} {count}')
+
+        lines.append(f"# HELP ryu_active_nodes Number of active switches")
+        lines.append(f"# TYPE ryu_active_nodes gauge")
+        lines.append(f"ryu_active_nodes {len(self.datapaths)}")
+
+        for (dpid, port_no), stats in self.port_stats.items():
+            p = stats
+            lines.append(f'ryu_port_rx_bytes_total{{dpid="{dpid}",port="{port_no}",name="{p["port_name"]}"}} {p["rx_bytes"]}')
+            lines.append(f'ryu_port_tx_bytes_total{{dpid="{dpid}",port="{port_no}",name="{p["port_name"]}"}} {p["tx_bytes"]}')
+            lines.append(f'ryu_port_rx_packets_total{{dpid="{dpid}",port="{port_no}",name="{p["port_name"]}"}} {p["rx_packets"]}')
+            lines.append(f'ryu_port_tx_packets_total{{dpid="{dpid}",port="{port_no}",name="{p["port_name"]}"}} {p["tx_packets"]}')
+
+        try:
+            node_ips = self._get_node_ips()
+            topo_version = self.topology_manager.topology_version
+            mst_edges = len(self.topology_manager.mst_edges)
+            diameter = -1
+            if self.topology_manager.graph and self.topology_manager.graph.number_of_nodes() > 0:
+                try:
+                    diameter = nx.diameter(self.topology_manager.graph)
+                except Exception:
+                    pass
+            lines.append(f"# HELP ryu_topology_version Topology version (increments on MST change)")
+            lines.append(f"# TYPE ryu_topology_version counter")
+            lines.append(f"ryu_topology_version {topo_version}")
+            lines.append(f"# HELP ryu_mst_edges Number of edges in MST")
+            lines.append(f"# TYPE ryu_mst_edges gauge")
+            lines.append(f"ryu_mst_edges {mst_edges}")
+            lines.append(f"# HELP ryu_topology_diameter Graph diameter")
+            lines.append(f"# TYPE ryu_topology_diameter gauge")
+            lines.append(f"ryu_topology_diameter {diameter}")
+            lines.append(f"# HELP ryu_topology_node_info Switch in topology")
+            lines.append(f"# TYPE ryu_topology_node_info gauge")
+            for raw_dpid, ip in node_ips.items():
+                dpid_int = self._raw_dpid_to_decimal(raw_dpid)
+                alive = 1 if self._is_switch_alive(dpid_int) else 0
+                lines.append(f'ryu_topology_node_info{{dpid="{raw_dpid}",ip="{ip}",alive="{alive}"}} 1')
+            lines.append(f"# HELP ryu_topology_edge_info Physical link in topology")
+            lines.append(f"# TYPE ryu_topology_edge_info gauge")
+            links = self.redis.smembers("topology:links") or set()
+            for link in links:
+                lines.append(f'ryu_topology_edge_info{{link="{link}"}} 1')
+        except Exception as e:
+            self.logger.warning("Error generating topology metrics: %s", e)
+
+        return "\n".join(lines) + "\n"

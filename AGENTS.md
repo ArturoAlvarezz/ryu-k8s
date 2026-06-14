@@ -78,6 +78,7 @@
 - GNS3 STP root check: resolve the `gns3/openvswitch:latest` container with `docker ps`, then run `docker exec <container> ovs-appctl stp/show br0` and verify `This bridge is the root`.
 
 ## Architecture Gotchas
+- **VXLAN topology is neighbor-only (LLDP), NOT full mesh.** `ovs-sdn-initializer` must read `topology:links` from Redis and create one VXLAN tunnel per LLDP-discovered physical neighbor, not one per known node in `topology:node_ips`. Full mesh was a rejected alternative: it is `O(n²)`, does not scale past ~50 nodes, and defeats the purpose of multi-hop Dijkstra path stitching. The MST/Dijkstra design in `services/ryu-controller/app.py` assumes a sparse graph (typically 2 neighbors per node in a ring/chain), not a clique.
 - Redis keys are part of the runtime contract: `topology:switches`, `topology:node_names`, `topology:node_ips`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, and `meter:*` are consumed across services.
 - DPID formatting differs by context: Ryu often uses decimal datapath IDs; topology/node metadata uses raw hex strings like `0000` plus 12 hex digits. Preserve existing conversions.
 - DHCP depends on Ryu sending broadcast traffic to `OFPP_LOCAL`; changing FLOOD/local OpenFlow behavior can break Scapy DHCP on `br-sdn` even if packets still traverse OVS.

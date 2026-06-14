@@ -1,3 +1,4 @@
 ryu==4.34
 eventlet==0.30.2
 redis
+networkx
