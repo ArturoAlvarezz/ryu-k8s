@@ -130,6 +130,17 @@ default_active_ports() {
   esac
 }
 
+# Prioridad del failover de uplink: solo los control planes de respaldo lo
+# corren. master no (siempre enslava su propio ens3 al Mgmt-Switch via
+# gns3-br0-tree). Vacio = no instalar el daemon.
+uplink_failover_priority() {
+  case "$NODE_NAME" in
+    control-2) echo 1 ;;
+    control-3) echo 2 ;;
+    *) echo "" ;;
+  esac
+}
+
 write_netplan() {
   dns_list=$(yaml_list "$NODE_DNS")
   active_ports=${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}
@@ -228,6 +239,42 @@ EOF
   systemctl enable --now gns3-br0-tree.service
 }
 
+install_uplink_failover_service() {
+  priority=$(uplink_failover_priority)
+  if [ -z "$priority" ]; then
+    # master (u otro nodo): no corre el failover. Asegurar que no quede activo.
+    systemctl disable --now uplink-failover.service 2>/dev/null || true
+    rm -f /etc/systemd/system/uplink-failover.service /etc/default/uplink-failover \
+          /etc/systemd/network/05-uplink-ens3-unmanaged.network
+    return 0
+  fi
+
+  install -m 0755 "$REPO_DIR/tools/gns3/uplink-failover.sh" /usr/local/bin/uplink-failover.sh
+  cat >/etc/default/uplink-failover <<EOF
+UPLINK_PORT=ens3
+MASTER_IP=192.168.122.100
+GATEWAY=$NODE_GATEWAY
+PRIORITY=$priority
+EOF
+
+  # El uplink ens3 (hacia el Mgmt-STP-Switch) queda bajo control exclusivo del
+  # daemon; networkd no debe gestionarlo para que el enslave/nomaster persista.
+  mkdir -p /etc/systemd/network
+  cat >/etc/systemd/network/05-uplink-ens3-unmanaged.network <<'EOF'
+[Match]
+Name=ens3
+
+[Link]
+Unmanaged=yes
+EOF
+
+  install -m 0644 "$REPO_DIR/tools/gns3/uplink-failover.service" \
+    /etc/systemd/system/uplink-failover.service
+  networkctl reload 2>/dev/null || true
+  systemctl daemon-reload
+  systemctl enable --now uplink-failover.service
+}
+
 configure_network_wait() {
   mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d/
   cat >/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf <<'EOF'
@@ -288,6 +335,7 @@ install_docker
 configure_hostname
 write_netplan
 install_br0_service
+install_uplink_failover_service
 configure_network_wait
 configure_forwarding
 
