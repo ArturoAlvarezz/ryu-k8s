@@ -1033,6 +1033,23 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.arp_handler.learn_request_location(dpid, in_port, src)
             self.arp_handler.mark_arp(dpid, src, arp_pkt.src_ip, arp_pkt.src_ip, arp.ARP_REPLY)
 
+        # For known guest destinations always use Dijkstra (guest_locations → topology).
+        # mac_to_port learns source MACs via MST flood, so a guest MAC may be recorded
+        # under the flood-arrival port rather than the optimal direct VXLAN port.
+        # Calling _resolve_guest_out_port first prevents stale flood-learned entries
+        # from overriding the Dijkstra-computed optimal path.
+        guest_location = self._resolve_guest_out_port(dpid, dst)
+        if guest_location:
+            out_port = guest_location
+            actions = [parser.OFPActionOutput(out_port)]
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            self.add_flow(datapath, 1, match, actions)
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
+            return
+
+        # Fallback: mac_to_port L2 learning for non-guest MACs (worker bridge MACs, etc.)
         try:
             out_port_str = self.redis.hget(mac_table_key, dst)
         except redis.RedisError as e:
@@ -1055,17 +1072,6 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         if out_port_str:
             out_port = int(out_port_str)
-            actions = [parser.OFPActionOutput(out_port)]
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            self.add_flow(datapath, 1, match, actions)
-            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                      in_port=in_port, actions=actions, data=msg.data)
-            datapath.send_msg(out)
-            return
-
-        guest_location = self._resolve_guest_out_port(dpid, dst)
-        if guest_location:
-            out_port = guest_location
             actions = [parser.OFPActionOutput(out_port)]
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
             self.add_flow(datapath, 1, match, actions)
