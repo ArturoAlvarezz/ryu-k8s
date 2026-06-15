@@ -232,39 +232,19 @@ spec:
 
             # Neighbor-only VXLAN topology: solo a vecinos LLDP directos, no full mesh.
             # Ver AGENTS.md "VXLAN topology is neighbor-only (LLDP), NOT full mesh."
-            # Lee topology:links (SET) escrito por Ryu link_add_handler.
-            # Cada link tiene formato "<src_dpid>:<src_port>-<dst_dpid>:<dst_port>".
-            # Filtra los links donde aparece este nodo, traduce el peer DPID a IP via topology:node_ips.
-            ALL_LINKS=$(redis-cli -h "$MASTER_IP" SMEMBERS topology:links 2>/dev/null || true)
-            DPID_DEC=$((16#$DPID))
-            VXLAN_PEERS=""
-            for link in $ALL_LINKS; do
-              case "$link" in
-                *"-") continue ;;  # skip malformed
-              esac
-              src_field="${link%%-*}"
-              dst_field="${link#*-}"
-              src_dpid_str="${src_field%%:*}"
-              dst_dpid_str="${dst_field%%:*}"
-              # Si este nodo es uno de los dos extremos, el otro es vecino
-              if [ "$src_dpid_str" = "$DPID_DEC" ]; then
-                peer_dpid="$dst_dpid_str"
-              elif [ "$dst_dpid_str" = "$DPID_DEC" ]; then
-                peer_dpid="$src_dpid_str"
-              else
-                continue
-              fi
-              # Traduce peer_dpid (decimal) a raw hex para buscar en topology:node_ips
-              peer_raw=$(printf '%016x' "$peer_dpid")
-              peer_ip=$(redis-cli -h "$MASTER_IP" HGET topology:node_ips "$peer_raw" 2>/dev/null || true)
-              case "$peer_ip" in
-                192.168.*) ;;  # only IPv4 192.168.0.0/16
-                *) continue ;;
-              esac
-              [ "$peer_ip" != "$MY_IP" ] || continue
-              VXLAN_PEERS=$(printf '%s\n%s\n' "$VXLAN_PEERS" "$peer_ip")
-            done
-            VXLAN_PEERS=$(printf '%s\n' "$VXLAN_PEERS" | grep -E "^192\.168\." | sort -u || true)
+            VXLAN_PEERS=$(lldpcli show neighbors 2>/dev/null | awk -v myip="$MY_IP" '
+              /^Interface:/ {
+                iface = $2
+                sub(",", "", iface)
+                valid = (iface ~ /^ens[3-6]$/) ? 1 : 0
+                next
+              }
+              /^[[:space:]]+MgmtIP:/ && valid {
+                ip = $2
+                sub("/", "", ip)
+                if (ip ~ /^192\.168\./ && ip != myip) print ip
+              }
+            ' | sort -u)
 
             for remote_ip in $VXLAN_PEERS; do
               PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
