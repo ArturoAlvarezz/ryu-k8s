@@ -165,6 +165,16 @@ update_netplan_bridge_config() {
         -e "s/interfaces: \[[^]]*\]/interfaces: $active_list/" \
         -e "s/stp: true/stp: false/" \
         "$netplan_file"
+
+    # Regenerar la config de runtime de networkd a partir del YAML editado.
+    # Sin esto, el `networkctl reconfigure br0` posterior re-lee la membresia
+    # vieja (p.ej. interfaces: [ens3], el uplink al Mgmt-Switch) y re-enslava
+    # ese puerto a br0, recreando un loop L2 / tormenta de broadcast tras un
+    # corte de energia. Ver incidente: control-2/control-3 booteaban con ens3
+    # en br0 pese a ACTIVE_BR0_PORTS correcto.
+    if command -v netplan >/dev/null 2>&1; then
+        netplan generate >/dev/null 2>&1 || true
+    fi
 }
 
 if [ -z "${NODE_IP:-}" ]; then

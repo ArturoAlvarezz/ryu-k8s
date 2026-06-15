@@ -110,6 +110,9 @@ configure_hostname() {
   printf '127.0.1.1 worker-golden\n' >>/etc/hosts
   mkdir -p /etc/cloud/cloud.cfg.d
   printf 'preserve_hostname: false\n' >/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+  # Evitar que cloud-init regenere /etc/netplan/50-cloud-init.yaml en cada boot
+  # y sobrescriba el netplan del arbol loop-free (ver nota en el control-plane).
+  printf 'network: {config: disabled}\n' >/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 }
 
 write_netplan() {

@@ -100,6 +100,11 @@ configure_hostname() {
   printf '127.0.1.1 %s\n' "$NODE_NAME" >>/etc/hosts
   mkdir -p /etc/cloud/cloud.cfg.d
   printf 'preserve_hostname: true\n' >/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+  # Evitar que cloud-init regenere /etc/netplan/50-cloud-init.yaml en cada boot.
+  # Si no se deshabilita, cloud-init sobrescribe el netplan del arbol loop-free
+  # con un br0 por defecto (interfaces: [ens3], el uplink al Mgmt-Switch), lo que
+  # tras un corte de energia recrea un loop L2 / tormenta de broadcast.
+  printf 'network: {config: disabled}\n' >/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 }
 
 yaml_list() {
