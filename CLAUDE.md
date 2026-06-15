@@ -27,8 +27,12 @@ kubectl create configmap ryu-code --from-file=app.py=services/ryu-controller/app
 kubectl rollout restart ds ryu -n sdn-controller
 
 # meter-collector (web dashboard + telemetry)
+# IMPORTANT: the configmap MUST include registry.py — the manifest mounts it
+# via subPath (/app/registry.py). Omitting it crashes pods with
+# "ModuleNotFoundError: No module named 'registry'".
 kubectl create configmap meter-collector-code \
   --from-file=app.py=services/meter-collector/app.py \
+  --from-file=registry.py=services/meter-collector/registry.py \
   --from-file=index.html=services/meter-collector/templates/index.html \
   -n sdn-controller -o yaml --dry-run=client | kubectl replace -f -
 kubectl rollout restart ds meter-collector -n sdn-controller
