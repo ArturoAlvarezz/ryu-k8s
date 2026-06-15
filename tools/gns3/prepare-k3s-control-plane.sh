@@ -9,8 +9,6 @@ NODE_PREFIX="${RYU_K3S_NODE_PREFIX:-24}"
 NODE_GATEWAY="${RYU_K3S_NODE_GATEWAY:-192.168.122.1}"
 NODE_DNS="${RYU_K3S_NODE_DNS:-8.8.8.8 1.1.1.1}"
 ALL_PORTS="${RYU_K3S_BR0_PORTS:-ens3 ens4 ens5 ens6}"
-STP_PORTS="${RYU_K3S_STP_PORTS:-$ALL_PORTS}"
-PREFERRED_STP_PORTS="${RYU_K3S_PREFERRED_STP_PORTS:-$STP_PORTS}"
 REPO_DIR="${RYU_K3S_REPO_DIR:-$PWD}"
 SKIP_APT_UPGRADE="${RYU_K3S_SKIP_APT_UPGRADE:-false}"
 
@@ -118,9 +116,19 @@ yaml_list() {
   printf ']'
 }
 
+default_active_ports() {
+  case "$NODE_NAME" in
+    master) echo "ens3 ens4 ens5" ;;
+    control-2) echo "ens5 ens6" ;;
+    control-3) echo "ens5" ;;
+    *) echo "ens3" ;;
+  esac
+}
+
 write_netplan() {
   dns_list=$(yaml_list "$NODE_DNS")
-  port_list=$(yaml_list "$ALL_PORTS")
+  active_ports=${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}
+  port_list=$(yaml_list "$active_ports")
 
   cat >/etc/netplan/50-cloud-init.yaml <<EOF
 network:
@@ -169,7 +177,7 @@ EOF
 
   cat >>/etc/netplan/50-cloud-init.yaml <<'EOF'
       parameters:
-        stp: true
+        stp: false
 EOF
   chmod 600 /etc/netplan/50-cloud-init.yaml
   netplan apply
@@ -185,8 +193,8 @@ NODE_PREFIX=$NODE_PREFIX
 NODE_GATEWAY=$NODE_GATEWAY
 NODE_DNS=${NODE_DNS%% *}
 ALL_PORTS="$ALL_PORTS"
-STP_PORTS="$STP_PORTS"
-PREFERRED_STP_PORTS="$PREFERRED_STP_PORTS"
+ACTIVE_BR0_PORTS="${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}"
+BR0_TREE_APPLIED=1
 EOF
   else
     rm -f /etc/default/gns3-br0-tree
@@ -194,7 +202,7 @@ EOF
 
   cat >/etc/systemd/system/gns3-br0-tree.service <<'EOF'
 [Unit]
-Description=Configurar br0 de gestion GNS3 con STP
+Description=Configurar br0 de gestion GNS3 sin STP
 DefaultDependencies=no
 After=systemd-udev-settle.service systemd-networkd.service
 Before=network-online.target k3s.service

@@ -9,10 +9,10 @@
 - This project is a distributed SDN lab on K3s/GNS3. Ryu, OVS, Redis Sentinel, DHCP, topology UI, telemetry, and observability run as Kubernetes workloads.
 - The data plane is Open vSwitch on every K3s node. `ovs-sdn-initializer` creates `br-sdn`, assigns `10.0.0.1/24`, connects OVS to local Ryu, adds guest-facing `ens*` ports, and creates VXLAN tunnels to LLDP-discovered physical neighbors.
 - The control plane is distributed. Each node runs one local Ryu controller with `hostNetwork: true`; switches connect to `tcp:127.0.0.1:6653`, and controllers coordinate through Redis instead of local-only memory.
-- Redis + Sentinel is the runtime state contract for topology, MAC learning, DHCP leases, guest locations, STP state, and meter telemetry.
+- Redis + Sentinel is the runtime state contract for topology, MAC learning, DHCP leases, guest locations, VXLAN peers, and meter telemetry.
 - Physical management/fabric connectivity is on Linux bridge `br0`; SDN guest traffic is on OVS bridge `br-sdn`. Never merge `br0` into `br-sdn`.
-- GNS3 management redundancy depends on a Docker Open vSwitch node named `Mgmt-STP-Switch` acting as STP root, plus `gns3-br0-tree.service` on every K3s node running `/usr/local/bin/configure-br0-tree.sh` in `stp` mode. The script is topology-agnostic and reads each node profile from `/etc/default/gns3-br0-tree`; the `tree` mode is only an emergency deterministic fallback.
-- `Mgmt-STP-Switch` should use image `gns3/openvswitch:latest`, bridge `br0`, STP enabled, and `other_config:stp-priority=0`; resolve the runtime container with `docker ps` because IDs change after recreation.
+- The physical GNS3 topology may contain rings. STP is not used anywhere in the active architecture; loops are controlled by Ryu/MST on `br-sdn`, while `br0` is kept loop-free by deterministic active bridge ports. Do not collapse physical rings into a full-mesh VXLAN design.
+- The GNS3 management switch should use image `gns3/openvswitch:latest` with STP disabled. Resolve the runtime container with `docker ps` because IDs change after recreation.
 
 ## Services
 - `services/ryu-controller/app.py`: Ryu OpenFlow app, Redis-backed MAC learning, gateway ARP handling for `10.0.0.1`, topology/path metrics, Prometheus `/metrics` on `METRICS_PORT` default `8000`.
@@ -22,7 +22,7 @@
 - `services/security-device-registry/`: CLI registry for authorized AMI devices backed by Redis. The web UI now lives in the unified `meter-collector` dashboard on port `8081`. It registers/lists/queries/deletes devices and validates observed `mac`/`ip`/`dpid`/`in_port` tuples used by the meter collector. Worker MACs derived from switch DPID are auto-allowed and highlighted separately.
 
 ## Redis Runtime Contract
-- Core keys: `topology:switches`, `topology:node_names`, `topology:node_ips`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `topology:br0_stp_ports`, `switch:alive:{dpid}`.
+- Core keys: `topology:switches`, `topology:node_names`, `topology:node_ips`, `topology:vxlan_peers`, `topology:mgmt_switch_links`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `switch:alive:{dpid}`.
 - DHCP keys include `dhcp:next_ip` and guest lease/health state written by `services/dhcp-server/app.py`.
 - Ryu uses distributed locks like `lock:flow:{dpid}:{src}:{dst}` to avoid conflicting flow installs during broadcasts.
 - Smart Meter telemetry keys: `meter:devices`, `meter:history:{device_id}`, `meter:latest:{device_id}`, `meter:hmac:*`, `meter:nonce:{device_id}:{nonce}`.
@@ -33,8 +33,7 @@
 - Ryu exposes Prometheus metrics directly from `services/ryu-controller/app.py`; no sidecar is required.
 - Key metrics: `ryu_packet_in_total{dpid}`, `ryu_active_nodes`, `ryu_active_switches`, `ryu_installed_flows{dpid}`, `ryu_port_rx_bytes_total`, `ryu_port_tx_bytes_total`, `ryu_topology_node_info`, `ryu_topology_edge_info`, `ryu_trace_path_edge_info`.
 - Grafana uses native Node graph with `src_guest` and `dst_guest` variables to show topology and highlighted paths.
-- `topology:br0_stp_ports` is exported to Grafana as `br0_stp` or `br0_stp_blocked`; blocked physical STP links should not be used for path visualization.
-- The topology dashboard API may show only discovered SDN nodes/guests; the authoritative source for physical `br0` STP edges in Grafana is Prometheus metric `ryu_topology_edge_info`.
+- The topology dashboard/API shows physical LLDP edges, VXLAN tunnels, management-switch links, SDN nodes, guests, and highlighted paths. It must not depend on STP state.
 - Loki/Promtail collect Ryu logs; LogQL selector is `{namespace="sdn-controller", app="ryu"}`.
 
 ## Commands
@@ -74,8 +73,8 @@
 - Topology JSON from master: `curl -s http://localhost:8081/api/sdn-topology`.
 - Meter collector stats from master/fabric: `curl http://192.168.122.100:8081/api/stats`.
 - Telemetry security state: `curl http://192.168.122.100:8081/api/telemetry-security` and `curl http://192.168.122.100:8081/api/guests`.
-- STP state in Redis: `kubectl exec redis-0 -c redis -n sdn-controller -- redis-cli HGETALL topology:br0_stp_ports`.
-- GNS3 STP root check: resolve the `gns3/openvswitch:latest` container with `docker ps`, then run `docker exec <container> ovs-appctl stp/show br0` and verify `This bridge is the root`.
+- Verify STP is disabled on a node: `cat /sys/class/net/br0/bridge/stp_state` should return `0`.
+- Verify the GNS3 management switch has STP disabled: resolve the `gns3/openvswitch:latest` container with `docker ps`, then run `docker exec <container> ovs-vsctl get Bridge br0 stp_enable` and verify `false`.
 
 ## Architecture Gotchas
 - **VXLAN topology is neighbor-only (LLDP), NOT full mesh.** `ovs-sdn-initializer` must read `topology:links` from Redis and create one VXLAN tunnel per LLDP-discovered physical neighbor, not one per known node in `topology:node_ips`. Full mesh was a rejected alternative: it is `O(n²)`, does not scale past ~50 nodes, and defeats the purpose of multi-hop Dijkstra path stitching. The MST/Dijkstra design in `services/ryu-controller/app.py` assumes a sparse graph (typically 2 neighbors per node in a ring/chain), not a clique.
@@ -89,10 +88,10 @@
 - Smart Meters must obtain a DHCP lease before starting telemetry; do not revert `services/smart-meter/entrypoint.sh` to a finite retry loop unless deployment ordering guarantees DHCP availability.
 - The meter collector must remain fail-closed: if Redis/security lookup is unavailable or a source IP is not registered as `authorized`, telemetry is rejected and counted under `/api/telemetry-security`.
 - Guest freshness matters. Avoid reintroducing stale guests into metrics/topology without checking live state such as `active_mac:*`, `health:*`, or current OVS FDB evidence.
-- `ovs-sdn-initializer` must not hardcode GNS3 node names, worker IDs, or neighbor IPs. Topology data must come from runtime discovery such as LLDP, Linux bridge STP state, Kubernetes node metadata, and Redis heartbeats because lab nodes are frequently recreated.
+- `ovs-sdn-initializer` must not hardcode GNS3 node names, worker IDs, or neighbor IPs. Topology data must come from runtime discovery such as LLDP, Kubernetes node metadata, and Redis heartbeats because lab nodes are frequently recreated.
 
 ## Roadmap Context
 - Completed: Smart Meter guest image and telemetry collector.
-- Completed: STP visualization for physical `br0` links in Grafana and path filtering around blocked links.
+- Completed: physical LLDP, VXLAN, management switch, and highlighted SDN path visualization without STP dependencies.
 - Completed: Prometheus/Grafana/Loki observability stack.
 - Potential future feature: SDN security/microsegmentation in Ryu, including anti-MAC-spoofing, ARP poisoning prevention, and ACLs isolating guests or meters from unauthorized nodes.

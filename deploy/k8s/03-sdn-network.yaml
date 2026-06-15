@@ -1,5 +1,5 @@
 # Plano SDN del host: OVS/VXLAN y DHCP distribuido. Sin STP.
-# Los túneles VXLAN se crean a TODOS los nodos conocidos (full mesh).
+# Los túneles VXLAN se crean solo a vecinos LLDP directos.
 # STP se elimina: los loops se previenen vía MST calculado por Ryu.
 ---
 apiVersion: v1
@@ -65,7 +65,7 @@ spec:
       containers:
       - name: ovs-configurator
         image: arturoalvarez/ovs-sdn-initializer:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
         env:
@@ -135,6 +135,20 @@ spec:
             printf '%s' "$role"
           }
 
+          node_internal_ip() {
+            node="$1"
+            token_file=/var/run/secrets/kubernetes.io/serviceaccount/token
+            ca_file=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            if command -v curl >/dev/null 2>&1 && [ -r "$token_file" ] && [ -r "$ca_file" ] && [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+              token=$(cat "$token_file" 2>/dev/null || true)
+              curl -fsS --connect-timeout 1 --max-time 2 --cacert "$ca_file" \
+                -H "Authorization: Bearer $token" \
+                "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/nodes/${node}" 2>/dev/null \
+                | jq -r '.status.addresses[]? | select(.type == "InternalIP") | .address' 2>/dev/null \
+                | head -n 1
+            fi
+          }
+
           measure_link_cost() {
             remote_ip="$1"
             RTT=$(ping -c 3 -W 1 "$remote_ip" 2>/dev/null | awk '/rtt|min/ {print $4}' | cut -d/ -f1 || echo "")
@@ -189,6 +203,7 @@ spec:
           }
 
           refresh_gateway_flows() {
+            ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=250,arp,arp_tpa=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
             ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,arp,arp_tpa=10.0.0.1,actions=CONTROLLER:65535" > /dev/null 2>&1 || true
             ovs-ofctl -O OpenFlow13 add-flow br-sdn "priority=200,ip,nw_dst=10.0.0.1,actions=LOCAL" > /dev/null 2>&1 || true
           }
@@ -232,7 +247,7 @@ spec:
 
             # Neighbor-only VXLAN topology: solo a vecinos LLDP directos, no full mesh.
             # Ver AGENTS.md "VXLAN topology is neighbor-only (LLDP), NOT full mesh."
-            VXLAN_PEERS=$(lldpcli show neighbors 2>/dev/null | awk -v myip="$MY_IP" '
+            LLDP_MGMT_PEERS=$(lldpcli show neighbors 2>/dev/null | awk -v myip="$MY_IP" '
               /^Interface:/ {
                 iface = $2
                 sub(",", "", iface)
@@ -245,6 +260,28 @@ spec:
                 if (ip ~ /^192\.168\./ && ip != myip) print ip
               }
             ' | sort -u)
+            LLDP_NODE_PEERS=$(lldpcli show neighbors 2>/dev/null | awk -v self="$NODE_NAME" '
+              /^Interface:/ {
+                iface = $2
+                sub(",", "", iface)
+                valid = (iface ~ /^ens[3-6]$/) ? 1 : 0
+                next
+              }
+              /^[[:space:]]+SysName:/ && valid {
+                name = $2
+                if (name != self) print name
+              }
+            ' | sort -u)
+            VXLAN_PEERS=$({
+              printf '%s\n' "$LLDP_MGMT_PEERS"
+              for peer_node in $LLDP_NODE_PEERS; do
+                node_internal_ip "$peer_node"
+              done
+            } | awk -v myip="$MY_IP" '/^192\.168\./ && $0 != myip' | sort -u)
+
+            redis-cli -h "$MASTER_IP" HSET topology:vxlan_peers "$DPID" "$VXLAN_PEERS" > /dev/null 2>&1 || true
+            BR0_PORTS=$(ls /sys/class/net/br0/brif 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+            redis-cli -h "$MASTER_IP" HSET topology:mgmt_switch_links "$DPID" "$BR0_PORTS" > /dev/null 2>&1 || true
 
             for remote_ip in $VXLAN_PEERS; do
               PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
@@ -306,7 +343,11 @@ spec:
             fi
 
             # Añadir Guests en cualquier interfaz ensX que NO pertenezca a br0
-            for intf in $(ls /sys/class/net | grep -E "^ens[4-9]$|^ens[1-9][0-9]$"); do
+            for fabric_intf in ens3 ens4 ens5 ens6; do
+              ovs-vsctl --if-exists del-port br-sdn "$fabric_intf" > /dev/null 2>&1 || true
+            done
+
+            for intf in $(ls /sys/class/net | grep -E "^ens[7-9]$|^ens[1-9][0-9]$"); do
               if ip link show $intf | grep -q "master br0"; then continue; fi
 
               if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then

@@ -586,7 +586,10 @@ def observed_guests(redis):
         if source_ip and device_id and source_ip not in rejected_meter_by_ip:
             rejected_meter_by_ip[source_ip] = device_id
 
-    for device in registry.list_devices(redis):
+    registered_devices = registry.list_devices(redis)
+    device_by_mac = {registry.normalize_mac(device.get("mac", "")): device for device in registered_devices}
+
+    for device in registered_devices:
         mac = registry.normalize_mac(device.get("mac", ""))
         if not mac or mac in guests or mac in worker_macs:
             continue
@@ -610,14 +613,15 @@ def observed_guests(redis):
                 guest["name"] = guest["telemetry_device_id"]
         elif not guest.get("name") and guest["telemetry_device_id"]:
             guest["name"] = guest["telemetry_device_id"]
-    current_guests = [
-        guest for guest in guests.values()
-        if guest.get("ip") in live_meter_ips
-        or (
-            not guest_is_registered(guest["mac"]) and
-            guest.get("telemetry_device_id")
-        )
-    ]
+    def should_show_guest(guest):
+        if guest.get("ip") in live_meter_ips:
+            return True
+        if not guest_is_registered(guest["mac"]):
+            return bool(guest.get("telemetry_device_id"))
+        device = device_by_mac.get(guest["mac"], {})
+        return device.get("status") in ("quarantined", "blocked") and bool(guest.get("dpid") and guest.get("in_port"))
+
+    current_guests = [guest for guest in guests.values() if should_show_guest(guest)]
     return sorted(current_guests, key=lambda item: (item.get("ip") or "", item["mac"]))
 
 
@@ -655,42 +659,85 @@ def active_switch_dpids(redis):
     return dpids
 
 
-def vxlan_peer_state(redis, local_dpid, remote_ip):
-    raw = raw_dpid_from(local_dpid)
-    for key in (f"vxlan:peer:state:{local_dpid}:{remote_ip}", f"vxlan:peer:state:{raw}:{remote_ip}"):
-        state = redis.get(key)
-        if state:
-            return state
-    return "unknown"
-
-
-def forwarding_br0_links(redis, dpids, ip_to_dpid):
-    states = {}
-    for key, value in (redis.hgetall("topology:br0_stp_ports") or {}).items():
-        if ":" not in key:
-            continue
-        raw, _ = key.split(":", 1)
+def vxlan_edges(redis, dpids, ip_to_dpid):
+    edges = {}
+    peer_map = redis.hgetall("topology:vxlan_peers") or {}
+    for raw, peers in peer_map.items():
         local_dpid = normalize_dpid(raw)
-        state, _, remote_ip = str(value).partition(":")
-        remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
-        if local_dpid not in dpids or remote_dpid not in dpids:
+        if local_dpid not in dpids:
             continue
-        link = edge_link_id(local_dpid, remote_dpid)
-        entry = states.setdefault(link, {"forwarding": set(), "blocked": False})
-        if state == "forwarding":
-            entry["forwarding"].add(local_dpid)
-        else:
-            entry["blocked"] = True
-    return {
-        link for link, state in states.items()
-        if not state["blocked"] and len(state["forwarding"]) >= 2
-    }
+        for remote_ip in str(peers or "").split():
+            remote_dpid = ip_to_dpid.get(str(remote_ip).replace(".", ""))
+            if not remote_dpid or remote_dpid not in dpids or remote_dpid == local_dpid:
+                continue
+            source, target = sorted([local_dpid, remote_dpid])
+            edge_id = f"vxlan:{source}:{target}"
+            entry = edges.setdefault(edge_id, {
+                "id": edge_id,
+                "source": source,
+                "target": target,
+                "type": "vxlan",
+                "status": "up",
+                "label": "VXLAN",
+                "port": "",
+                "remote_ip": remote_ip,
+                "details_list": [],
+            })
+            entry["details_list"].append(f"{local_dpid}->{remote_ip}")
+
+    if edges:
+        return edges
+
+    for key in (redis.hkeys("topology:link_cost") or []):
+        left, sep, right = str(key).partition(":")
+        if not sep:
+            continue
+        source = normalize_dpid(left)
+        target = normalize_dpid(right)
+        if source not in dpids or target not in dpids or source == target:
+            continue
+        source, target = sorted([source, target])
+        edge_id = f"vxlan:{source}:{target}"
+        edges[edge_id] = {
+            "id": edge_id,
+            "source": source,
+            "target": target,
+            "type": "vxlan",
+            "status": "up",
+            "label": "VXLAN",
+            "port": "",
+            "remote_ip": "",
+            "details_list": ["Enlace VXLAN inferido por costo de enlace"],
+        }
+    return edges
 
 
-def vxlan_link_allowed(redis, local_dpid, remote_dpid, remote_ip, valid_br0_links):
-    if edge_link_id(local_dpid, remote_dpid) in valid_br0_links:
-        return True
-    return vxlan_peer_state(redis, local_dpid, remote_ip) == "up"
+def physical_edges(redis, dpids, ip_to_dpid):
+    edges = {}
+    peer_map = redis.hgetall("topology:vxlan_peers") or {}
+    for raw, peers in peer_map.items():
+        local_dpid = normalize_dpid(raw)
+        if local_dpid not in dpids:
+            continue
+        for remote_ip in str(peers or "").split():
+            remote_dpid = ip_to_dpid.get(str(remote_ip).replace(".", ""))
+            if not remote_dpid or remote_dpid not in dpids or remote_dpid == local_dpid:
+                continue
+            source, target = sorted([local_dpid, remote_dpid])
+            edge_id = f"physical:{source}:{target}"
+            entry = edges.setdefault(edge_id, {
+                "id": edge_id,
+                "source": source,
+                "target": target,
+                "type": "br0_physical",
+                "status": "up",
+                "label": "br0 fisico",
+                "port": "",
+                "remote_ip": remote_ip,
+                "details_list": [],
+            })
+            entry["details_list"].append(f"{local_dpid}->{remote_ip}")
+    return edges
 
 
 def build_sdn_topology(redis):
@@ -704,7 +751,6 @@ def build_sdn_topology(redis):
     for raw, ip in node_ips.items():
         if ip:
             ip_to_dpid[str(ip).replace(".", "")] = normalize_dpid(raw)
-    valid_br0_links = forwarding_br0_links(redis, dpids, ip_to_dpid)
 
     for dpid in sorted(dpids, key=lambda value: node_names.get(raw_dpid_from(value), value)):
         raw = raw_dpid_from(dpid)
@@ -757,91 +803,43 @@ def build_sdn_topology(redis):
                 "details": "Conexion local guest-switch",
             }
 
-    for dpid in dpids:
-        ports = redis.hgetall(f"switch_ports:{dpid}") or {}
-        for port_no, port_name in ports.items():
-            if not str(port_name).startswith("vx"):
-                continue
-            remote_key = str(port_name)[2:]
-            remote_dpid = ip_to_dpid.get(remote_key)
-            if not remote_dpid or remote_dpid not in dpids or str(remote_dpid) == str(dpid):
-                continue
-            source, target = sorted([str(dpid), str(remote_dpid)])
-            edge_id = f"vxlan:{source}:{target}"
-            remote_ip = ".".join([remote_key[0:3], remote_key[3:6], remote_key[6:9], remote_key[9:]]) if len(remote_key) == 12 else remote_key
-            state = vxlan_peer_state(redis, dpid, remote_ip)
-            if not vxlan_link_allowed(redis, dpid, remote_dpid, remote_ip, valid_br0_links):
-                continue
-            existing = edges_by_id.get(edge_id)
-            status = "down" if state == "down" or (existing and existing.get("status") == "down") else ("up" if state == "up" else "unknown")
-            edges_by_id[edge_id] = {
-                "id": edge_id,
-                "source": source,
-                "target": target,
-                "type": "vxlan",
-                "status": status,
-                "label": "VXLAN",
-                "port": str(port_no),
-                "remote_ip": remote_ip,
-                "details": f"Puerto {port_no} hacia {remote_ip} ({state})",
-            }
+    for edge_id, edge in physical_edges(redis, dpids, ip_to_dpid).items():
+        edge["details"] = ", ".join(edge.get("details_list", []))
+        edges_by_id[edge_id] = edge
 
-    has_mgmt_switch = False
-    for key, value in (redis.hgetall("topology:br0_stp_ports") or {}).items():
-        if ":" not in key:
-            continue
-        raw, intf = key.split(":", 1)
-        local_dpid = normalize_dpid(raw)
-        state, _, remote_ip = str(value).partition(":")
-        if local_dpid not in dpids:
-            continue
-        if remote_ip == "mgmt-switch":
-            has_mgmt_switch = True
-            edge_id = f"br0:{local_dpid}:mgmt-stp-switch"
-            edges_by_id[edge_id] = {
-                "id": edge_id,
-                "source": local_dpid,
-                "target": "mgmt-stp-switch",
-                "type": "br0_mgmt_switch",
-                "status": state,
-                "label": f"br0 {state}",
-                "port": intf,
-                "details": f"{intf}: {state}",
-            }
-            continue
-        remote_dpid = ip_to_dpid.get(remote_ip.replace(".", ""))
-        if not remote_dpid or remote_dpid not in dpids:
-            continue
-        source, target = sorted([str(local_dpid), str(remote_dpid)])
-        edge_id = f"br0:{source}:{target}"
-        existing = edges_by_id.get(edge_id)
-        status = "blocking" if state == "blocking" or (existing and existing.get("status") == "blocking") else state
-        details = list(existing.get("details_list", [])) if existing else []
-        details.append(f"{local_dpid}:{intf}={state}")
-        edges_by_id[edge_id] = {
-            "id": edge_id,
-            "source": source,
-            "target": target,
-            "type": "br0_stp_blocked" if status == "blocking" else "br0_stp",
-            "status": status,
-            "label": "STP bloqueado" if status == "blocking" else "br0 STP",
-            "port": intf,
-            "details": ", ".join(details),
-            "details_list": details,
-        }
+    for edge_id, edge in vxlan_edges(redis, dpids, ip_to_dpid).items():
+        edge["details"] = ", ".join(edge.get("details_list", []))
+        edges_by_id[edge_id] = edge
 
-    if has_mgmt_switch:
+    if dpids:
         nodes.append({
-            "id": "mgmt-stp-switch",
-            "label": "Mgmt-STP-Switch",
+            "id": "mgmt-switch",
+            "label": "Mgmt-Switch",
             "type": "mgmt_switch",
-            "role": "stp-root",
-            "name": "Mgmt-STP-Switch",
+            "role": "management-plane",
+            "name": "Mgmt-Switch",
             "ip": "",
             "mac": "",
             "dpid": "",
             "status": "online",
         })
+        for dpid in sorted(dpids, key=lambda value: node_names.get(raw_dpid_from(value), value)):
+            raw = raw_dpid_from(dpid)
+            name = node_names.get(raw, "")
+            if str(name).startswith("worker"):
+                continue
+            edge_id = f"mgmt:{dpid}:mgmt-switch"
+            ports = redis.hget("topology:mgmt_switch_links", raw) or "br0"
+            edges_by_id[edge_id] = {
+                "id": edge_id,
+                "source": dpid,
+                "target": "mgmt-switch",
+                "type": "br0_mgmt_switch",
+                "status": "up",
+                "label": "br0 mgmt",
+                "port": ports,
+                "details": f"Plano de management br0 ({ports})",
+            }
 
     edges = []
     for edge in edges_by_id.values():
@@ -863,7 +861,7 @@ def trace_sdn_path(redis, src_guest, dst_guest):
     for raw, ip in (redis.hgetall("topology:node_ips") or {}).items():
         if ip:
             ip_to_dpid[str(ip).replace(".", "")] = normalize_dpid(raw)
-    valid_br0_links = forwarding_br0_links(redis, dpids, ip_to_dpid)
+    vx_edges = vxlan_edges(redis, dpids, ip_to_dpid)
 
     guest_locations = redis.hgetall("topology:guest_locations") or {}
     switch_ports = {dpid: redis.hgetall(f"switch_ports:{dpid}") or {} for dpid in dpids}
@@ -903,8 +901,8 @@ def trace_sdn_path(redis, src_guest, dst_guest):
         if not next_switch or next_switch not in dpids:
             path = []
             break
-        remote_ip = ".".join([str(port_name)[2:5], str(port_name)[5:8], str(port_name)[8:11], str(port_name)[11:]])
-        if not vxlan_link_allowed(redis, current, next_switch, remote_ip, valid_br0_links):
+        a, b = sorted([str(current), str(next_switch)])
+        if f"vxlan:{a}:{b}" not in vx_edges:
             path = []
             break
         path.append(next_switch)
@@ -912,16 +910,12 @@ def trace_sdn_path(redis, src_guest, dst_guest):
 
     if not path:
         adjacency = {dpid: [] for dpid in dpids}
-        for dpid, ports in switch_ports.items():
-            for _, port_name in ports.items():
-                if not str(port_name).startswith("vx"):
-                    continue
-                target = ip_to_dpid.get(str(port_name)[2:])
-                if target and target in dpids:
-                    remote_key = str(port_name)[2:]
-                    remote_ip = ".".join([remote_key[0:3], remote_key[3:6], remote_key[6:9], remote_key[9:]]) if len(remote_key) == 12 else remote_key
-                    if vxlan_link_allowed(redis, dpid, target, remote_ip, valid_br0_links):
-                        adjacency[dpid].append(target)
+        for edge in vx_edges.values():
+            source = str(edge.get("source", ""))
+            target = str(edge.get("target", ""))
+            if source in adjacency and target in adjacency:
+                adjacency[source].append(target)
+                adjacency[target].append(source)
         queue = [(src_switch, [src_switch])]
         seen = {src_switch}
         while queue:

@@ -573,7 +573,7 @@ data:
           "type": "stat",
           "title": "Switches activos",
           "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
-          "targets": [{"expr": "max(ryu_active_switches)", "legendFormat": "switches"}]
+          "targets": [{"expr": "max(ryu_active_switches or ryu_active_nodes)", "legendFormat": "switches"}]
         },
         {
           "type": "bargauge",

@@ -130,9 +130,9 @@ class TopologyManager:
         }
 
     def _build_graph(self):
-        """Build NetworkX graph from Redis topology:links and link costs."""
+        """Build NetworkX graph from direct VXLAN peers and link costs."""
         try:
-            links = self.redis.smembers("topology:links") or set()
+            vxlan_peers = self.redis.hgetall("topology:vxlan_peers") or {}
             link_costs = self.redis.hgetall("topology:link_cost") or {}
             node_ips = self.redis.hgetall("topology:node_ips") or {}
         except redis.RedisError as e:
@@ -145,26 +145,22 @@ class TopologyManager:
             if dpid:
                 G.add_node(dpid, ip=ip)
 
-        for link in links:
-            if "-" not in link:
+        ip_to_dpid = self._ip_to_dpid(node_ips)
+        for raw_dpid, peers in vxlan_peers.items():
+            src_dpid = self._raw_dpid_to_decimal(raw_dpid)
+            if not src_dpid:
                 continue
-            src_str, dst_str = link.split("-", 1)
-            try:
-                src_dpid, src_port = src_str.split(":")
-                dst_dpid, dst_port = dst_str.split(":")
-                src_dpid = int(src_dpid)
-                dst_dpid = int(dst_dpid)
-            except Exception:
-                continue
-
-            edge_key = _edge_link_id(src_dpid, dst_dpid)
-            cost = float(link_costs.get(edge_key, DEFAULT_LINK_COST))
-
             if not G.has_node(src_dpid):
                 G.add_node(src_dpid)
-            if not G.has_node(dst_dpid):
-                G.add_node(dst_dpid)
-            G.add_edge(src_dpid, dst_dpid, weight=cost, src_port=int(src_port), dst_port=int(dst_port))
+            for peer_ip in str(peers).split():
+                dst_dpid = ip_to_dpid.get(str(peer_ip).replace(".", ""))
+                if not dst_dpid or src_dpid == dst_dpid:
+                    continue
+                if not G.has_node(dst_dpid):
+                    G.add_node(dst_dpid)
+                edge_key = _edge_link_id(src_dpid, dst_dpid)
+                cost = float(link_costs.get(edge_key, DEFAULT_LINK_COST))
+                G.add_edge(src_dpid, dst_dpid, weight=cost)
 
         return G
 
@@ -257,38 +253,58 @@ class TopologyManager:
 class ArpHandler:
     """Handles ARP requests with proxy reply and deduplication.
 
-    ARP deduplication: uses a Redis sorted set with score=timestamp
-    to track recent (src_mac, src_ip, dst_ip) tuples. Duplicates
-    within ARP_DEDUP_WINDOW seconds are dropped.
+    ARP deduplication key: (dpid, src_mac, src_ip, dst_ip, opcode)
+    - dpid avoids cross-switch collisions when the same packet traverses
+      the broadcast tree and reaches multiple switches.
+    - opcode distinguishes request from reply if needed.
+
+    Stored in a Redis sorted set with score=timestamp. Duplicates within
+    ARP_DEDUP_WINDOW seconds are dropped.
     """
 
     def __init__(self, logger, redis_client):
         self.logger = logger
         self.redis = redis_client
         self.arp_table = {}
+        self.metrics = {
+            "proxy": 0,
+            "flood": 0,
+            "dedup": 0,
+            "learn": 0,
+        }
 
-    def _arp_dedup_key(self, src_mac, src_ip, dst_ip):
-        return f"{src_mac}:{src_ip}:{dst_ip}"
+    def _arp_dedup_key(self, dpid, src_mac, src_ip, dst_ip, opcode):
+        return f"{dpid}:{src_mac}:{src_ip}:{dst_ip}:{opcode}"
 
-    def is_duplicate(self, src_mac, src_ip, dst_ip):
+    def is_duplicate(self, dpid, src_mac, src_ip, dst_ip, opcode):
         """Return True if this exact ARP was seen within the dedup window."""
-        key = self._arp_dedup_key(src_mac, src_ip, dst_ip)
+        key = self._arp_dedup_key(dpid, src_mac, src_ip, dst_ip, opcode)
         try:
             score = self.redis.zscore("topology:arp_dedup", key)
             if score and (time.time() - score) < ARP_DEDUP_WINDOW:
+                self.metrics["dedup"] += 1
                 return True
             return False
         except redis.RedisError:
             return False
 
-    def mark_arp(self, src_mac, src_ip, dst_ip):
+    def mark_arp(self, dpid, src_mac, src_ip, dst_ip, opcode):
         """Record this ARP in the dedup set."""
-        key = self._arp_dedup_key(src_mac, src_ip, dst_ip)
+        key = self._arp_dedup_key(dpid, src_mac, src_ip, dst_ip, opcode)
         try:
-            self.redis.zadd("topology:arp_dedup", {key: time.time()})
-            self.redis.zremrangebyscore("topology:arp_dedup", 0, time.time() - ARP_DEDUP_WINDOW * 2)
+            pipe = self.redis.pipeline()
+            pipe.zadd("topology:arp_dedup", {key: time.time()})
+            pipe.zremrangebyscore("topology:arp_dedup", 0, time.time() - ARP_DEDUP_WINDOW * 2)
+            pipe.execute()
         except redis.RedisError as e:
             self.logger.warning("Redis error in ARP dedup: %s", e)
+
+    def learn_request_location(self, dpid, in_port, src_mac):
+        """Record where an ARP request was observed: (dpid, in_port) per src_mac."""
+        try:
+            self.redis.hset("topology:arp_request_origin", src_mac, f"{dpid}:{in_port}")
+        except redis.RedisError as e:
+            self.logger.warning("Redis error recording ARP request origin: %s", e)
 
     def learn_ip(self, mac, ip_addr):
         """Learn IP->MAC mapping."""
@@ -297,6 +313,7 @@ class ArpHandler:
         if not str(ip_addr).startswith("10.0.0."):
             return
         self.arp_table[ip_addr] = mac
+        self.metrics["learn"] += 1
         try:
             self.redis.hset("topology:arp_table", ip_addr, mac)
         except redis.RedisError as e:
@@ -315,26 +332,47 @@ class ArpHandler:
             return None
 
     def handle_arp_request(self, datapath, in_port, src_mac, src_ip, dst_ip, parser):
-        """Handle incoming ARP request. Returns (reply_needed, flood_needed)."""
-        self.mark_arp(src_mac, src_ip, dst_ip)
+        """Handle incoming ARP request.
+
+        Returns (proxy_reply_sent, flood_needed).
+        - proxy_reply_sent=True: a fabricated ARP reply was sent back via
+          packet-out and the original request must NOT be flooded.
+        - flood_needed=True: the controller does not know the target MAC,
+          so the packet must be flooded through the controlled tree.
+        """
+        dpid = datapath.id
+        opcode = arp.ARP_REQUEST
+
+        self.learn_request_location(dpid, in_port, src_mac)
+        self.mark_arp(dpid, src_mac, src_ip, dst_ip, opcode)
         self.learn_ip(src_mac, src_ip)
+
+        if dst_ip == "10.0.0.1":
+            gateway_mac = _mac_from_dpid(hex(int(dpid))[2:].zfill(16))
+            if gateway_mac:
+                self.metrics["proxy"] += 1
+                self._send_arp_reply(
+                    datapath, parser, in_port=in_port,
+                    dst_mac=src_mac, dst_ip=src_ip,
+                    src_mac=gateway_mac, src_ip=dst_ip,
+                )
+                return True, False
 
         target_mac = self.get_mac_for_ip(dst_ip)
         if target_mac:
-            raw_dpid = self._decimal_to_raw(datapath.id)
-            gateway_mac = _mac_from_dpid(raw_dpid)
-            reply = self._make_arp_reply(
-                datapath, parser,
+            self.metrics["proxy"] += 1
+            self._send_arp_reply(
+                datapath, parser, in_port=in_port,
                 dst_mac=src_mac, dst_ip=src_ip,
                 src_mac=target_mac, src_ip=dst_ip,
-                in_port=in_port
             )
-            datapath.send_msg(reply)
-            return False, False
+            return True, False
 
+        self.metrics["flood"] += 1
         return False, True
 
-    def _make_arp_reply(self, datapath, parser, dst_mac, dst_ip, src_mac, src_ip, in_port):
+    def _send_arp_reply(self, datapath, parser, in_port, dst_mac, dst_ip, src_mac, src_ip):
+        """Build and send a fabricated ARP reply directly to the requester."""
         reply = packet.Packet()
         reply.add_protocol(ethernet.ethernet(
             ethertype=ether_types.ETH_TYPE_ARP,
@@ -349,12 +387,17 @@ class ArpHandler:
             dst_ip=dst_ip,
         ))
         reply.serialize()
-        return parser.OFPPacketOut(
+        out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=datapath.ofproto.OFP_NO_BUFFER,
             in_port=datapath.ofproto.OFPP_CONTROLLER,
             actions=[parser.OFPActionOutput(in_port)],
             data=reply.data,
+        )
+        datapath.send_msg(out)
+        self.logger.info(
+            "ARP proxy reply: dpid=%s in_port=%s %s->%s reply_mac=%s",
+            datapath.id, in_port, src_ip, dst_ip, src_mac,
         )
 
     def _decimal_to_raw(self, dpid):
@@ -366,11 +409,26 @@ class BroadcastController:
 
     Instead of OFPP_FLOOD (which sends to ALL ports including loops),
     broadcast uses only the edges of the MST computed by TopologyManager.
+
+    Behavior:
+    - Inter-switch ports (VXLAN) are only used if the peer is reachable
+      via an MST edge. This guarantees no broadcast packet traverses a
+      non-tree link, so cycles are impossible.
+    - Local guest ports (`ens*`, `br-*`) are always included because they
+      cannot form an L2 loop.
+    - The incoming port is always excluded.
+    - The OFPP_LOCAL port is excluded to avoid echoing the controller path
+      back through the bridge.
     """
 
     def __init__(self, logger, topology_manager):
         self.logger = logger
         self.tm = topology_manager
+        self.metrics = {
+            "flood": 0,
+            "mst_edges": 0,
+            "ports_blocked": 0,
+        }
 
     def get_broadcast_ports(self, dpid, in_port, ports):
         """Return list of output ports for broadcast, excluding in_port.
@@ -378,6 +436,7 @@ class BroadcastController:
         Uses MST edges to determine which ports to flood.
         """
         mst_neighbors = self.tm.get_mst_neighbors(dpid)
+        self.metrics["mst_edges"] = len(mst_neighbors)
         node_ips = self.tm.redis.hgetall("topology:node_ips") or {}
         ip_to_dpid = self.tm._ip_to_dpid(node_ips)
 
@@ -397,6 +456,8 @@ class BroadcastController:
                 peer_dpid = ip_to_dpid.get(peer_ip)
                 if peer_dpid and peer_dpid in mst_neighbors:
                     out_ports.append(port_no_int)
+                else:
+                    self.metrics["ports_blocked"] += 1
             elif port_name.startswith("ens") or port_name.startswith("br-"):
                 out_ports.append(port_no_int)
         return out_ports
@@ -487,7 +548,7 @@ class ForwardingEngine:
                 self.logger.debug("No VXLAN port found from %s to %s", current_dpid, next_dpid)
                 continue
 
-            match = parser.OFPMatch(in_port=ofproto.OFPP_LOCAL, eth_dst=dst_mac)
+            match = parser.OFPMatch(eth_dst=dst_mac)
             actions = [parser.OFPActionOutput(out_port)]
             try:
                 self.add_flow(dp, 10, match, actions)
@@ -758,9 +819,32 @@ class DistributedL2Switch(app_manager.RyuApp):
 
     def _is_switch_alive(self, dpid):
         try:
-            return self.redis.get(f"switch:alive:{dpid}") == "1"
+            raw_dpid = self._decimal_dpid_to_raw(dpid) if str(dpid).isdigit() else str(dpid)
+            return self.redis.get(f"switch:alive:{dpid}") == "1" or self.redis.get(f"switch:alive:{raw_dpid}") == "1"
         except redis.RedisError:
             return False
+
+    def _active_switch_count(self):
+        try:
+            return len(self._active_switch_dpids())
+        except redis.RedisError:
+            return len(self.datapaths)
+
+    def _active_switch_dpids(self):
+        active = set()
+        for raw_dpid in self.redis.hkeys("topology:node_ips") or []:
+            if self._is_switch_alive(raw_dpid):
+                active.add(str(self._raw_dpid_to_decimal(raw_dpid)))
+        for dpid in self.redis.smembers("topology:switches") or []:
+            if self._is_switch_alive(dpid):
+                active.add(str(dpid))
+        return active
+
+    def _metric_switch_dpids(self):
+        try:
+            return self._active_switch_dpids()
+        except redis.RedisError:
+            return {str(dpid) for dpid in self.datapaths}
 
     def _is_forwarding_port_alive(self, port_name, dpid):
         if not port_name:
@@ -898,17 +982,6 @@ class DistributedL2Switch(app_manager.RyuApp):
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while learning MAC %s on %s: %s", src, dpid, e)
 
-        if 1 <= in_port <= 10:
-            switch_mac_map = self._get_switch_mac_map()
-            if src in switch_mac_map:
-                neighbor_dpid = switch_mac_map[src]
-                if str(neighbor_dpid) != str(dpid):
-                    link_str = f"{dpid}:{in_port}-{neighbor_dpid}:0"
-                    try:
-                        self.redis.sadd("topology:links", link_str)
-                    except redis.RedisError as e:
-                        self.logger.warning("Redis unavailable while inferring link %s: %s", link_str, e)
-
         try:
             ports = self._get_switch_ports(dpid)
         except redis.RedisError as e:
@@ -934,9 +1007,14 @@ class DistributedL2Switch(app_manager.RyuApp):
         src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
 
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
-            is_dup = self.arp_handler.is_duplicate(src, arp_pkt.src_ip, arp_pkt.dst_ip)
+            is_dup = self.arp_handler.is_duplicate(
+                dpid, src, arp_pkt.src_ip, arp_pkt.dst_ip, arp_pkt.opcode
+            )
             if is_dup:
-                self.logger.debug("Dropping duplicate ARP: %s -> %s", src, arp_pkt.dst_ip)
+                self.logger.debug(
+                    "Dropping duplicate ARP: dpid=%s %s %s -> %s",
+                    dpid, src, arp_pkt.src_ip, arp_pkt.dst_ip,
+                )
                 return
 
             proxy_reply, should_flood = self.arp_handler.handle_arp_request(
@@ -944,12 +1022,16 @@ class DistributedL2Switch(app_manager.RyuApp):
             )
 
             if proxy_reply:
-                self.logger.debug("ARP proxy reply for %s -> %s", arp_pkt.src_ip, arp_pkt.dst_ip)
                 return
 
             if should_flood:
-                self._do_controlled_flood(datapath, in_port, msg.data, ports)
+                self._do_controlled_flood(datapath, in_port, msg.data, ports, dpid, include_local=False)
                 return
+
+        if arp_pkt and arp_pkt.opcode == arp.ARP_REPLY:
+            self.arp_handler.learn_ip(src, arp_pkt.src_ip)
+            self.arp_handler.learn_request_location(dpid, in_port, src)
+            self.arp_handler.mark_arp(dpid, src, arp_pkt.src_ip, arp_pkt.src_ip, arp.ARP_REPLY)
 
         try:
             out_port_str = self.redis.hget(mac_table_key, dst)
@@ -992,21 +1074,38 @@ class DistributedL2Switch(app_manager.RyuApp):
             datapath.send_msg(out)
             return
 
-        self._do_controlled_flood(datapath, in_port, msg.data, ports)
+        self._do_controlled_flood(datapath, in_port, msg.data, ports, datapath.id)
 
-    def _do_controlled_flood(self, datapath, in_port, packet_data, ports):
+    def _do_controlled_flood(self, datapath, in_port, packet_data, ports, dpid=None, include_local=True):
+        """Send a broadcast packet only through the logical spanning tree.
+
+        The MST is published by TopologyManager. This function:
+        - Excludes the incoming port explicitly (so the source never
+          receives its own broadcast back).
+        - Excludes OFPP_CONTROLLER.
+        - Only floods VXLAN ports whose peer is reachable via an MST edge,
+          preventing cycles regardless of physical ring topology.
+        - Always includes local guest ports (ens*, br-*); these cannot form
+          an L2 loop with any other switch.
+        - Optionally includes OFPP_LOCAL for DHCP/broadcast consumers on the
+          bridge host; ARP unknown flooding disables it.
+        """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        dpid = dpid if dpid is not None else datapath.id
 
         bcast_ports = self.broadcast_controller.get_broadcast_ports(
-            datapath.id, in_port, ports
+            dpid, in_port, ports
         )
         if not bcast_ports:
-            self.logger.debug("No broadcast ports available from dpid=%s", datapath.id)
+            self.logger.debug("No broadcast ports available from dpid=%s in_port=%s",
+                              dpid, in_port)
             return
 
-        actions = [parser.OFPActionOutput(p) for p in bcast_ports]
-        if in_port != ofproto.OFPP_LOCAL:
+        self.broadcast_controller.metrics["flood"] += 1
+
+        actions = [parser.OFPActionOutput(p) for p in bcast_ports if p != in_port]
+        if include_local and in_port != ofproto.OFPP_LOCAL:
             actions.append(parser.OFPActionOutput(ofproto.OFPP_LOCAL))
 
         out = parser.OFPPacketOut(
@@ -1017,6 +1116,10 @@ class DistributedL2Switch(app_manager.RyuApp):
             data=packet_data,
         )
         datapath.send_msg(out)
+        self.logger.debug(
+            "Controlled flood: dpid=%s in_port=%s -> ports=%s",
+            dpid, in_port, bcast_ports,
+        )
 
     def _resolve_guest_out_port(self, current_dpid, dst_mac):
         try:
@@ -1382,17 +1485,46 @@ class DistributedL2Switch(app_manager.RyuApp):
 
         lines.append(f"# HELP ryu_packet_in_total Total Packet-In events")
         lines.append(f"# TYPE ryu_packet_in_total counter")
-        for dpid, count in self.packet_in_total.items():
-            lines.append(f'ryu_packet_in_total{{dpid="{dpid}"}} {count}')
+        metric_dpids = self._metric_switch_dpids()
+        packet_counts = {str(dpid): count for dpid, count in self.packet_in_total.items()}
+        for dpid in sorted(metric_dpids | set(packet_counts)):
+            lines.append(f'ryu_packet_in_total{{dpid="{dpid}"}} {packet_counts.get(dpid, 0)}')
 
         lines.append(f"# HELP ryu_installed_flows Installed forwarding flows per switch")
         lines.append(f"# TYPE ryu_installed_flows gauge")
-        for dpid, count in self.installed_flows.items():
-            lines.append(f'ryu_installed_flows{{dpid="{dpid}"}} {count}')
+        flow_counts = {str(dpid): count for dpid, count in self.installed_flows.items()}
+        for dpid in sorted(metric_dpids | set(flow_counts)):
+            lines.append(f'ryu_installed_flows{{dpid="{dpid}"}} {flow_counts.get(dpid, 0)}')
 
+        active_switches = self._active_switch_count()
         lines.append(f"# HELP ryu_active_nodes Number of active switches")
         lines.append(f"# TYPE ryu_active_nodes gauge")
-        lines.append(f"ryu_active_nodes {len(self.datapaths)}")
+        lines.append(f"ryu_active_nodes {active_switches}")
+        lines.append(f"# HELP ryu_active_switches Number of active switches")
+        lines.append(f"# TYPE ryu_active_switches gauge")
+        lines.append(f"ryu_active_switches {active_switches}")
+
+        lines.append(f"# HELP ryu_arp_proxy_total Total ARP replies sent by controller proxy")
+        lines.append(f"# TYPE ryu_arp_proxy_total counter")
+        lines.append(f'ryu_arp_proxy_total{{node="{NODE_NAME}"}} {self.arp_handler.metrics.get("proxy", 0)}')
+        lines.append(f"# HELP ryu_arp_flood_total Total ARP requests forwarded via controlled flood")
+        lines.append(f"# TYPE ryu_arp_flood_total counter")
+        lines.append(f'ryu_arp_flood_total{{node="{NODE_NAME}"}} {self.arp_handler.metrics.get("flood", 0)}')
+        lines.append(f"# HELP ryu_arp_dedup_total Total ARP requests dropped as duplicates")
+        lines.append(f"# TYPE ryu_arp_dedup_total counter")
+        lines.append(f'ryu_arp_dedup_total{{node="{NODE_NAME}"}} {self.arp_handler.metrics.get("dedup", 0)}')
+        lines.append(f"# HELP ryu_arp_learn_total Total IP->MAC bindings learned from ARP")
+        lines.append(f"# TYPE ryu_arp_learn_total counter")
+        lines.append(f'ryu_arp_learn_total{{node="{NODE_NAME}"}} {self.arp_handler.metrics.get("learn", 0)}')
+        lines.append(f"# HELP ryu_broadcast_flood_total Total broadcast floods issued by this node")
+        lines.append(f"# TYPE ryu_broadcast_flood_total counter")
+        lines.append(f'ryu_broadcast_flood_total{{node="{NODE_NAME}"}} {self.broadcast_controller.metrics.get("flood", 0)}')
+        lines.append(f"# HELP ryu_broadcast_mst_edges MST edges visible from this node")
+        lines.append(f"# TYPE ryu_broadcast_mst_edges gauge")
+        lines.append(f'ryu_broadcast_mst_edges{{node="{NODE_NAME}"}} {self.broadcast_controller.metrics.get("mst_edges", 0)}')
+        lines.append(f"# HELP ryu_broadcast_ports_blocked Non-MST VXLAN ports skipped during flood")
+        lines.append(f"# TYPE ryu_broadcast_ports_blocked counter")
+        lines.append(f'ryu_broadcast_ports_blocked{{node="{NODE_NAME}"}} {self.broadcast_controller.metrics.get("ports_blocked", 0)}')
 
         for (dpid, port_no), stats in self.port_stats.items():
             p = stats

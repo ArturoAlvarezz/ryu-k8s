@@ -52,7 +52,7 @@ spec:
       - name: ryu
         image: arturoalvarez/ryu-controller:latest
         # FIX: IfNotPresent evita intentos de pull fallidos en lab GNS3 aislado sin internet
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         command:
         - /bin/sh
         - -c
@@ -76,7 +76,7 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         - name: METRICS_EXPORTER_NODE
-          value: "master"
+          value: ""
         - name: METRICS_CACHE_SECONDS
           value: "30"
         - name: RYU_CACHE_NODE_IPS_SECONDS
@@ -87,14 +87,10 @@ spec:
           value: "10"
         - name: RYU_CACHE_LIVENESS_SECONDS
           value: "2"
-        - name: RYU_CACHE_BR0_STP_SECONDS
-          value: "5"
         - name: RYU_CACHE_SECURITY_SECONDS
           value: "5"
         - name: RYU_CACHE_PATH_SECONDS
           value: "5"
-        - name: VXLAN_REQUIRES_FORWARDING_BR0_EDGE
-          value: "true"
         - name: FORWARDING_FLOW_IDLE_TIMEOUT
           value: "120"
         volumeMounts:
@@ -102,28 +98,37 @@ spec:
           mountPath: /app/app.py
           subPath: app.py
         readinessProbe:
-          tcpSocket:
-            host: 127.0.0.1
-            port: 8000
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "grep -qi ':19FD .* 0A' /proc/net/tcp /proc/net/tcp6"
           initialDelaySeconds: 5
           periodSeconds: 5
+          timeoutSeconds: 5
           # FIX: 100s de tolerancia para reconvergencia VXLAN tras reconexión de nodos
           failureThreshold: 20
         startupProbe:
-          tcpSocket:
-            host: 127.0.0.1
-            port: 8000
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "grep -qi ':19FD .* 0A' /proc/net/tcp /proc/net/tcp6"
           periodSeconds: 5
+          timeoutSeconds: 5
           failureThreshold: 60   # 300s máximo para startup — sin cambio
         livenessProbe:
-          tcpSocket:
-            host: 127.0.0.1
-            port: 8000
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - "tr '\\0' ' ' < /proc/1/cmdline | grep -q ryu-manager"
           # FIX: period 30s + delay 30s + 6 fallos = 210s de tolerancia (antes: 60s)
           # Evita SIGKILL (Exit 137) durante reconvergencias VXLAN transitorias
           initialDelaySeconds: 30
           periodSeconds: 30
-          failureThreshold: 6
+          timeoutSeconds: 5
+          failureThreshold: 10
       volumes:
       - name: code-volume
         configMap:

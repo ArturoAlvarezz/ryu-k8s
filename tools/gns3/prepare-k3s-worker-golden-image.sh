@@ -4,12 +4,11 @@ set -euo pipefail
 
 JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-${1:-}}}"
 API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-192.168.122.10}}"
+NODE_NAME="${RYU_K3S_NODE_NAME:-${K3S_NODE_NAME:-$(hostname)}}"
 NODE_PREFIX="${RYU_K3S_NODE_PREFIX:-24}"
 NODE_GATEWAY="${RYU_K3S_NODE_GATEWAY:-192.168.122.1}"
 NODE_DNS="${RYU_K3S_NODE_DNS:-$NODE_GATEWAY}"
 ALL_PORTS="${RYU_K3S_BR0_PORTS:-ens3 ens4 ens5 ens6}"
-STP_PORTS="${RYU_K3S_STP_PORTS:-$ALL_PORTS}"
-PREFERRED_STP_PORTS="${RYU_K3S_PREFERRED_STP_PORTS:-$STP_PORTS}"
 REPO_DIR="${RYU_K3S_REPO_DIR:-$PWD}"
 SKIP_APT_UPGRADE="${RYU_K3S_SKIP_APT_UPGRADE:-false}"
 
@@ -94,6 +93,16 @@ yaml_list() {
   printf ']'
 }
 
+default_active_ports() {
+  case "$NODE_NAME" in
+    worker-24cf41) echo "ens5" ;;
+    worker-b0ff27) echo "ens3 ens4 ens5" ;;
+    worker-b56b35) echo "ens3 ens4" ;;
+    worker-ea7e34) echo "ens3" ;;
+    *) echo "ens3" ;;
+  esac
+}
+
 configure_hostname() {
   hostnamectl set-hostname worker-golden
   printf 'worker-golden\n' >/etc/hostname
@@ -105,7 +114,8 @@ configure_hostname() {
 
 write_netplan() {
   dns_list=$(yaml_list "$NODE_DNS")
-  port_list=$(yaml_list "$ALL_PORTS")
+  active_ports=${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}
+  port_list=$(yaml_list "$active_ports")
 
   cat >/etc/netplan/50-cloud-init.yaml <<EOF
 network:
@@ -137,7 +147,7 @@ network:
       nameservers:
         addresses: $dns_list
       parameters:
-        stp: true
+        stp: false
 EOF
   chmod 600 /etc/netplan/50-cloud-init.yaml
   netplan apply
@@ -149,7 +159,7 @@ install_br0_service() {
 
   cat >/etc/systemd/system/gns3-br0-tree.service <<'EOF'
 [Unit]
-Description=Configurar br0 de gestion GNS3 con STP
+Description=Configurar br0 de gestion GNS3 sin STP
 DefaultDependencies=no
 After=systemd-udev-settle.service systemd-networkd.service
 Before=network-online.target k3s-agent.service

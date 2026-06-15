@@ -76,19 +76,20 @@ servidor DHCP de SDN.
 
 ## 2. Plano de management: `br0` (Linux bridge)
 
-- Cada nodo K3s tiene `br0` como **Linux bridge plano** (sin STP en el plano
-  SDN; ver §3).
-- `br0` conecta las NICs físicas `ens*` entre sí en capa 2.
+- Cada nodo K3s tiene `br0` como **Linux bridge sin STP**.
+- `br0` conecta solo los puertos físicos activos definidos por
+  `ACTIVE_BR0_PORTS`; los enlaces físicos redundantes del anillo se mantienen
+  en GNS3 para LLDP/VXLAN/topología, pero no forman una malla L2 libre en
+  `br0`.
 - Los nodos obtienen IP en `192.168.122.0/24` (DHCP desde el GNS3 NAT1 o
   estática vía `cloud-init`).
 - Servicios de Kubernetes (K3s API server, etcd, flannel VXLAN, kubelet)
   corren sobre `br0`.
-- `Mgmt-STP-Switch` (GNS3 Open vSwitch) corre STP sobre `br0` como root
-  para evitar loops accidentales en el cableado físico. Esto es **solo para
-  `br0`**, no afecta al plano SDN.
-- Servicio `gns3-br0-tree.service` está **deshabilitado** en todos los nodos
-  (configurado en `tools/gns3/configure-br0-tree.sh`). STP sigue activo vía
-  `Mgmt-STP-Switch` como root.
+- `Mgmt-Switch` (GNS3 Open vSwitch) debe tener STP deshabilitado.
+- Los anillos físicos se conservan como topología de laboratorio. Los loops de
+  tráfico SDN se controlan en `br-sdn` mediante Ryu/MST/Dijkstra, no con STP.
+- `gns3-br0-tree.service` ejecuta `tools/gns3/configure-br0-tree.sh` para
+  mantener `br0` sin STP y con un conjunto determinista de puertos activos.
 
 ## 3. Plano de datos SDN: `br-sdn` (OVS bridge)
 
