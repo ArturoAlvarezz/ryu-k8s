@@ -32,6 +32,7 @@ import threading
 import logging
 import hmac
 import hashlib
+import heapq
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -854,6 +855,46 @@ def build_sdn_topology(redis):
     }
 
 
+def _dijkstra_shortest_path(adjacency, src, dst):
+    """Camino de menor costo con Dijkstra (heapq).
+
+    adjacency: {dpid: [(vecino, costo), ...]}. Con costos uniformes (1.0)
+    equivale al menor numero de saltos. Empata por orden de dpid para que
+    el resultado sea determinista. Devuelve [] si no hay camino.
+    """
+    if src == dst:
+        return [src]
+    dist = {src: 0.0}
+    prev = {}
+    heap = [(0.0, src)]
+    visited = set()
+    while heap:
+        d, node = heapq.heappop(heap)
+        if node in visited:
+            continue
+        visited.add(node)
+        if node == dst:
+            break
+        for neighbor, cost in sorted(adjacency.get(node, [])):
+            if neighbor in visited:
+                continue
+            nd = d + cost
+            if neighbor not in dist or nd < dist[neighbor]:
+                dist[neighbor] = nd
+                prev[neighbor] = node
+                heapq.heappush(heap, (nd, neighbor))
+    if dst not in dist:
+        return []
+    path = [dst]
+    while path[-1] != src:
+        node = prev.get(path[-1])
+        if node is None:
+            return []
+        path.append(node)
+    path.reverse()
+    return path
+
+
 def trace_sdn_path(redis, src_guest, dst_guest):
     topology = build_sdn_topology(redis)
     dpids = {node["id"] for node in topology["nodes"] if node.get("type") == "switch"}
@@ -884,50 +925,29 @@ def trace_sdn_path(redis, src_guest, dst_guest):
     if not src_switch or not dst_switch:
         return {"nodes": [], "edges": [], "reason": "guest_location_unknown"}
 
-    path = [src_switch]
-    visited = set()
-    current = src_switch
-    while current != dst_switch:
-        if current in visited:
-            path = []
-            break
-        visited.add(current)
-        out_port = mac_tables.get(current, {}).get(dst_guest)
-        port_name = switch_ports.get(current, {}).get(str(out_port), "") if out_port else ""
-        if not str(port_name).startswith("vx"):
-            path = []
-            break
-        next_switch = ip_to_dpid.get(str(port_name)[2:])
-        if not next_switch or next_switch not in dpids:
-            path = []
-            break
-        a, b = sorted([str(current), str(next_switch)])
-        if f"vxlan:{a}:{b}" not in vx_edges:
-            path = []
-            break
-        path.append(next_switch)
-        current = next_switch
+    # Camino mas corto con Dijkstra sobre el grafo VXLAN.
+    # NO seguimos mac_to_port: esa tabla aprende MACs origen via flood MST y
+    # registra puertos sub-optimos, lo que producia rutas no optimas e
+    # intermitentes en el mapa. El camino mostrado debe coincidir siempre con
+    # el que instala Ryu (Dijkstra sobre el mismo grafo VXLAN con
+    # topology:link_cost; costo por defecto 1.0 = menor numero de saltos).
+    link_costs = redis.hgetall("topology:link_cost") or {}
+    adjacency = {dpid: [] for dpid in dpids}
+    for edge in vx_edges.values():
+        source = str(edge.get("source", ""))
+        target = str(edge.get("target", ""))
+        if source not in adjacency or target not in adjacency:
+            continue
+        raw_cost = link_costs.get(f"{source}:{target}",
+                                  link_costs.get(f"{target}:{source}", 1.0))
+        try:
+            cost = float(raw_cost)
+        except (TypeError, ValueError):
+            cost = 1.0
+        adjacency[source].append((target, cost))
+        adjacency[target].append((source, cost))
 
-    if not path:
-        adjacency = {dpid: [] for dpid in dpids}
-        for edge in vx_edges.values():
-            source = str(edge.get("source", ""))
-            target = str(edge.get("target", ""))
-            if source in adjacency and target in adjacency:
-                adjacency[source].append(target)
-                adjacency[target].append(source)
-        queue = [(src_switch, [src_switch])]
-        seen = {src_switch}
-        while queue:
-            current, candidate = queue.pop(0)
-            if current == dst_switch:
-                path = candidate
-                break
-            for target in sorted(adjacency.get(current, [])):
-                if target in seen:
-                    continue
-                seen.add(target)
-                queue.append((target, candidate + [target]))
+    path = _dijkstra_shortest_path(adjacency, src_switch, dst_switch)
 
     if not path:
         return {"nodes": [src_guest, dst_guest], "edges": [], "reason": "path_not_found"}
