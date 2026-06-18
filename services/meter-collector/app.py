@@ -80,6 +80,19 @@ _cache_lock = threading.Lock()
 _redis_metrics: dict[tuple[str, str], dict[str, float]] = {}
 _redis_metrics_lock = threading.Lock()
 
+# Última vista buena del registro persistente de nodos (topology:switches /
+# node_names / node_ips). Sirve para no colapsar las APIs SDN a "0 nodos" cuando
+# una lectura transitoria de Redis devuelve vacío (failover de Sentinel o una
+# réplica resincronizando durante el reinicio de un worker).
+_node_registry_snapshot: dict = {"switches": set(), "node_names": {}, "node_ips": {}, "ts": 0.0}
+_node_registry_lock = threading.Lock()
+# Cuánto tiempo (s) servir el snapshot persistente cuando Redis responde vacío.
+NODE_SNAPSHOT_TTL = float(os.environ.get("NODE_SNAPSHOT_TTL", "600"))
+# Ventana de gracia (s) para seguir mostrando un switch (marcado stale) tras
+# perder su heartbeat switch:alive. Evita que un nodo que solo reconverge
+# desaparezca de la topología; los nodos realmente ausentes caen al superarla.
+NODE_STALE_GRACE = float(os.environ.get("NODE_STALE_GRACE", "600"))
+
 
 def canonical_json(payload: dict) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -423,16 +436,22 @@ def looks_like_worker_name(name):
 
 
 def observed_workers(redis):
-    node_names = redis.hgetall("topology:node_names")
-    node_ips = redis.hgetall("topology:node_ips")
+    # Registro persistente con fallback a la última vista buena: una lectura
+    # transitoria vacía durante el reinicio de un worker no debe devolver 0
+    # workers. La liveness se refleja en "online"/"stale", no ocultando el nodo.
+    switches, node_names, node_ips, _degraded = read_node_registry(redis)
+    known = known_switch_dpids(redis, node_names, switches)
     workers = []
     for raw_dpid, name in sorted(node_names.items(), key=lambda item: item[1]):
         if not looks_like_worker_name(name):
             continue
+        if normalize_dpid(raw_dpid) not in known:
+            continue  # nodo fuera de la ventana de gracia: realmente ausente
         mac = ""
         if len(raw_dpid) >= 12:
             raw_mac = raw_dpid[-12:]
             mac = ":".join(raw_mac[i:i + 2] for i in range(0, 12, 2)).lower()
+        online = bool(redis.exists(f"switch:alive:{raw_dpid}"))
         workers.append({
             "mac": mac,
             "ip": node_ips.get(raw_dpid, ""),
@@ -441,7 +460,8 @@ def observed_workers(redis):
             "in_port": "",
             "port_name": "node",
             "node_name": name,
-            "online": bool(redis.exists(f"switch:alive:{raw_dpid}")),
+            "online": online,
+            "stale": not online,
             "kind": "worker",
         })
     return workers
@@ -650,16 +670,67 @@ def with_security_state(redis, guest):
     return guest
 
 
-def active_switch_dpids(redis):
-    dpids = set()
-    for dpid in redis.smembers("topology:switches") or []:
+def read_node_registry(redis):
+    """Lee el registro persistente de nodos con fallback a la última vista buena.
+
+    Devuelve (switches, node_names, node_ips, degraded). Si Redis responde con un
+    registro vacío (lectura transitoria contra una réplica resincronizando o
+    durante un failover de Sentinel) pero hay un snapshot reciente no vacío,
+    devuelve ese snapshot con degraded=True en lugar de propagar un estado vacío
+    que vaciaría /api/guests y /api/sdn-topology de forma global.
+    """
+    switches = set(redis.smembers("topology:switches") or [])
+    node_names = redis.hgetall("topology:node_names") or {}
+    node_ips = redis.hgetall("topology:node_ips") or {}
+    if node_names or switches:
+        with _node_registry_lock:
+            _node_registry_snapshot.update(
+                switches=set(switches), node_names=dict(node_names),
+                node_ips=dict(node_ips), ts=time.time())
+        return switches, node_names, node_ips, False
+    with _node_registry_lock:
+        age = time.time() - _node_registry_snapshot["ts"]
+        if _node_registry_snapshot["node_names"] and age < NODE_SNAPSHOT_TTL:
+            return (set(_node_registry_snapshot["switches"]),
+                    dict(_node_registry_snapshot["node_names"]),
+                    dict(_node_registry_snapshot["node_ips"]), True)
+    return switches, node_names, node_ips, False
+
+
+def alive_switch_dpids(redis, node_names, switches):
+    """Switches con heartbeat switch:alive vigente (vivos en este instante)."""
+    alive = set()
+    for dpid in switches:
+        if redis.exists(f"switch:alive:{raw_dpid_from(dpid)}"):
+            alive.add(normalize_dpid(dpid))
+    for raw in node_names:
+        if redis.exists(f"switch:alive:{raw}"):
+            alive.add(normalize_dpid(raw))
+    return alive
+
+
+def known_switch_dpids(redis, node_names, switches):
+    """Todos los switches conocidos del registro persistente, visibles aunque su
+    heartbeat haya expirado mientras sigan dentro de la ventana de gracia
+    (node_last_seen) o estén vivos. Así un nodo que solo reconverge no se borra
+    de la topología, pero los realmente ausentes caen tras NODE_STALE_GRACE.
+    """
+    last_seen = redis.hgetall("topology:node_last_seen") or {}
+    now = time.time()
+    known = set()
+    for dpid in set(switches) | set(node_names.keys()):
         raw = raw_dpid_from(dpid)
         if redis.exists(f"switch:alive:{raw}"):
-            dpids.add(normalize_dpid(dpid))
-    for raw in redis.hkeys("topology:node_names") or []:
-        if redis.exists(f"switch:alive:{raw}"):
-            dpids.add(normalize_dpid(raw))
-    return dpids
+            known.add(normalize_dpid(dpid))
+            continue
+        seen = last_seen.get(raw) or last_seen.get(str(dpid))
+        if seen:
+            try:
+                if (now - float(seen)) < NODE_STALE_GRACE:
+                    known.add(normalize_dpid(dpid))
+            except (TypeError, ValueError):
+                pass
+    return known
 
 
 def vxlan_edges(redis, dpids, ip_to_dpid):
@@ -744,9 +815,13 @@ def physical_edges(redis, dpids, ip_to_dpid):
 
 
 def build_sdn_topology(redis):
-    dpids = active_switch_dpids(redis)
-    node_names = redis.hgetall("topology:node_names") or {}
-    node_ips = redis.hgetall("topology:node_ips") or {}
+    # Estructura desde el registro persistente (con fallback a la última vista
+    # buena) y liveness desde switch:alive. Un switch cuyo heartbeat expiró sigue
+    # en la topología marcado "stale" en vez de desaparecer: así reconvergencia
+    # de un worker no vacía la vista global.
+    switches, node_names, node_ips, degraded = read_node_registry(redis)
+    dpids = known_switch_dpids(redis, node_names, switches)
+    alive = alive_switch_dpids(redis, node_names, switches)
     nodes = []
     edges_by_id = {}
     ip_to_dpid = {}
@@ -760,6 +835,7 @@ def build_sdn_topology(redis):
         name = node_names.get(raw, f"switch-{dpid}")
         ip = node_ips.get(raw, "")
         role = "control-plane" if looks_like_worker_name(name) and not str(name).startswith("worker") else "worker"
+        is_alive = dpid in alive
         nodes.append({
             "id": str(dpid),
             "label": name,
@@ -770,7 +846,8 @@ def build_sdn_topology(redis):
             "mac": mac_from_raw_dpid(raw),
             "dpid": str(dpid),
             "raw_dpid": raw,
-            "status": "online",
+            "online": is_alive,
+            "status": "online" if is_alive else "stale",
         })
 
     for guest in [with_security_state(redis, item) for item in observed_guests(redis)]:
@@ -806,12 +883,17 @@ def build_sdn_topology(redis):
                 "details": "Conexion local guest-switch",
             }
 
+    # Aristas físicas/VXLAN entre todos los switches conocidos (no solo los
+    # vivos), marcadas "stale" si algún extremo perdió su heartbeat. Así el grafo
+    # no pierde enlaces durante la reconvergencia de un nodo.
     for edge_id, edge in physical_edges(redis, dpids, ip_to_dpid).items():
         edge["details"] = ", ".join(edge.get("details_list", []))
+        edge["status"] = "up" if (edge["source"] in alive and edge["target"] in alive) else "stale"
         edges_by_id[edge_id] = edge
 
     for edge_id, edge in vxlan_edges(redis, dpids, ip_to_dpid).items():
         edge["details"] = ", ".join(edge.get("details_list", []))
+        edge["status"] = "up" if (edge["source"] in alive and edge["target"] in alive) else "stale"
         edges_by_id[edge_id] = edge
 
     if dpids:
@@ -838,7 +920,7 @@ def build_sdn_topology(redis):
                 "source": dpid,
                 "target": "mgmt-switch",
                 "type": "br0_mgmt_switch",
-                "status": "up",
+                "status": "up" if dpid in alive else "stale",
                 "label": "br0 mgmt",
                 "port": ports,
                 "details": f"Plano de management br0 ({ports})",
@@ -853,6 +935,7 @@ def build_sdn_topology(redis):
     return {
         "nodes": sorted(nodes, key=lambda item: (item.get("type", ""), item.get("label", ""), item["id"])),
         "edges": sorted(edges, key=lambda item: (item.get("type", ""), item["id"])),
+        "degraded": degraded,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
