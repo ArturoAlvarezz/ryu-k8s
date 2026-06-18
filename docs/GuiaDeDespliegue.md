@@ -39,6 +39,7 @@
 17. [Monitoreo y endpoints](#17-monitoreo-y-endpoints)
 18. [Debugging post-despliegue](#18-debugging-post-despliegue)
 19. [Operaciones de mantenimiento](#19-operaciones-de-mantenimiento)
+20. [Resiliencia de la red de gestión](#20-resiliencia-de-la-red-de-gestión)
 
 ---
 
@@ -82,7 +83,7 @@ Recursos mínimos validados para las VMs control-plane:
 
 ### 2.1 Arranque completo de una topología GNS3 con enlaces redundantes
 
-#### 2.1.1 Configurar el switch STP de gestión
+#### 2.1.1 Configurar el switch de gestión
 
 Configuración del nodo en GNS3:
 
@@ -90,7 +91,7 @@ Configuración del nodo en GNS3:
 | --- | --- |
 | Template | Docker container / Open vSwitch |
 | Imagen | `gns3/openvswitch:latest` |
-| Nombre del nodo | `Mgmt-STP-Switch` o un nombre equivalente de switch de gestión |
+| Nombre del nodo | `Mgmt-Switch` o un nombre equivalente de switch de gestión |
 | Adaptadores | 16 Ethernet adapters, o al menos tantos como enlaces de gestión vayas a conectar |
 | Consola | Telnet o none |
 
@@ -102,14 +103,9 @@ for port in $(ls /sys/class/net | grep -E "^eth[0-9]+$"); do
   ip link set "$port" up
 done
 ip link set br0 up
-ovs-vsctl set Bridge br0 stp_enable=true other_config:stp-priority=0
-
-ovs-vsctl get Bridge br0 stp_enable
-
-ovs-vsctl get Bridge br0 other_config:stp-priority
-
-ovs-appctl stp/show br0
 ```
+
+El control de bucles no se delega al switch de gestión; se mantiene mediante el árbol determinístico de puertos aplicado en cada nodo K3s.
 
 ---
 
@@ -422,7 +418,7 @@ Exporta el disco `.qcow2` desde el hipervisor y úsalo como appliance de worker 
 1. Mantén encendidos los 3 servidores control-plane.
 2. Mantén activo el VIP `192.168.122.10`.
 3. Arrastra la appliance `SDN-Worker` al canvas tantas veces como necesites.
-4. Conecta los workers solo a puertos libres de nodos control-plane. No conectes ningún worker al `Mgmt-STP-Switch`, al switch básico de GNS3 ni a `NAT1`.
+4. Conecta los workers solo a puertos libres de nodos control-plane. No conectes ningún worker al switch de gestión, al switch básico de GNS3 ni a `NAT1`.
 5. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN.
 6. Enciende los workers.
 7. No asignes IP manualmente a cada clon: `gns3-br0-tree.service` capturará la IP DHCP inicial de `br0` y la convertirá en perfil estático antes de que `k3s-autojoin.service` una el worker al cluster.
@@ -435,7 +431,7 @@ Cableado válido mínimo para un worker con un solo enlace:
 | `SDN-Worker-2:e0` (`ens3`) | `Master2:e1` (`ens4`) |
 | `SDN-Worker-3:e0` (`ens3`) | `Master3:e1` (`ens4`) |
 
-Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master:e1`, `Master2:e1` y `Master3:e1`. Por defecto todos los puertos STP usan el mismo coste para que Linux bridge elija el camino más corto real hacia `Mgmt-STP-Switch`; usa `PREFERRED_STP_PORTS` solo si necesitas forzar un árbol específico para un clon. No uses el switch de gestión como punto de conexión de workers.
+Si quieres redundancia de gestión para un worker, conecta `e0`-`e2` del worker a control-plane distintos, por ejemplo `Master:e1`, `Master2:e1` y `Master3:e1`. El árbol activo de `br0` se define por `ACTIVE_BR0_PORTS` en cada nodo; ajusta esa variable si necesitas forzar un camino específico para un clon. No uses el switch de gestión como punto de conexión de workers. Para que ese cable de respaldo se active automáticamente ante la caída de un worker-hub (sin formar loop ni STP), instala el daemon `worker-mgmt-failover` en el worker correspondiente: ver [Sección 20 — Resiliencia de la red de gestión](#20-resiliencia-de-la-red-de-gestión).
 
 Cada worker usa una IP persistente en `br0`, genera hostname `worker-<mac>`, instala `k3s-agent` y se une al cluster usando `https://192.168.122.10:6443`.
 
@@ -628,7 +624,7 @@ curl http://192.168.122.10:8081/api/telemetry-security
 curl http://192.168.122.10:9090/api/v1/targets
 ```
 
-Consulta directa del grafo STP usado por Grafana:
+Consulta directa de enlaces SDN publicados por Prometheus:
 
 ```bash
 curl -s 'http://192.168.122.10:9090/api/v1/query?query=ryu_topology_edge_info'
@@ -766,6 +762,8 @@ curl http://192.168.122.10:8081/api/telemetry-security
 
 Si `/api/telemetry-security` muestra `unregistered_source`, registra el medidor con la IP/MAC/DPID/puerto observados en `/api/guests`. Si muestra `status_quarantine` o `security_status_blocked`, cambia el estado del dispositivo a `authorized` desde la consola AMI antes de esperar que aparezca en `/api/stats`.
 
+Un medidor nuevo NO se autoriza solo: al observarse por primera vez queda en estado `pending` (rechazo de política `status_pending`) y su telemetría se descarta hasta que el operador lo aprueba con el botón **Registrar** en la consola AMI (o cambiando su estado a `authorized`). Las VMs recreadas que ya estaban `authorized` conservan ese estado. Los registros sin telemetría reciente se marcan `stale` en `/api/guests` (`offline_registered`) para distinguir bajas reales de medidores que sólo no han reportado aún.
+
 En el nodo donde corre el guest o el collector:
 
 ```bash
@@ -855,3 +853,85 @@ Resultado esperado:
 - Redis Sentinel mantiene o elige un master.
 - Los DaemonSets críticos siguen activos en los nodos vivos.
 - Los Deployments se recrean fuera del nodo apagado si tenían réplicas allí.
+
+---
+
+## 20. Resiliencia de la red de gestión
+
+La red de gestión (`br0`, `192.168.122.0/24`) es una sola L2 plana sin STP. Mantener `br0` libre de loops y, a la vez, tolerante a fallos de nodo se logra con tres mecanismos coordinados, todos sin STP y todos auto-reparables ante tormentas de broadcast. El endpoint que mide "plano de gestión sano" es siempre el VIP HA de K3s `192.168.122.10` (kube-vip), no un control-plane concreto: así un master caído con el VIP flotando a otro control-plane no se confunde con una pérdida de red.
+
+### 20.1 Árbol determinístico de `br0` (`gns3-br0-tree.service`)
+
+`tools/gns3/configure-br0-tree.sh` enslava a `br0` únicamente un subconjunto de puertos físicos por nodo (`ACTIVE_BR0_PORTS`), dejando el resto de cables conectados pero fuera del bridge. Eso da un árbol sin ciclos con STP deshabilitado; los enlaces redundantes quedan como respaldo en frío que sólo se activa bajo demanda (ver 20.2 y 20.3).
+
+- El subconjunto activo se define por nodo en `/etc/default/gns3-br0-tree` con `ACTIVE_BR0_PORTS`. Si esa variable no existe, el script aplica un default por hostname (función `default_active_ports`). Para un clon nuevo, fija `ACTIVE_BR0_PORTS` en su archivo de config en vez de depender del default.
+- **Excepción documentada (control-plane estable):** `control-3` lleva `ens4` permanentemente en `br0`. Ese `ens4` es el extremo fijo del cable de respaldo hacia un worker (ver 20.3). No forma loop porque el extremo del worker mantiene su propio `ens4` fuera de `br0` mientras el camino primario está sano.
+- Tras editar el árbol, el script regenera la config de `netplan`/`networkd` para que un reinicio (o un corte de energía) no re-enslave un puerto viejo y dispare una tormenta.
+
+Verifica el árbol activo de un nodo:
+
+```bash
+systemctl is-active gns3-br0-tree.service
+ip -br link show master br0
+```
+
+### 20.2 Failover del uplink a internet (`uplink-failover.service`)
+
+Sólo `master` enslava su uplink hacia `NAT1`/gateway (`192.168.122.1`); los control-plane lo dejan fuera de `br0`. Eso hace de `master` un punto único de fallo para la salida a internet. El daemon `tools/gns3/uplink-failover.sh` corre en los control-plane de respaldo (`control-2` = prioridad 1, `control-3` = prioridad 2) y enslava su uplink local cuando `master` deja de responder, devolviéndolo al liberarse cuando `master` regresa o si detecta una tormenta.
+
+- Sólo se activa con `master` INALCANZABLE: si master no responde, su enlace está abajo y enslavar no crea un segundo camino activo (no hay loop).
+- Un guard de tormenta libera el puerto de inmediato si se formara un loop en la ventana de failback.
+- El uplink es puro plano de gestión; `br-sdn`/VXLAN/Smart Meters no lo usan, así que el failover nunca afecta el tráfico SDN.
+
+Instalación (en `control-2` y `control-3`):
+
+```bash
+sudo install -m 0755 tools/gns3/uplink-failover.sh /usr/local/bin/uplink-failover.sh
+sudo install -m 0644 tools/gns3/uplink-failover.service /etc/systemd/system/uplink-failover.service
+# control-2 -> prioridad 1, control-3 -> prioridad 2
+echo 'PRIORITY=1' | sudo tee /etc/default/uplink-failover    # PRIORITY=2 en control-3
+sudo systemctl enable --now uplink-failover.service
+```
+
+### 20.3 Failover de la ruta de gestión de un worker (`worker-mgmt-failover.service`)
+
+Cuando los workers cuelgan en cadena de un único worker-hub, apagar ese hub deja sin ruta de gestión a todos los workers aguas abajo y se produce una **cascada**: todos pasan a `NotReady`. Para romperla, un worker con un segundo cable hacia un control-plane corre `tools/gns3/worker-mgmt-failover.sh`, que enslava su puerto de respaldo (`BACKUP_PORT`, por defecto `ens4`) a `br0` cuando el VIP de K3s deja de responder, abriendo un camino alternativo hacia el control-plane (su `ens4` siempre activo, ver 20.1).
+
+Garantías (mismo patrón que 20.2):
+
+- **Disparo por salud del VIP** (`MGMT_VIP=192.168.122.10`): se mide contra el VIP HA, no contra un master concreto. Mientras el hub esté caído, el extremo primario del posible loop también está abajo, así que enslavar no forma un bucle activo.
+- **Failback exclusivamente por tormenta:** cuando el hub vuelve, el camino primario (`ens3`) y el backup (`ens4`) quedan activos a la vez → loop → el multicast se dispara → el guard libera `ens4`. No se libera por ping al VIP, porque estando enslavado el VIP es alcanzable a través del propio backup y ese ping no distinguiría "primario vivo".
+- **Sin IPs de worker hardcodeadas:** el único valor fijo es el VIP (estable). Qué worker corre el daemon, su `BACKUP_PORT` y el cableado al control-plane se definen por config, nunca por la IP de otro worker (que cambia al recrear la VM).
+
+Requisitos de cableado: el worker que corre el daemon debe tener un cable de su `ens4` al `ens4` de un control-plane que lleve ese puerto permanentemente en `br0` (ver excepción de `control-3` en 20.1). Ese worker reparte el respaldo para toda la cadena aguas abajo.
+
+Instalación (en el worker con cable de respaldo a un control-plane):
+
+```bash
+sudo install -m 0755 tools/gns3/worker-mgmt-failover.sh /usr/local/bin/worker-mgmt-failover.sh
+sudo install -m 0644 tools/gns3/worker-mgmt-failover.service /etc/systemd/system/worker-mgmt-failover.service
+# Opcional: override de BACKUP_PORT/MGMT_VIP en /etc/default/worker-mgmt-failover
+sudo systemctl enable --now worker-mgmt-failover.service
+```
+
+### 20.4 Prueba de no-cascada de workers
+
+Verifica que apagar el worker-hub sólo afecta a ese worker y no colapsa la cadena.
+
+```bash
+# Baseline: todos Ready
+kubectl get nodes --no-headers | awk '{print $1, $2}'
+```
+
+Apaga el worker-hub en GNS3. A los 45 s, 90 s y 150 s vuelve a consultar:
+
+```bash
+kubectl get nodes --no-headers | grep -c ' Ready'
+kubectl get nodes --no-headers | grep ' NotReady'
+```
+
+Resultado esperado:
+
+- Sólo el worker-hub apagado aparece `NotReady`; los demás workers siguen `Ready` en todas las mediciones.
+- En el worker de respaldo, `journalctl -u worker-mgmt-failover` muestra un único `ENSLAVE` durante el outage y un único `TORMENTA → RELEASE` al reencender el hub (failback limpio, sin oscilación).
+- Al reencender el hub, el cluster reconverge a todos `Ready` en bajo 30-60 s.
