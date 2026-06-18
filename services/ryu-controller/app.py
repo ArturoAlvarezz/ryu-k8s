@@ -925,7 +925,10 @@ class DistributedL2Switch(app_manager.RyuApp):
             ports[str(port_no)] = port_name
         if ports:
             try:
-                self.redis.hset(f"switch_ports:{datapath.id}", mapping={k: v for k, v in ports.items()})
+                pipe = self.redis.pipeline()
+                pipe.delete(f"switch_ports:{datapath.id}")
+                pipe.hset(f"switch_ports:{datapath.id}", mapping={k: v for k, v in ports.items()})
+                pipe.execute()
             except redis.RedisError as e:
                 self.logger.warning("Redis error saving switch ports: %s", e)
 
@@ -945,9 +948,36 @@ class DistributedL2Switch(app_manager.RyuApp):
             ports[str(port.port_no)] = port_name
         if ports:
             try:
-                self.redis.hset(f"switch_ports:{datapath.id}", mapping={k: v for k, v in ports.items()})
+                pipe = self.redis.pipeline()
+                pipe.delete(f"switch_ports:{datapath.id}")
+                pipe.hset(f"switch_ports:{datapath.id}", mapping={k: v for k, v in ports.items()})
+                pipe.execute()
             except redis.RedisError as e:
                 self.logger.warning("Redis error saving port desc stats: %s", e)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        desc = msg.desc
+        port_no = desc.port_no
+        if port_no > 0xffffff00:
+            return
+        port_name = desc.name.decode() if isinstance(desc.name, bytes) else desc.name
+        reason = msg.reason
+        ofproto = datapath.ofproto
+        key = f"switch_ports:{datapath.id}"
+        try:
+            if reason == ofproto.OFPPR_DELETE:
+                self.redis.hdel(key, str(port_no))
+                self.logger.info("Port removed from switch_ports: dpid=%s port=%s name=%s",
+                                 datapath.id, port_no, port_name)
+            else:
+                self.redis.hset(key, str(port_no), port_name)
+                self.logger.info("Port updated in switch_ports: dpid=%s port=%s name=%s reason=%s",
+                                 datapath.id, port_no, port_name, reason)
+        except redis.RedisError as e:
+            self.logger.warning("Redis error updating port status: %s", e)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -1343,11 +1373,26 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.logger.info("Link added: %s:%s <-> %s:%s", src.dpid, src.port_no, dst.dpid, dst.port_no)
         link_str = f"{src.dpid}:{src.port_no}-{dst.dpid}:{dst.port_no}"
         try:
-            self.redis.sadd("topology:links", link_str)
+            # Remove stale entries for this DPID pair before adding the current link.
+            existing = self.redis.smembers("topology:links") or set()
+            prefix_fwd = f"{src.dpid}:"
+            prefix_rev = f"{dst.dpid}:"
+            stale = {
+                e for e in existing
+                if (str(e).startswith(prefix_fwd) and f"-{dst.dpid}:" in str(e))
+                or (str(e).startswith(prefix_rev) and f"-{src.dpid}:" in str(e))
+            }
+            pipe = self.redis.pipeline()
+            for s in stale:
+                pipe.srem("topology:links", s)
+            pipe.sadd("topology:links", link_str)
             cost_src = self.redis.hget("topology:link_cost", f"{src.dpid}:{dst.dpid}") or DEFAULT_LINK_COST
             cost_dst = self.redis.hget("topology:link_cost", f"{dst.dpid}:{src.dpid}") or DEFAULT_LINK_COST
-            self.redis.hset("topology:link_cost", f"{src.dpid}:{dst.dpid}", cost_src)
-            self.redis.hset("topology:link_cost", f"{dst.dpid}:{src.dpid}", cost_dst)
+            pipe.hset("topology:link_cost", f"{src.dpid}:{dst.dpid}", cost_src)
+            pipe.hset("topology:link_cost", f"{dst.dpid}:{src.dpid}", cost_dst)
+            pipe.execute()
+            if stale:
+                self.logger.info("Removed %d stale links for pair %s<->%s", len(stale), src.dpid, dst.dpid)
         except redis.RedisError as e:
             self.logger.warning("Redis error saving link: %s", e)
         self._cache_delete_prefix("path_next_hop:")

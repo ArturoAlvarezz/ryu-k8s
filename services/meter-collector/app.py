@@ -302,6 +302,8 @@ def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
     if existing and existing.get("status") in ("blocked", "quarantined"):
         return False
 
+    # Preserve authorized status for recreated VMs; new devices wait for operator approval.
+    new_status = "authorized" if (existing and existing.get("status") == "authorized") else "pending"
     registry.save_device(redis, {
         "device_id": device_id,
         "mac": observed["mac"],
@@ -309,7 +311,7 @@ def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
         "role": "smart_meter",
         "allowed_dst_ip": "10.0.0.1",
         "allowed_udp_port": UDP_PORT,
-        "status": "authorized",
+        "status": new_status,
         "dpid": observed.get("dpid", ""),
         "in_port": observed.get("in_port", ""),
     })
@@ -1010,7 +1012,7 @@ def _record_invalid_event(reason: str, device_id: str, source_ip: str):
 
 
 def _is_policy_rejection(reason: str) -> bool:
-    return reason in {"status_blocked", "status_quarantine", "status_quarantined"}
+    return reason in {"status_blocked", "status_quarantine", "status_quarantined", "status_pending"}
 
 
 def _record_policy_rejection(reason: str, device_id: str, source_ip: str):
@@ -1520,7 +1522,33 @@ def api_guests():
         guests = [with_security_state(redis, guest) for guest in observed_guests(redis)]
         registered = registry.list_devices(redis)
         observed_macs = {item["mac"] for item in workers + guests}
-        offline_registered = [device for device in registered if device["mac"] not in observed_macs]
+        offline_raw = [device for device in registered if device["mac"] not in observed_macs]
+        # Enrich each offline device with its last telemetry signal so the UI can
+        # surface stale entries without blindly deleting persisted registrations.
+        offline_registered = []
+        for device in offline_raw:
+            enriched = dict(device)
+            dev_id = device.get("device_id", "")
+            last_ts = None
+            if dev_id:
+                try:
+                    raw = redis.get(f"meter:latest:{dev_id}")
+                    if raw:
+                        last_ts = json.loads(raw).get("timestamp")
+                except Exception:
+                    pass
+            enriched["last_telemetry"] = last_ts
+            # Mark as stale if no telemetry in the last 24 h.
+            if last_ts:
+                try:
+                    from datetime import datetime, timezone, timedelta
+                    ts = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                    enriched["stale"] = (datetime.now(timezone.utc) - ts) > timedelta(hours=24)
+                except Exception:
+                    enriched["stale"] = True
+            else:
+                enriched["stale"] = True
+            offline_registered.append(enriched)
         return jsonify({"guests": guests, "workers": workers, "offline_registered": offline_registered})
     except Exception as e:
         log.exception("No se pudo listar estado de seguridad")

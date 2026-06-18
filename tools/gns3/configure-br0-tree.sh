@@ -23,7 +23,11 @@ default_active_ports() {
     case "$HOSTNAME" in
         master) echo "ens3 ens4 ens5" ;;
         control-2) echo "ens5 ens6" ;;
-        control-3) echo "ens5" ;;
+        # ens4 permanently active: connects to worker-ea7e34 as backup uplink.
+        # worker-ea7e34 keeps its own ens4 out of br0 while the primary path via
+        # worker-b56b35 is healthy, so this causes no loop. The backup path
+        # activates only when the worker-ea7e34 failover daemon enslaves ens4.
+        control-3) echo "ens4 ens5" ;;
         worker-24cf41) echo "ens5" ;;
         worker-b0ff27) echo "ens3 ens4 ens5" ;;
         worker-b56b35) echo "ens3 ens4" ;;
