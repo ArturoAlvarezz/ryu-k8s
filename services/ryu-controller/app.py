@@ -54,7 +54,10 @@ ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS"
 MONITOR_INTERVAL_SECONDS = float(os.environ.get("MONITOR_INTERVAL_SECONDS", 5))
 FORWARDING_FLOW_IDLE_TIMEOUT = int(os.environ.get("FORWARDING_FLOW_IDLE_TIMEOUT", 120))
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
-MST_RECOMPUTE_INTERVAL = int(os.environ.get("MST_RECOMPUTE_INTERVAL", 30))
+# Intervalo del recompute periodico de topologia. Los nodos de TRANSITO (que no
+# reciben eventos LLDP del enlace caido) dependen de este ciclo para detectar el
+# cambio de grafo y re-resolver caminos; 30s era demasiado lento para el reroute.
+MST_RECOMPUTE_INTERVAL = int(os.environ.get("MST_RECOMPUTE_INTERVAL", 8))
 ARP_DEDUP_WINDOW = int(os.environ.get("ARP_DEDUP_WINDOW", 5))
 DEFAULT_LINK_COST = float(os.environ.get("DEFAULT_LINK_COST", 1.0))
 
@@ -111,6 +114,7 @@ class TopologyManager:
         self.redis = redis_client
         self.graph = None
         self.mst_edges = set()
+        self.graph_edges = set()
         self.last_mst_computation = 0
         self.topology_version = 0
 
@@ -183,7 +187,10 @@ class TopologyManager:
         return G
 
     def recompute(self):
-        """Recompute MST and store in Redis. Returns True if MST changed."""
+        """Recompute el grafo/MST. Devuelve True si cambio el conjunto de aristas
+        del grafo (no solo del MST): el forwarding usa Dijkstra sobre TODAS las
+        aristas, asi que cortar un enlace redundante (fuera del MST) tambien debe
+        forzar re-resolucion de caminos."""
         now = time.time()
         if now - self.last_mst_computation < 5:
             return False
@@ -201,14 +208,18 @@ class TopologyManager:
         new_mst_edges = set()
         for u, v in mst.edges():
             new_mst_edges.add(_edge_link_id(u, v))
+        new_graph_edges = set(_edge_link_id(u, v) for u, v in G.edges())
 
-        if new_mst_edges != self.mst_edges:
+        mst_changed = new_mst_edges != self.mst_edges
+        graph_changed = new_graph_edges != self.graph_edges
+        self.graph = G
+        self.graph_edges = new_graph_edges
+
+        if mst_changed:
             self.logger.info("MST changed: %d edges (was %d)", len(new_mst_edges), len(self.mst_edges))
             self.mst_edges = new_mst_edges
-            self.graph = G
             self.last_mst_computation = now
             self.topology_version = self.redis.incr("topology:version")
-
             try:
                 pipe = self.redis.pipeline()
                 pipe.delete("topology:mst_edges")
@@ -218,10 +229,10 @@ class TopologyManager:
             except redis.RedisError as e:
                 self.logger.warning("Redis error saving MST: %s", e)
 
-            return True
+        if graph_changed and not mst_changed:
+            self.logger.info("Graph edges changed: %d (MST unchanged)", len(new_graph_edges))
 
-        self.graph = G
-        return False
+        return mst_changed or graph_changed
 
     def compute_dijkstra(self, src_dpid, dst_dpid):
         """Return list of dpids from src to dst, or None if unreachable."""
@@ -628,6 +639,13 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.installed_flows = {}
         self.port_stats = {}
         self.metrics_started_at = time.time()
+        # Cuando la topologia (MST/grafo) cambia, hay que re-resolver los caminos:
+        # los flows de forwarding instalados pueden seguir un camino roto cuyos
+        # saltos son nodos VIVOS (p.ej. tras un corte de enlace los nodos de
+        # transito no reciben link_delete y sus flows salen a peers vivos). Esta
+        # bandera pide al flow_stats handler vaciar los flows de forwarding del
+        # switch local para que se recomputen via Dijkstra en el siguiente paquete.
+        self._forwarding_flush_pending = False
 
         self.topology_manager = TopologyManager(self.logger, self.redis)
         self.arp_handler = ArpHandler(self.logger, self.redis)
@@ -875,8 +893,18 @@ class DistributedL2Switch(app_manager.RyuApp):
                 node_ips = self._get_node_ips()
                 ip_to_dpid = self._ip_to_dpid(node_ips)
                 peer_dpid_str = ip_to_dpid.get(peer_ip.replace(".", ""))
-                if peer_dpid_str:
-                    return self._is_switch_alive(peer_dpid_str)
+                if peer_dpid_str and not self._is_switch_alive(peer_dpid_str):
+                    return False
+                # El peer puede estar VIVO pero el enlace/tunel directo caido
+                # (corte de enlace br0): si ya no figura como vecino VXLAN de este
+                # switch, el tunel no transporta -> puerto no apto para forwarding.
+                # fail-open si vxlan_peers esta vacio (lapso transitorio del
+                # heartbeat) para no romper el forwarding sano.
+                raw_local = self._decimal_dpid_to_raw(dpid)
+                peers = self.redis.hget("topology:vxlan_peers", raw_local) or ""
+                if peers and peer_ip not in str(peers).split():
+                    return False
+                return True
             except Exception:
                 pass
         return True
@@ -889,6 +917,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                     self.logger.info("Topology changed, MST updated. version=%s",
                                      self.topology_manager.topology_version)
                     self._cache_delete_prefix("path_next_hop:")
+                    self._forwarding_flush_pending = True
                     self._publish_topology_metrics()
             except Exception as e:
                 self.logger.warning("Topology recompute error: %s", e)
@@ -1314,8 +1343,14 @@ class DistributedL2Switch(app_manager.RyuApp):
                     local_port = int(loc.split(":", 1)[1])
                 except (ValueError, IndexError):
                     local_port = None
-            delete_flow = False
+            # Flush por cambio de topologia: borrar flows de forwarding de guests
+            # (priority 1 = aprendido por packet-in, 10 = install_path_flows) para
+            # que se recomputen via Dijkstra sobre el grafo nuevo. Solo afecta
+            # flows con eth_dst; no toca table-miss, ARP, gateway ni LLDP.
+            delete_flow = bool(self._forwarding_flush_pending and eth_dst and stat.priority in (1, 10))
             for instruction in getattr(stat, "instructions", []):
+                if delete_flow:
+                    break
                 for action in getattr(instruction, "actions", []):
                     out_port = getattr(action, "port", None)
                     if out_port is None:
@@ -1359,6 +1394,9 @@ class DistributedL2Switch(app_manager.RyuApp):
                 except redis.RedisError as e:
                     self.logger.warning("Redis error clearing mac_to_port for flow delete: %s", e)
         self.installed_flows[dpid] = sum(1 for stat in ev.msg.body if stat.priority > 0)
+        # El flush por cambio de topologia se aplica de una vez sobre este switch.
+        if self._forwarding_flush_pending:
+            self._forwarding_flush_pending = False
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
@@ -1387,7 +1425,8 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.logger.info("Switch entered: %s", ev.switch)
         self._cache_delete_prefix("path_next_hop:")
         try:
-            self.topology_manager.recompute()
+            if self.topology_manager.recompute():
+                self._forwarding_flush_pending = True
         except Exception as e:
             self.logger.warning("MST recompute after switch enter failed: %s", e)
 
@@ -1406,7 +1445,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             self._clear_mac_to_port_for_dead_switch(raw_dpid)
         self._cache_delete_prefix("path_next_hop:")
         try:
-            self.topology_manager.recompute()
+            if self.topology_manager.recompute():
+                self._forwarding_flush_pending = True
         except Exception as e:
             self.logger.warning("MST recompute after switch leave failed: %s", e)
 
@@ -1441,7 +1481,8 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.logger.warning("Redis error saving link: %s", e)
         self._cache_delete_prefix("path_next_hop:")
         try:
-            self.topology_manager.recompute()
+            if self.topology_manager.recompute():
+                self._forwarding_flush_pending = True
         except Exception as e:
             self.logger.warning("MST recompute after link add failed: %s", e)
 
@@ -1460,7 +1501,8 @@ class DistributedL2Switch(app_manager.RyuApp):
         self._cache_delete_prefix("path_next_hop:")
         self._invalidate_flows_via_link(src.dpid, dst.dpid)
         try:
-            self.topology_manager.recompute()
+            if self.topology_manager.recompute():
+                self._forwarding_flush_pending = True
         except Exception as e:
             self.logger.warning("MST recompute after link delete failed: %s", e)
 

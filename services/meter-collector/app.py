@@ -998,14 +998,20 @@ def trace_sdn_path(redis, src_guest, dst_guest):
     mac_tables = {dpid: redis.hgetall(f"mac_to_port:{dpid}") or {} for dpid in dpids}
 
     def guest_switch(mac):
+        # topology:guest_locations es la fuente autoritativa (se fija en el
+        # packet-in cuando el guest llega por un puerto local no-vx). Se respeta
+        # aunque su switch este offline: es el dueno real. Si el switch esta
+        # caido, el camino resultara path_not_found (honesto), en vez de ubicar
+        # falsamente el guest en otro switch via mac_to_port (flood) y devolver
+        # un camino imposible (ambos guests colgando del mismo DPID).
         location = str(guest_locations.get(mac, ""))
         if ":" in location:
-            dpid = location.split(":", 1)[0]
-            if dpid in dpids:
-                return dpid
+            return location.split(":", 1)[0]
+        # Fallback SOLO si no hay guest_location: exige un puerto de guest real
+        # (ens*, no vx ni uplink) en mac_to_port.
         for dpid, table in mac_tables.items():
             port = table.get(mac)
-            if port and not str(switch_ports.get(dpid, {}).get(str(port), "")).startswith("vx"):
+            if port and str(switch_ports.get(dpid, {}).get(str(port), "")).startswith("ens"):
                 return dpid
         return None
 
