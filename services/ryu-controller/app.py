@@ -139,22 +139,40 @@ class TopologyManager:
             self.logger.warning("Redis unavailable while building graph: %s", e)
             return None
 
+        # Solo switches vivos (heartbeat switch:alive vigente). Un nodo apagado
+        # expira su heartbeat (TTL ~30s); excluirlo del grafo hace que MST y
+        # Dijkstra computen un camino alternativo en vez de seguir tunelizando
+        # hacia un nodo muerto (que provocaba blackhole hasta restaurar el nodo).
+        # fail-open ante error de Redis: no excluir para no romper el grafo.
+        def _is_alive(raw):
+            try:
+                return bool(self.redis.exists(f"switch:alive:{raw}"))
+            except redis.RedisError:
+                return True
+
+        alive_dpids = set()
+        for raw in set(node_ips.keys()) | set(vxlan_peers.keys()):
+            if _is_alive(raw):
+                d = self._raw_dpid_to_decimal(raw)
+                if d:
+                    alive_dpids.add(d)
+
         G = nx.Graph()
         for node_raw, ip in node_ips.items():
             dpid = self._raw_dpid_to_decimal(node_raw)
-            if dpid:
+            if dpid and dpid in alive_dpids:
                 G.add_node(dpid, ip=ip)
 
         ip_to_dpid = self._ip_to_dpid(node_ips)
         for raw_dpid, peers in vxlan_peers.items():
             src_dpid = self._raw_dpid_to_decimal(raw_dpid)
-            if not src_dpid:
+            if not src_dpid or src_dpid not in alive_dpids:
                 continue
             if not G.has_node(src_dpid):
                 G.add_node(src_dpid)
             for peer_ip in str(peers).split():
                 dst_dpid = ip_to_dpid.get(str(peer_ip).replace(".", ""))
-                if not dst_dpid or src_dpid == dst_dpid:
+                if not dst_dpid or src_dpid == dst_dpid or dst_dpid not in alive_dpids:
                     continue
                 if not G.has_node(dst_dpid):
                     G.add_node(dst_dpid)
@@ -1277,9 +1295,25 @@ class DistributedL2Switch(app_manager.RyuApp):
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while checking flow output ports for %s: %s", dpid, e)
             ports = {}
+        try:
+            guest_locations = self.redis.hgetall("topology:guest_locations") or {}
+        except redis.RedisError:
+            guest_locations = {}
         for stat in ev.msg.body:
             if stat.priority <= 0:
                 continue
+            # Si el destino del flow es un guest que ahora reside LOCALMENTE en
+            # este switch, el flow debe sacarlo por su puerto local; cualquier
+            # otro puerto (p.ej. un tunel VXLAN viejo) es stale tras la
+            # reubicacion del guest y provoca blackhole.
+            eth_dst = stat.match.get("eth_dst", "")
+            local_port = None
+            loc = str(guest_locations.get(eth_dst, "")) if eth_dst else ""
+            if loc.startswith(f"{dpid}:"):
+                try:
+                    local_port = int(loc.split(":", 1)[1])
+                except (ValueError, IndexError):
+                    local_port = None
             delete_flow = False
             for instruction in getattr(stat, "instructions", []):
                 for action in getattr(instruction, "actions", []):
@@ -1288,6 +1322,16 @@ class DistributedL2Switch(app_manager.RyuApp):
                         continue
                     port_name = str(ports.get(str(out_port), ""))
                     if port_name.startswith("vx") and not self._is_forwarding_port_alive(port_name, dpid):
+                        delete_flow = True
+                        break
+                    if local_port is not None and out_port < 0xffffff00 and out_port != local_port:
+                        delete_flow = True
+                        break
+                    # (3) el puerto de salida ya no existe en el switch (ofport
+                    #     obsoleto tras renumeracion de OVS en un reinicio): el
+                    #     flow tira el trafico a un puerto inexistente -> borrar
+                    #     para que Ryu reinstale el camino con el puerto vigente.
+                    if ports and out_port < 0xffffff00 and str(out_port) not in ports:
                         delete_flow = True
                         break
                 if delete_flow:

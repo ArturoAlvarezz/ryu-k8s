@@ -982,7 +982,11 @@ def _dijkstra_shortest_path(adjacency, src, dst):
 
 def trace_sdn_path(redis, src_guest, dst_guest):
     topology = build_sdn_topology(redis)
-    dpids = {node["id"] for node in topology["nodes"] if node.get("type") == "switch"}
+    # Solo switches VIVOS para el camino: un nodo stale/caido no debe aparecer
+    # como ruta activa (debe converger con los flows reales que instala Ryu,
+    # que excluye nodos sin switch:alive del grafo Dijkstra).
+    dpids = {node["id"] for node in topology["nodes"]
+             if node.get("type") == "switch" and node.get("online")}
     ip_to_dpid = {}
     for raw, ip in (redis.hgetall("topology:node_ips") or {}).items():
         if ip:
