@@ -109,7 +109,18 @@ spec:
           }
 
           get_redis_master() {
-            redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1
+            # Reintentar la resolucion via Sentinel con timeout corto. El Service
+            # redis-sentinel balancea entre los 3 sentinels; si uno corre en un
+            # nodo caido, su endpoint K8s sigue activo ~40s (hasta node NotReady)
+            # y ~1/3 de las queries caen ahi. El -t 2 evita que una query a un
+            # endpoint muerto cuelgue, y el reintento alcanza un sentinel vivo.
+            i=0
+            while [ "$i" -lt 3 ]; do
+              addr=$(timeout 2 redis-cli -h redis-sentinel.sdn-controller.svc.cluster.local -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | head -n 1)
+              if [ -n "$addr" ]; then echo "$addr"; return 0; fi
+              i=$((i + 1))
+            done
+            return 1
           }
 
           node_role() {
@@ -238,8 +249,21 @@ spec:
               continue
             fi
 
-            MASTER_IP=$(get_redis_master)
-            if [ -z "$MASTER_IP" ] || ! redis-cli -h "$MASTER_IP" PING > /dev/null 2>&1; then
+            NEW_MASTER=$(get_redis_master)
+            if [ -n "$NEW_MASTER" ] && timeout 2 redis-cli -h "$NEW_MASTER" PING > /dev/null 2>&1; then
+              MASTER_IP="$NEW_MASTER"
+              LAST_GOOD_MASTER="$NEW_MASTER"
+            elif [ -n "${LAST_GOOD_MASTER:-}" ] && timeout 2 redis-cli -h "$LAST_GOOD_MASTER" PING > /dev/null 2>&1; then
+              # La resolucion via Sentinel fallo (al caer un NODO, el Service
+              # redis-sentinel sigue enrutando ~40s a un sentinel cuyo pod murio,
+              # hasta que K8s marca su endpoint NotReady). Pero el master REAL de
+              # Redis sigue vivo en otro nodo: reusar el ultimo master valido
+              # evita pausar el heartbeat y que switch:alive expire en TODO el
+              # cluster por la caida de un solo nodo (causa del colapso del grafo
+              # SDN al apagar master). Si hubo un failover real, este master
+              # cacheado dejara de responder al PING y caeremos al pause de abajo.
+              MASTER_IP="$LAST_GOOD_MASTER"
+            else
               echo "Redis Master no alcanzable; pausando heartbeat SDN..."
               sleep 3
               continue
