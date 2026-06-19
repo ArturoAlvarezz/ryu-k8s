@@ -237,6 +237,7 @@ spec:
 
           COST_INTERVAL_FILE="/run/ryu-link-cost-interval"
           COST_INTERVAL=${COST_INTERVAL:-30}
+          PREV_VXLAN_PEERS=""
 
           while true; do
             refresh_table_miss
@@ -302,6 +303,22 @@ spec:
                 node_internal_ip "$peer_node"
               done
             } | awk -v myip="$MY_IP" '/^192\.168\./ && $0 != myip' | sort -u)
+
+            # Si un peer reaparece tras haber estado ausente, su link_cost en Redis
+            # puede reflejar la latencia alta de la ruta alternativa. Actualizarlo
+            # ahora (con el RTT real del enlace restaurado) antes de publicar
+            # vxlan_peers, para que Dijkstra elija la ruta directa y no la alterna.
+            if [ -n "$PREV_VXLAN_PEERS" ]; then
+              for remote_ip in $VXLAN_PEERS; do
+                if ! echo "$PREV_VXLAN_PEERS" | grep -qx "$remote_ip"; then
+                  cost=$(measure_link_cost "$remote_ip")
+                  edge_key=$(printf '%s\n%s\n' "$DPID:$remote_ip" "$remote_ip:$DPID" | sort | head -n 1 | tr -d ':')
+                  redis-cli -h "$MASTER_IP" HSET "topology:link_cost" "$edge_key" "$cost" > /dev/null 2>&1 || true
+                  echo "Peer $remote_ip reapareció; link_cost=${cost}ms"
+                fi
+              done
+            fi
+            PREV_VXLAN_PEERS="$VXLAN_PEERS"
 
             redis-cli -h "$MASTER_IP" HSET topology:vxlan_peers "$DPID" "$VXLAN_PEERS" > /dev/null 2>&1 || true
             BR0_PORTS=$(ls /sys/class/net/br0/brif 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
