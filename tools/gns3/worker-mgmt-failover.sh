@@ -59,12 +59,23 @@ release() {
 
 ping_ok() { ping -c1 -W1 "$1" >/dev/null 2>&1; }
 
-mcast_delta() {
-    f="/sys/class/net/$BRIDGE/statistics/multicast"
-    a=$(cat "$f" 2>/dev/null || echo 0)
+# Tasa de "tormenta" para detectar el loop de failback. En un loop L2 las tramas
+# inundadas circulan y se reciben en el BACKUP_PORT a miles de pps. Medimos el
+# MAXIMO entre el contador multicast del bridge y el rx_packets del backup port:
+# un storm de BROADCAST (ARP, tipico al restaurar un ENLACE entre dos nodos vivos)
+# NO incrementa el contador 'multicast' del bridge -> el guard original quedaba
+# ciego y nunca liberaba el backup, perpetuando el loop. rx_packets del backup
+# sube con cualquier tipo de tormenta (broadcast/multicast/flood unicast).
+storm_rate() {
+    mf="/sys/class/net/$BRIDGE/statistics/multicast"
+    rf="/sys/class/net/$BACKUP_PORT/statistics/rx_packets"
+    m0=$(cat "$mf" 2>/dev/null || echo 0)
+    r0=$(cat "$rf" 2>/dev/null || echo 0)
     sleep 1
-    b=$(cat "$f" 2>/dev/null || echo 0)
-    echo $((b - a))
+    m1=$(cat "$mf" 2>/dev/null || echo 0)
+    r1=$(cat "$rf" 2>/dev/null || echo 0)
+    dm=$((m1 - m0)); dr=$((r1 - r0))
+    [ "$dr" -gt "$dm" ] && echo "$dr" || echo "$dm"
 }
 
 now() { cut -d. -f1 /proc/uptime; }
@@ -80,9 +91,9 @@ while :; do
         # Failback exclusivamente por tormenta: si el primario volvio, ens3+ens4
         # forman loop y el multicast se dispara. Liberamos y entramos en
         # cooldown. NO liberamos por ping al VIP (alcanzable via el backup).
-        rate=$(mcast_delta)
+        rate=$(storm_rate)
         if [ "${rate:-0}" -gt "$STORM_PPS" ]; then
-            log "TORMENTA en $BRIDGE (${rate} mcast/s) -> liberando $BACKUP_PORT"
+            log "TORMENTA en $BRIDGE (${rate} pps en $BACKUP_PORT/mcast) -> liberando $BACKUP_PORT"
             release
             fail=0
             cooldown_until=$((t + STORM_COOLDOWN))

@@ -32,7 +32,7 @@ GATEWAY=${GATEWAY:-192.168.122.1}
 PRIORITY=${PRIORITY:-1}              # 1 = respaldo primario, 2 = secundario
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 FAIL_THRESHOLD=${FAIL_THRESHOLD:-2}  # polls fallidos consecutivos antes de actuar
-STORM_PPS=${STORM_PPS:-1000}         # multicast/s en br0 que se considera loop
+STORM_PPS=${STORM_PPS:-1000}         # pps (rx uplink o mcast br0) que se considera loop
 STORM_COOLDOWN=${STORM_COOLDOWN:-20} # s sin re-activar tras detectar tormenta
 
 log() { logger -t uplink-failover "$*" 2>/dev/null; echo "uplink-failover: $*"; }
@@ -54,12 +54,20 @@ release() {
 
 ping_ok() { ping -c1 -W1 "$1" >/dev/null 2>&1; }
 
-mcast_delta() {
-    f="/sys/class/net/$BRIDGE/statistics/multicast"
-    a=$(cat "$f" 2>/dev/null || echo 0)
+# Tasa de "tormenta": MAXIMO entre el contador multicast del bridge y el
+# rx_packets del UPLINK_PORT. Un storm de BROADCAST (ARP) no incrementa
+# 'multicast' del bridge -> el guard quedaba ciego y nunca soltaba el uplink,
+# perpetuando el loop. rx_packets del uplink sube con cualquier tipo de tormenta.
+storm_rate() {
+    mf="/sys/class/net/$BRIDGE/statistics/multicast"
+    rf="/sys/class/net/$UPLINK_PORT/statistics/rx_packets"
+    m0=$(cat "$mf" 2>/dev/null || echo 0)
+    r0=$(cat "$rf" 2>/dev/null || echo 0)
     sleep 1
-    b=$(cat "$f" 2>/dev/null || echo 0)
-    echo $((b - a))
+    m1=$(cat "$mf" 2>/dev/null || echo 0)
+    r1=$(cat "$rf" 2>/dev/null || echo 0)
+    dm=$((m1 - m0)); dr=$((r1 - r0))
+    [ "$dr" -gt "$dm" ] && echo "$dr" || echo "$dm"
 }
 
 now() { cut -d. -f1 /proc/uptime; }
@@ -73,9 +81,9 @@ while :; do
 
     # Guard de tormenta: si tenemos el uplink y aparece un storm, soltarlo ya.
     if is_enslaved; then
-        rate=$(mcast_delta)
+        rate=$(storm_rate)
         if [ "${rate:-0}" -gt "$STORM_PPS" ]; then
-            log "TORMENTA en $BRIDGE (${rate} mcast/s) -> liberando $UPLINK_PORT para romper el loop"
+            log "TORMENTA en $BRIDGE (${rate} pps en $UPLINK_PORT/mcast) -> liberando $UPLINK_PORT para romper el loop"
             release
             fail=0
             cooldown_until=$((t + STORM_COOLDOWN))
