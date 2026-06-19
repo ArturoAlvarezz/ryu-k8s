@@ -168,15 +168,35 @@ class TopologyManager:
                 G.add_node(dpid, ip=ip)
 
         ip_to_dpid = self._ip_to_dpid(node_ips)
+        # Adyacencia declarada por cada switch vivo segun SU propia lista
+        # topology:vxlan_peers.
+        peer_map = {}
         for raw_dpid, peers in vxlan_peers.items():
             src_dpid = self._raw_dpid_to_decimal(raw_dpid)
             if not src_dpid or src_dpid not in alive_dpids:
                 continue
             if not G.has_node(src_dpid):
                 G.add_node(src_dpid)
+            neigh = set()
             for peer_ip in str(peers).split():
                 dst_dpid = ip_to_dpid.get(str(peer_ip).replace(".", ""))
-                if not dst_dpid or src_dpid == dst_dpid or dst_dpid not in alive_dpids:
+                if dst_dpid and dst_dpid != src_dpid and dst_dpid in alive_dpids:
+                    neigh.add(dst_dpid)
+            peer_map[src_dpid] = neigh
+
+        # Aristas con confirmacion BIDIRECCIONAL: ambos extremos deben listarse
+        # mutuamente. Un nodo MUERTO conserva su lista vxlan_peers stale en Redis
+        # (y su switch:alive vigente hasta el TTL ~45s), pero sus vecinos VIVOS lo
+        # quitan de su propia lista en ~segundos (perdida de carrier -> LLDP).
+        # Exigir reciprocidad hace que la arista hacia el nodo muerto desaparezca
+        # de inmediato, desacoplando el reroute por CAIDA DE NODO del TTL de
+        # switch:alive (que se subio a 45s por resiliencia ante blips de Redis).
+        # El corte de ENLACE entre dos nodos vivos ya funcionaba: ambos extremos
+        # se quitan mutuamente. fail-open: si un nodo no publico aun su lista,
+        # peer_map.get(dst) vacio -> la arista no se añade hasta que ambos esten.
+        for src_dpid, neigh in peer_map.items():
+            for dst_dpid in neigh:
+                if src_dpid not in peer_map.get(dst_dpid, ()):
                     continue
                 if not G.has_node(dst_dpid):
                     G.add_node(dst_dpid)
