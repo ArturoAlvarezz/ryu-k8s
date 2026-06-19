@@ -251,10 +251,10 @@ spec:
             fi
 
             NEW_MASTER=$(get_redis_master)
-            if [ -n "$NEW_MASTER" ] && timeout 2 redis-cli -h "$NEW_MASTER" PING > /dev/null 2>&1; then
+            if [ -n "$NEW_MASTER" ] && timeout 3 redis-cli -h "$NEW_MASTER" PING > /dev/null 2>&1; then
               MASTER_IP="$NEW_MASTER"
               LAST_GOOD_MASTER="$NEW_MASTER"
-            elif [ -n "${LAST_GOOD_MASTER:-}" ] && timeout 2 redis-cli -h "$LAST_GOOD_MASTER" PING > /dev/null 2>&1; then
+            elif [ -n "${LAST_GOOD_MASTER:-}" ] && timeout 3 redis-cli -h "$LAST_GOOD_MASTER" PING > /dev/null 2>&1; then
               # La resolucion via Sentinel fallo (al caer un NODO, el Service
               # redis-sentinel sigue enrutando ~40s a un sentinel cuyo pod murio,
               # hasta que K8s marca su endpoint NotReady). Pero el master REAL de
@@ -418,7 +418,15 @@ spec:
               redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME > /dev/null 2>&1 || true
               redis-cli -h $MASTER_IP HSET topology:node_ips $DPID $MY_IP > /dev/null 2>&1 || true
               redis-cli -h $MASTER_IP HSET topology:node_last_seen $DPID "$(date +%s)" > /dev/null 2>&1 || true
-              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX 30 > /dev/null 2>&1 || true
+              # TTL 45s (no 30): los nodos son VMs de 1 vCPU; bajo un pico de CPU
+              # (p.ej. recompute de Ryu+ovs-vswitchd tras un cambio de topologia)
+              # el heartbeat puede no alcanzar Redis durante rafagas de ~20s. Con
+              # TTL 30 dos rafagas seguidas expiran switch:alive -> el grafo SDN
+              # colapsa (MST 6->3) y se dispara un recompute storm que realimenta
+              # el pico de CPU. 45s sobrevive una rafaga con holgura. La deteccion
+              # de nodo-caido NO depende de este TTL (la reruta usa vxlan_peers via
+              # LLDP y eventos de puerto, ~15-25s).
+              redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX "${SWITCH_ALIVE_TTL:-45}" > /dev/null 2>&1 || true
             fi
             sleep 2
           done
