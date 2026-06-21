@@ -1,0 +1,42 @@
+# Calico en modo BGP sobre el fabric L3.
+#
+# Calico distribuye las rutas de pods por BGP. En este fabric:
+#   - El underlay (alcanzabilidad loopback-a-loopback + ECMP) lo da OSPF (FRR).
+#   - Calico peerea con el FRR LOCAL de cada nodo (127.0.0.1, ASN 64512) en vez
+#     de su malla node-to-node nativa: así las rutas de pods entran al mismo
+#     proceso de routing que el underlay y heredan el ECMP/reconvergencia.
+#   - Sin enumerar pares: el peer es siempre el FRR local -> config uniforme.
+#
+# Aplicar con calicoctl o como manifiestos del operador (projectcalico.org/v3).
+---
+apiVersion: projectcalico.org/v3
+kind: BGPConfiguration
+metadata:
+  name: default
+spec:
+  # Desactivar la malla full-mesh nativa: el routing lo lleva FRR/OSPF.
+  nodeToNodeMeshEnabled: false
+  asNumber: 64512
+  # No anunciar el rango de servicios por aquí: el VIP lo gestiona kube-vip.
+  serviceClusterIPs: []
+---
+# Peer uniforme: cada nodo Calico habla BGP con su FRR local (127.0.0.1).
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: frr-local
+spec:
+  peerIP: "127.0.0.1"
+  asNumber: 64512
+---
+# Pool de pods enrutado nativamente (sin IPIP/VXLAN: el underlay ya es L3).
+apiVersion: projectcalico.org/v3
+kind: IPPool
+metadata:
+  name: default-ipv4-pool
+spec:
+  cidr: 10.42.0.0/16
+  ipipMode: Never
+  vxlanMode: Never
+  natOutgoing: true
+  nodeSelector: all()

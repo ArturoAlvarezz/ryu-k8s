@@ -1,0 +1,16 @@
+[Unit]
+Description=L3 routed fabric bootstrap (loopback + OSPF/BGP unnumbered)
+# Debe correr antes que K3s: K3s se bindea a la loopback que esto crea.
+Before=k3s.service k3s-agent.service
+After=network-pre.target frr.service gns3-br0-tree.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/fabric-bootstrap.sh
+# Re-ejecutable de forma idempotente (addr replace / config regen).
+ExecReload=/usr/local/bin/fabric-bootstrap.sh
+
+[Install]
+WantedBy=multi-user.target

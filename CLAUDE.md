@@ -107,9 +107,9 @@ If the VIP is unreachable, use the direct Master-1 address. The VIP (`192.168.12
 
 QEMU VMs inside GNS3. All management traffic (K3s API, etcd, flannel) runs on Linux bridge `br0` (`192.168.122.0/24`). SDN guest traffic runs on OVS bridge `br-sdn` (`10.0.0.0/24`). These two bridges must never be merged.
 
-The GNS3 `Mgmt-Switch` (OVS container, STP disabled) connects all 3 control-plane nodes and NAT1. NAT1 bridges the GNS3 L2 to the host's `virbr0` via a TAP interface (`gns3tap0-0`).
+The GNS3 `Mgmt-Switch` (OVS container) connects all 3 control-plane nodes and NAT1. NAT1 bridges the GNS3 L2 to the host's `virbr0` via a TAP interface (`gns3tap0-0`).
 
-Each K3s node's `br0` uses only a deterministic subset of its physical ports (`ACTIVE_BR0_PORTS` defined per hostname in `tools/gns3/configure-br0-tree.sh`) to keep `br0` loop-free without STP.
+Each K3s node's `br0` uses only a deterministic subset of its physical ports (`ACTIVE_BR0_PORTS` defined per hostname in `tools/gns3/configure-br0-tree.sh`) to keep `br0` loop-free.
 
 ### Control Plane: Ryu (distributed)
 

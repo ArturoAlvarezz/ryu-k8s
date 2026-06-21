@@ -78,21 +78,17 @@ spec:
         - -c
         - |
           get_br0_ip() {
-            ip -4 addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1
+            # Fabric L3: el "IP de gestion" del nodo es su loopback /32 (no br0).
+            # Se excluye el VIP anycast del API (10.255.255.1).
+            ip -4 -o addr show lo 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+              | grep -E '^10\.255\.' | grep -vx '10.255.255.1' | head -1
           }
 
           wait_for_management_plane() {
             while true; do
               MY_IP=$(get_br0_ip)
               if [ -z "$MY_IP" ]; then
-                echo "br0 aun no tiene IPv4 de gestion; esperando..."
-                sleep 3
-                continue
-              fi
-
-              if ! ip link show br0 2>/dev/null | grep -q "state UP"; then
-                echo "br0 existe pero no esta UP; intentando levantarlo..."
-                ip link set br0 up 2>/dev/null || true
+                echo "loopback del fabric aun no asignada; esperando..."
                 sleep 3
                 continue
               fi
@@ -181,7 +177,12 @@ spec:
           lldpd -d &
           sleep 2
 
-          BR0_MAC=$(ip link show br0 | awk '/ether/ {print $2}')
+          # DPID/hwaddr ESTABLES derivados de la LOOPBACK del fabric (host-única).
+          # NO usar /etc/machine-id: en un pod es la del CONTENEDOR (igual en todos
+          # los pods de la imagen) -> colisión de DPID. La loopball la pone el
+          # fabric-bootstrap en el host y es única por nodo. MAC localmente-admin.
+          MAC6=$(get_br0_ip | sha256sum | cut -c1-10)
+          BR0_MAC="02:${MAC6:0:2}:${MAC6:2:2}:${MAC6:4:2}:${MAC6:6:2}:${MAC6:8:2}"
           MAC_ADDR=$(echo "$BR0_MAC" | tr -d ':')
           DPID="0000${MAC_ADDR}"
 
@@ -270,59 +271,26 @@ spec:
               continue
             fi
 
-            # Neighbor-only VXLAN topology: solo a vecinos LLDP directos, no full mesh.
-            # Ver AGENTS.md "VXLAN topology is neighbor-only (LLDP), NOT full mesh."
-            LLDP_MGMT_PEERS=$(lldpcli show neighbors 2>/dev/null | awk -v myip="$MY_IP" '
-              /^Interface:/ {
-                iface = $2
-                sub(",", "", iface)
-                valid = (iface ~ /^ens[3-6]$/) ? 1 : 0
-                next
-              }
-              /^[[:space:]]+MgmtIP:/ && valid {
-                ip = $2
-                sub("/", "", ip)
-                if (ip ~ /^192\.168\./ && ip != myip) print ip
-              }
-            ' | sort -u)
-            LLDP_NODE_PEERS=$(lldpcli show neighbors 2>/dev/null | awk -v self="$NODE_NAME" '
-              /^Interface:/ {
-                iface = $2
-                sub(",", "", iface)
-                valid = (iface ~ /^ens[3-6]$/) ? 1 : 0
-                next
-              }
-              /^[[:space:]]+SysName:/ && valid {
-                name = $2
-                if (name != self) print name
-              }
-            ' | sort -u)
-            VXLAN_PEERS=$({
-              printf '%s\n' "$LLDP_MGMT_PEERS"
-              for peer_node in $LLDP_NODE_PEERS; do
-                node_internal_ip "$peer_node"
-              done
-            } | awk -v myip="$MY_IP" '/^192\.168\./ && $0 != myip' | sort -u)
+            # Overlay NEIGHBOR-ONLY sobre el fabric L3 (NO malla; Ryu cose multi-salto):
+            # los vecinos FÍSICOS son los vecinos OSPF directos (1 salto) = rutas /32
+            # cuyo destino == nexthop. VTEP = loopbacks 10.255.x.x; el túnel a un vecino
+            # viaja por el cable directo (OSPF). Reemplaza al viejo LLDP-sobre-br0.
+            VXLAN_PEERS=$(ip route 2>/dev/null | awk '/proto ospf/{dst=$1; via=""; for(i=1;i<=NF;i++) if($i=="via") via=$(i+1); if(dst==via && dst ~ /^10\.255\./) print dst}' | sort -u)
 
-            # Si un peer reaparece tras haber estado ausente, su link_cost en Redis
-            # puede reflejar la latencia alta de la ruta alternativa. Actualizarlo
-            # ahora (con el RTT real del enlace restaurado) antes de publicar
-            # vxlan_peers, para que Dijkstra elija la ruta directa y no la alterna.
+            # Actualizar link_cost (RTT real) de peers que (re)aparecen, antes de
+            # publicar vxlan_peers, para que Dijkstra de Ryu use la ruta directa.
             if [ -n "$PREV_VXLAN_PEERS" ]; then
               for remote_ip in $VXLAN_PEERS; do
                 if ! echo "$PREV_VXLAN_PEERS" | grep -qx "$remote_ip"; then
                   cost=$(measure_link_cost "$remote_ip")
                   edge_key=$(printf '%s\n%s\n' "$DPID:$remote_ip" "$remote_ip:$DPID" | sort | head -n 1 | tr -d ':')
                   redis-cli -h "$MASTER_IP" HSET "topology:link_cost" "$edge_key" "$cost" > /dev/null 2>&1 || true
-                  echo "Peer $remote_ip reapareció; link_cost=${cost}ms"
                 fi
               done
             fi
             PREV_VXLAN_PEERS="$VXLAN_PEERS"
 
             redis-cli -h "$MASTER_IP" HSET topology:vxlan_peers "$DPID" "$VXLAN_PEERS" > /dev/null 2>&1 || true
-            BR0_PORTS=$(ls /sys/class/net/br0/brif 2>/dev/null | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-            redis-cli -h "$MASTER_IP" HSET topology:mgmt_switch_links "$DPID" "$BR0_PORTS" > /dev/null 2>&1 || true
 
             for remote_ip in $VXLAN_PEERS; do
               PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
@@ -332,7 +300,8 @@ spec:
                   -- set interface $PORT_NAME type=vxlan \
                      options:remote_ip=$remote_ip \
                      options:key=100 \
-                     options:dst_port=4789 \
+                     options:dst_port=4790 \
+                  -- set interface $PORT_NAME external-ids:peer=$remote_ip \
                   > /dev/null 2>&1 || true
                 refresh_table_miss
                 refresh_gateway_flows
@@ -340,9 +309,10 @@ spec:
               rm -f "/run/ryu-vx-stale/${PORT_NAME}" 2>/dev/null || true
             done
 
-            # Eliminar túneles a IPs que ya no existen en Redis
+            # Eliminar túneles a IPs que ya no existen en Redis (peer via external-id,
+            # robusto con loopbacks 10.255.x.y de longitud variable).
             for vx_port in $(ovs-vsctl list-ports br-sdn 2>/dev/null | grep "^vx" || true); do
-              remote_ip=$(echo "$vx_port" | sed -E 's/^vx192168122([0-9]{1,3})$/192.168.122.\1/')
+              remote_ip=$(ovs-vsctl get interface "$vx_port" external-ids:peer 2>/dev/null | tr -d '"')
               if echo "$VXLAN_PEERS" | grep -qx "$remote_ip"; then
                 rm -f "/run/ryu-vx-stale/${vx_port}" 2>/dev/null || true
                 continue
@@ -442,7 +412,7 @@ spec:
             - /bin/bash
             - -c
             - |
-              test -e /sys/class/net/br0 &&
+              test -e /sys/class/net/lo &&
               test -e /sys/class/net/br-sdn &&
               ovs-vsctl br-exists br-sdn &&
               ovs-vsctl get-controller br-sdn | grep -q "tcp:127.0.0.1:6653"
@@ -455,7 +425,7 @@ spec:
             - /bin/bash
             - -c
             - |
-              test -e /sys/class/net/br0 &&
+              test -e /sys/class/net/lo &&
               ovs-vsctl br-exists br-sdn
           periodSeconds: 5
           failureThreshold: 90
@@ -465,7 +435,7 @@ spec:
             - /bin/bash
             - -c
             - |
-              test -e /sys/class/net/br0 &&
+              test -e /sys/class/net/lo &&
               ovs-vsctl br-exists br-sdn
           periodSeconds: 20
           failureThreshold: 6

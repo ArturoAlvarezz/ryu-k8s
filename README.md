@@ -34,7 +34,7 @@ La aplicación dejó de ser un simple script sobre una terminal para convertirse
 
 ## 3. Cómo Desplegar en K3s
 
-Sigue estos pasos desde cualquier nodo control-plane o estación con kubeconfig apuntando al VIP HA `https://192.168.122.10:6443`. Para reconstruir el cluster completo usa `GuiaDeDespliegue.md`; esa guía es la fuente única para desplegar K3s HA y el stack SDN.
+Sigue estos pasos desde cualquier nodo control-plane o estación con kubeconfig apuntando al VIP HA `https://192.168.122.10:6443`. Para reconstruir el cluster completo usa [docs/GuiaDeDespliegue.md](docs/GuiaDeDespliegue.md); esa guía es la fuente única para desplegar K3s HA y el stack SDN.
 
 ### Paso A: Compilar la Imagen Docker
 

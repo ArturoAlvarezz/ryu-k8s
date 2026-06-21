@@ -11,8 +11,8 @@
 - The control plane is distributed. Each node runs one local Ryu controller with `hostNetwork: true`; switches connect to `tcp:127.0.0.1:6653`, and controllers coordinate through Redis instead of local-only memory.
 - Redis + Sentinel is the runtime state contract for topology, MAC learning, DHCP leases, guest locations, VXLAN peers, and meter telemetry.
 - Physical management/fabric connectivity is on Linux bridge `br0`; SDN guest traffic is on OVS bridge `br-sdn`. Never merge `br0` into `br-sdn`.
-- The physical GNS3 topology may contain rings. STP is not used anywhere in the active architecture; loops are controlled by Ryu/MST on `br-sdn`, while `br0` is kept loop-free by deterministic active bridge ports. Do not collapse physical rings into a full-mesh VXLAN design.
-- The GNS3 management switch should use image `gns3/openvswitch:latest` with STP disabled. Resolve the runtime container with `docker ps` because IDs change after recreation.
+- The physical GNS3 topology may contain rings. Loops are controlled by Ryu/MST on `br-sdn`, while `br0` is kept loop-free by deterministic active bridge ports. Do not collapse physical rings into a full-mesh VXLAN design.
+- The GNS3 management switch should use image `gns3/openvswitch:latest`. Resolve the runtime container with `docker ps` because IDs change after recreation.
 
 ## Services
 - `services/ryu-controller/app.py`: Ryu OpenFlow app, Redis-backed MAC learning, gateway ARP handling for `10.0.0.1`, topology/path metrics, Prometheus `/metrics` on `METRICS_PORT` default `8000`.
@@ -32,8 +32,8 @@
 ## Observability
 - Ryu exposes Prometheus metrics directly from `services/ryu-controller/app.py`; no sidecar is required.
 - Key metrics: `ryu_packet_in_total{dpid}`, `ryu_active_nodes`, `ryu_active_switches`, `ryu_installed_flows{dpid}`, `ryu_port_rx_bytes_total`, `ryu_port_tx_bytes_total`, `ryu_topology_node_info`, `ryu_topology_edge_info`, `ryu_trace_path_edge_info`.
-- Grafana uses native Node graph with `src_guest` and `dst_guest` variables to show topology and highlighted paths.
-- The topology dashboard/API shows physical LLDP edges, VXLAN tunnels, management-switch links, SDN nodes, guests, and highlighted paths. It must not depend on STP state.
+- Grafana is used for metrics, logs, service health, security counters, and telemetry trends.
+- The topology dashboard/API in the unified meter/security UI shows physical LLDP edges, VXLAN tunnels, management-switch links, SDN nodes, guests, and highlighted paths.
 - Loki/Promtail collect Ryu logs; LogQL selector is `{namespace="sdn-controller", app="ryu"}`.
 
 ## Commands
@@ -73,8 +73,8 @@
 - Topology JSON from master: `curl -s http://localhost:8081/api/sdn-topology`.
 - Meter collector stats from master/fabric: `curl http://192.168.122.100:8081/api/stats`.
 - Telemetry security state: `curl http://192.168.122.100:8081/api/telemetry-security` and `curl http://192.168.122.100:8081/api/guests`.
-- Verify STP is disabled on a node: `cat /sys/class/net/br0/bridge/stp_state` should return `0`.
-- Verify the GNS3 management switch has STP disabled: resolve the `gns3/openvswitch:latest` container with `docker ps`, then run `docker exec <container> ovs-vsctl get Bridge br0 stp_enable` and verify `false`.
+- Verify the deterministic `br0` tree on a node: inspect `/etc/default/gns3-br0-tree`, `ACTIVE_BR0_PORTS`, and `bridge link show` for the ports currently enslaved to `br0`.
+- Verify the GNS3 management switch connectivity by resolving the `gns3/openvswitch:latest` container with `docker ps`, then checking its `br0` ports with `ovs-vsctl list-ports br0`.
 
 ## Architecture Gotchas
 - **VXLAN topology is neighbor-only (LLDP), NOT full mesh.** `ovs-sdn-initializer` must read `topology:links` from Redis and create one VXLAN tunnel per LLDP-discovered physical neighbor, not one per known node in `topology:node_ips`. Full mesh was a rejected alternative: it is `O(n²)`, does not scale past ~50 nodes, and defeats the purpose of multi-hop Dijkstra path stitching. The MST/Dijkstra design in `services/ryu-controller/app.py` assumes a sparse graph (typically 2 neighbors per node in a ring/chain), not a clique.
@@ -92,6 +92,6 @@
 
 ## Roadmap Context
 - Completed: Smart Meter guest image and telemetry collector.
-- Completed: physical LLDP, VXLAN, management switch, and highlighted SDN path visualization without STP dependencies.
+- Completed: physical LLDP, VXLAN, management switch, and highlighted SDN path visualization in the operations UI.
 - Completed: Prometheus/Grafana/Loki observability stack.
 - Potential future feature: SDN security/microsegmentation in Ryu, including anti-MAC-spoofing, ARP poisoning prevention, and ACLs isolating guests or meters from unauthorized nodes.

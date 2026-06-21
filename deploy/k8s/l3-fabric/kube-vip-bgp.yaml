@@ -1,0 +1,60 @@
+# kube-vip en modo BGP — anuncia el VIP del API server por BGP al FRR local.
+#
+# En el fabric L3 NO usamos ARP/L2 para el VIP. kube-vip peerea con el bgpd de
+# FRR del propio nodo (127.0.0.1) y anuncia VIP_ADDRESS/32. FRR lo redistribuye
+# por OSPF/BGP -> el VIP es alcanzable fabric-wide y, si el control-plane que lo
+# sostiene cae, el anuncio se retira y otro control-plane lo toma (BGP failover).
+#
+# Constantes del cluster (mismas en todos los control-planes):
+#   VIP_ADDRESS  = 10.255.255.1   (la /32 del API, ancla conocida del cluster)
+#   FABRIC_ASN   = 64512          (mismo ASN del fabric; kube-vip <-> FRR local)
+#
+# Solo corre en control-planes (nodeSelector node-role control-plane).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-vip
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: kube-vip
+  template:
+    metadata:
+      labels:
+        app: kube-vip
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      tolerations:
+      - effect: NoSchedule
+        operator: Exists
+      containers:
+      - name: kube-vip
+        image: ghcr.io/kube-vip/kube-vip:v0.8.0
+        args: ["manager"]
+        env:
+        - name: vip_address
+          value: "10.255.255.1"
+        - name: vip_interface
+          value: "lo"
+        - name: cp_enable
+          value: "true"
+        - name: svc_enable
+          value: "false"
+        - name: bgp_enable
+          value: "true"
+        - name: bgp_routerid            # router-id = loopback del nodo (derivada)
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP   # = node-ip = loopback
+        - name: bgp_as
+          value: "64512"
+        - name: bgp_peeraddress
+          value: "127.0.0.1"            # peerea con el FRR local del nodo
+        - name: bgp_peeras
+          value: "64512"
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN", "NET_RAW"]

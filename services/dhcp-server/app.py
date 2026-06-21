@@ -77,11 +77,23 @@ def get_local_dpid():
     if LOCAL_DPID:
         return LOCAL_DPID
     try:
-        br0_mac = get_if_hwaddr("br0").replace(":", "")
-        LOCAL_DPID = str(int("0000" + br0_mac, 16))
+        # Fabric L3: DPID derivado de la loopback (host-única), igual que el
+        # ovs-sdn-initializer. br0 ya no existe. Debe COINCIDIR con el DPID que el
+        # initializer fija en br-sdn: 0000 + 02 + sha256(loopback+"\n")[:10] (hex).
+        import hashlib, subprocess, re
+        out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "lo"], text=True)
+        loopback = None
+        for line in out.splitlines():
+            m = re.search(r"\b(10\.255\.\d+\.\d+)/", line)
+            if m and m.group(1) != "10.255.255.1":
+                loopback = m.group(1); break
+        if not loopback:
+            raise RuntimeError("loopback del fabric no encontrada en lo")
+        mac6 = hashlib.sha256((loopback + "\n").encode()).hexdigest()[:10]
+        LOCAL_DPID = str(int("000002" + mac6, 16))
         return LOCAL_DPID
     except Exception as e:
-        print(f"No se pudo calcular DPID local desde br0: {e}")
+        print(f"No se pudo calcular DPID local desde la loopback: {e}")
         return None
 
 def get_local_guest_iface(mac):

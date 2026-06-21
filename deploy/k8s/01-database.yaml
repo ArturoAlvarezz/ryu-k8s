@@ -67,7 +67,7 @@ spec:
 
           CURRENT_MASTER=""
           for i in $(seq 1 30); do
-            CURRENT_MASTER=$(redis-cli -h "$SENTINEL_HOST" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | sed -n '1p' || true)
+            CURRENT_MASTER=$(timeout 3 redis-cli -h "$SENTINEL_HOST" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | sed -n '1p' || true)
             if [ -n "$CURRENT_MASTER" ]; then
               break
             fi
@@ -134,7 +134,7 @@ spec:
           SELF_IP="$1"
 
           while kill -0 "$REDIS_PID" 2>/dev/null; do
-            CURRENT_MASTER=$(redis-cli -h "$SENTINEL_HOST" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | sed -n '1p' || true)
+            CURRENT_MASTER=$(timeout 3 redis-cli -h "$SENTINEL_HOST" -p 26379 sentinel get-master-addr-by-name mymaster 2>/dev/null | sed -n '1p' || true)
             case "$CURRENT_MASTER" in
               *.*.*.*)
                 MASTER_BY_NAME=""

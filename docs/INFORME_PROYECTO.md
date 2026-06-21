@@ -194,7 +194,7 @@ La creación de VXLAN es dinámica. El inicializador observa vecinos LLDP en la 
 
 Esta decisión evita hardcodear la topología. El usuario puede modificar cables en GNS3, y el sistema reconstruye los túneles según los vecinos observados. Es una decisión coherente con el objetivo de recuperación rápida, porque reduce la intervención manual tras cambios físicos o reinicios.
 
-El historial de commits muestra que el diseño pasó por varias etapas: VXLAN fijo, topología en anillo, RSTP experimental, inferencia por MAC learning y finalmente VXLAN dinámico vía Redis/LLDP sin mover las interfaces de gestión. Esa evolución llevó a la separación actual entre `br0` y `br-sdn`, que es más estable para K3s.
+El historial de commits muestra que el diseño pasó por varias etapas: VXLAN fijo, topología en anillo, pruebas de mecanismos de bloqueo de puertos, inferencia por MAC learning y finalmente VXLAN dinámico vía Redis/LLDP sin mover las interfaces de gestión. Esa evolución llevó a la separación actual entre `br0` y `br-sdn`, que es más estable para K3s.
 
 ## 10. Redis Sentinel como Estado Compartido
 
@@ -242,7 +242,7 @@ Esta decisión mejora la frescura de la topología: si un guest deja de responde
 
 ## 12. Visualización de Topología
 
-La visualización de topología se implementa en dos niveles: la web de operaciones unificada y un dashboard Grafana basado en métricas Prometheus.
+La visualización de topología se implementa en la web de operaciones unificada. Grafana queda dedicado a métricas, logs y salud operacional mediante Prometheus/Loki.
 
 La web de operaciones está en `services/meter-collector/app.py` (pestaña "Topologia SDN"). Expone `/api/sdn-topology` y `/api/sdn-trace`. Lee Redis para construir nodos, enlaces, guests e información de caminos.
 
@@ -259,9 +259,7 @@ La API construye la vista a partir de:
 
 El dashboard evita mostrar nodos desconectados mediante heartbeats. Si un switch no tiene `switch:alive:{dpid}`, se limpia su estado asociado. Esto mantiene la visualización coherente tras fallos y reinicios.
 
-Grafana complementa esta vista con un panel Node graph nativo. Ryu exporta métricas `ryu_topology_node_info`, `ryu_topology_edge_info` y `ryu_trace_path_edge_info`, que Grafana consulta para mostrar el mapa SDN y resaltar caminos entre dos guests seleccionados.
-
-La decisión de usar Grafana para la vista operacional se fundamenta en que permite unir topología, métricas, logs y eventos de seguridad en un mismo lugar. La web de operaciones queda como herramienta directa de depuración y trazado de caminos basada en Redis, mientras Grafana queda como observabilidad integrada.
+La web de operaciones es la herramienta directa de depuración y trazado de caminos basada en Redis. Grafana complementa la operación con métricas temporales, logs de Ryu, eventos de seguridad, estado de Redis, uso de recursos y telemetría agregada.
 
 ## 13. Smart Meters y Telemetría AMI
 
@@ -347,13 +345,13 @@ Métricas principales:
 | `ryu_installed_flows` | Flujos instalados por switch |
 | `ryu_port_rx_bytes_total` | Tráfico recibido por puerto OpenFlow |
 | `ryu_port_tx_bytes_total` | Tráfico transmitido por puerto OpenFlow |
-| `ryu_topology_node_info` | Nodos para el Node graph de Grafana |
-| `ryu_topology_edge_info` | Enlaces para el Node graph de Grafana |
+| `ryu_topology_node_info` | Estado de nodos SDN para observabilidad |
+| `ryu_topology_edge_info` | Estado de enlaces SDN para observabilidad |
 | `ryu_security_events_total` | Eventos de seguridad detectados |
 | `meter_hmac_accepted_total` | Paquetes AMI válidos |
 | `meter_hmac_invalid_total` | Paquetes AMI rechazados |
 
-Grafana incluye un dashboard `SDN Observabilidad` con mapa de red, camino entre guests, Packet-In por segundo, nodos activos, switches activos, flujos instalados, tráfico por puerto, CPU, memoria, logs de Ryu, eventos de seguridad, validación HMAC y potencia reportada por Smart Meters.
+Grafana incluye un dashboard `SDN Observabilidad` con Packet-In por segundo, nodos activos, switches activos, flujos instalados, tráfico por puerto, CPU, memoria, logs de Ryu, eventos de seguridad, validación HMAC y potencia reportada por Smart Meters.
 
 Loki y Promtail centralizan logs de Ryu. Esto facilita correlacionar eventos de seguridad con cambios de topología, reconexiones OpenFlow o fallos de servicios.
 
@@ -395,7 +393,7 @@ El historial de commits muestra una evolución incremental hacia la arquitectura
 | AMI seguro | Se añadió HMAC, nonces anti-replay y métricas de telemetría válida/inválida |
 | Correcciones finales | Se estabilizó frescura de guests, dashboards, cuarentena y reautorización |
 
-Algunos commits muestran decisiones descartadas. Por ejemplo, se probó visualización o lógica relacionada con RSTP, pero luego se removió del proyecto SDN. El diseño vigente conserva STP en `br0` para proteger el plano físico/de gestión, pero evita mezclarlo con la lógica SDN principal sobre `br-sdn`.
+Algunos commits muestran decisiones descartadas. Por ejemplo, se probaron mecanismos automáticos de bloqueo de puertos, pero luego se removieron del proyecto SDN. El diseño vigente mantiene `br0` con un árbol determinístico de puertos y `br-sdn` con control explícito desde Ryu.
 
 También se observa que la documentación inicial hablaba de un Ryu como `Deployment` balanceado. El estado actual del código y los manifiestos reemplaza esa idea por un `DaemonSet` local por nodo, que es más coherente con el objetivo de recuperación rápida y control distribuido.
 
@@ -447,10 +445,10 @@ Estado base verificado:
 | DaemonSet meter collector | 7/7 pods disponibles |
 | Redis Sentinel | Master `redis-0.redis-headless.sdn-controller.svc.cluster.local`, 2 replicas sincronizadas |
 | Topología API | 7 switches, 5 guests Smart Meter, 13 enlaces SDN/guest |
-| Grafana/Prometheus | 13 nodos totales: 7 switches SDN, 5 guests y `mgmt-stp-switch` para STP físico |
+| Grafana/Prometheus | Métricas de controladores, switches, telemetría, recursos y logs disponibles |
 | Telemetría AMI | 5/5 Smart Meters online |
 
-Durante la revisión se detectó una inconsistencia de topología: Prometheus/Grafana mostraban 6 guests mientras la telemetría real tenía 5 Smart Meters. La causa fue una MAC antigua de `SDNSmartMeter-5` retenida en Redis tras recreación del contenedor. Se limpió la entrada runtime de `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `health:*`, `active_mac:*` y `mac_to_port:*`. Tras expirar la ventana `last_over_time`, Grafana volvió a coincidir con la realidad: 5 guests y 5 meters.
+Durante la revisión se detectó una inconsistencia de topología: la web de operaciones mostraba un guest obsoleto mientras la telemetría real tenía 5 Smart Meters. La causa fue una MAC antigua de `SDNSmartMeter-5` retenida en Redis tras recreación del contenedor. Se limpió la entrada runtime de `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `health:*`, `active_mac:*` y `mac_to_port:*`. Tras expirar las ventanas de frescura, la vista operacional volvió a coincidir con la realidad: 5 guests y 5 meters.
 
 Pruebas de conectividad:
 
@@ -515,7 +513,7 @@ Las tres opciones comparadas son:
 
 ### 22.1 Respuesta ante Caídas
 
-En una red tradicional sin OpenFlow, la recuperación depende principalmente de protocolos de red clásicos. STP/RSTP protege contra bucles a nivel L2, OSPF o rutas estáticas redundantes pueden recuperar caminos L3, y VRRP/HSRP puede mover una gateway virtual entre routers. Estos mecanismos son robustos y ampliamente probados, pero operan con información limitada: reaccionan a enlaces, interfaces o vecinos de routing, no al estado semántico de los medidores, la seguridad AMI, la validez de la telemetría o la ubicación real de cada dispositivo final.
+En una red tradicional sin OpenFlow, la recuperación depende principalmente de protocolos de red clásicos. Mecanismos L2/L3 convencionales, OSPF o rutas estáticas redundantes pueden recuperar caminos, y VRRP/HSRP puede mover una gateway virtual entre routers. Estos mecanismos son robustos y ampliamente probados, pero operan con información limitada: reaccionan a enlaces, interfaces o vecinos de routing, no al estado semántico de los medidores, la seguridad AMI, la validez de la telemetría o la ubicación real de cada dispositivo final.
 
 En una SDN centralizada, el controlador tiene más visibilidad lógica que una red tradicional, pero introduce una dependencia fuerte del punto central. Si el controlador o su conectividad de gestión fallan, los switches pueden seguir reenviando flows ya instalados, pero no pueden resolver correctamente nuevos flujos, cambios de topología, nuevos medidores o eventos de seguridad que requieran nuevas reglas.
 
@@ -523,7 +521,7 @@ En este proyecto, cada nodo mantiene su propio controlador Ryu local. OVS no nec
 
 | Escenario de caída | Red tradicional sin OpenFlow | SDN centralizada | SDN distribuida del proyecto |
 | --- | --- | --- | --- |
-| Caída de enlace | STP/RSTP u OSPF reconvergen, pero sin conocimiento de guests AMI | El controlador recalcula si sigue accesible | LLDP/probes actualizan VXLAN, Ryu borra flows hacia peers inactivos |
+| Caída de enlace | Protocolos L2/L3 tradicionales reconvergen, pero sin conocimiento de guests AMI | El controlador recalcula si sigue accesible | LLDP/probes actualizan VXLAN, Ryu borra flows hacia peers inactivos |
 | Caída de nodo de acceso | Los dispositivos detrás del nodo quedan fuera; la red puede tardar en limpiar MAC/ARP | El controlador central detecta si recibe eventos o métricas | `switch:alive:*`, `health:*` y `active_mac:*` limpian topología y guests obsoletos |
 | Caída del controlador | No aplica si no hay controlador | Alto impacto si el endpoint central no está disponible | Impacto local: cada nodo tiene su Ryu local |
 | Reinicio de un nodo | Requiere scripts/servicios de host para reconstruir bridges y rutas | Depende de que OVS reconecte al controlador central | `ovs-sdn-initializer` reconstruye `br-sdn`, VXLAN, controller y heartbeats |

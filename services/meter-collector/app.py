@@ -315,8 +315,11 @@ def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
     if existing and existing.get("status") in ("blocked", "quarantined"):
         return False
 
-    # Preserve authorized status for recreated VMs; new devices wait for operator approval.
-    new_status = "authorized" if (existing and existing.get("status") == "authorized") else "pending"
+    # Only auto-register VMs that were previously authorized (MAC/IP changed on recreation).
+    # New devices require explicit operator approval via the UI (POST /api/devices).
+    if not existing or existing.get("status") != "authorized":
+        return False
+
     registry.save_device(redis, {
         "device_id": device_id,
         "mac": observed["mac"],
@@ -324,7 +327,7 @@ def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
         "role": "smart_meter",
         "allowed_dst_ip": "10.0.0.1",
         "allowed_udp_port": UDP_PORT,
-        "status": new_status,
+        "status": "authorized",
         "dpid": observed.get("dpid", ""),
         "in_port": observed.get("in_port", ""),
     })
