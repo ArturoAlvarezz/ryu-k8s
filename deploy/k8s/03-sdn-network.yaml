@@ -166,7 +166,17 @@ spec:
             fi
           }
 
-          wait_for_management_plane
+          # Esperar SOLO la loopback del fabric (necesaria para derivar el DPID).
+          # NO se espera a Redis aqui: br-sdn debe crearse cuanto antes para que las
+          # probes (que verifican br-exists br-sdn) pasen y el contenedor NO entre en
+          # CrashLoopBackOff durante la reconvergencia del fabric tras un reboot
+          # (Redis puede tardar segundos/minutos en ser alcanzable desde un worker
+          # recien reiniciado). Los tuneles VXLAN y el registro en Redis se hacen
+          # DESPUES (wait_for_management_plane), sin bloquear la creacion de br-sdn.
+          while [ -z "$(get_br0_ip)" ]; do
+            echo "loopback del fabric aun no asignada; esperando para el DPID..."
+            sleep 2
+          done
 
           echo "Cargando módulo del kernel..."
           modprobe openvswitch || true
@@ -221,6 +231,11 @@ spec:
           }
           refresh_table_miss
           refresh_gateway_flows
+
+          # br-sdn ya existe y esta conectado a Ryu; ahora SI esperamos a que Redis
+          # sea alcanzable para registrar el nodo y construir los tuneles. Si Redis
+          # tarda, br-sdn ya pasa las probes y el contenedor sobrevive (sin crash-loop).
+          wait_for_management_plane
 
           echo "Obteniendo IP del Redis Master via Sentinel..."
           MY_IP=$(get_br0_ip)
