@@ -54,8 +54,15 @@ log = logging.getLogger(__name__)
 
 SENTINEL_HOST         = os.environ.get("REDIS_SENTINEL_HOST", "redis-sentinel.sdn-controller.svc.cluster.local")
 SENTINEL_PORT         = int(os.environ.get("REDIS_SENTINEL_PORT", 26379))
+# Servicio HEADLESS: su DNS resuelve a TODOS los pods sentinel (uno por nodo). Se
+# usa para construir la lista multi-endpoint de Sentinel, de modo que la caída de
+# un control-plane (un sentinel inalcanzable) no deje a la API sin Redis (503): el
+# cliente prueba los demás sentinels. El ClusterIP único no permite ese failover.
+SENTINEL_HEADLESS     = os.environ.get("REDIS_SENTINEL_HEADLESS", "redis-headless.sdn-controller.svc.cluster.local")
 REDIS_SOCKET_TIMEOUT = float(os.environ.get("REDIS_SOCKET_TIMEOUT", "1.0"))
-REDIS_RECONNECT_INTERVAL = float(os.environ.get("REDIS_RECONNECT_INTERVAL", "10.0"))
+# Reintento de reconexión más ágil: un control-plane caído debe recuperarse en
+# segundos, no en ~10s (ventana en la que la API devolvía 503 prolongado).
+REDIS_RECONNECT_INTERVAL = float(os.environ.get("REDIS_RECONNECT_INTERVAL", "3.0"))
 REDIS_RECONNECT_ATTEMPTS = int(os.environ.get("REDIS_RECONNECT_ATTEMPTS", "2"))
 UDP_PORT              = int(os.environ.get("UDP_PORT", 5555))
 FLASK_PORT            = int(os.environ.get("FLASK_PORT", 5000))
@@ -138,13 +145,33 @@ def escape_label(value: str) -> str:
 # ---------------------------------------------------------------------------
 # Redis
 # ---------------------------------------------------------------------------
+def _resolve_sentinels() -> list[tuple[str, int]]:
+    """Lista de endpoints sentinel. Resuelve el servicio HEADLESS a TODOS los pods
+    sentinel (uno por nodo) para que el cliente pueda hacer failover si uno cae con
+    su control-plane. Cae al ClusterIP si la resolución headless falla."""
+    endpoints: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for host in (SENTINEL_HEADLESS, SENTINEL_HOST):
+        try:
+            for info in socket.getaddrinfo(host, SENTINEL_PORT, proto=socket.IPPROTO_TCP):
+                ip = info[4][0]
+                if ip not in seen:
+                    seen.add(ip)
+                    endpoints.append((ip, SENTINEL_PORT))
+        except Exception:
+            continue
+    if not endpoints:
+        endpoints = [(SENTINEL_HOST, SENTINEL_PORT)]
+    return endpoints
+
+
 def connect_redis(attempts: int | None = None, sleep_between: bool = True) -> redis_lib.Redis | None:
     """Conecta a Redis Sentinel con reintentos. Retorna None si falla."""
     attempts = attempts or REDIS_RECONNECT_ATTEMPTS
     for attempt in range(1, attempts + 1):
         try:
             sentinel = Sentinel(
-                [(SENTINEL_HOST, SENTINEL_PORT)],
+                _resolve_sentinels(),
                 socket_timeout=REDIS_SOCKET_TIMEOUT,
                 socket_connect_timeout=REDIS_SOCKET_TIMEOUT,
             )
