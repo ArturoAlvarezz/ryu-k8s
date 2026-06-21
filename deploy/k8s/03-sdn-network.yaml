@@ -177,22 +177,31 @@ spec:
             # cada Ryu borra su switch:alive y reroutea en ~2-3s. Auto-corrige: si el
             # peer revive, su ovs-configurator re-publica switch:alive y el primer OK
             # limpia el contador. Corre en segundo plano, desacoplado del loop pesado.
-            mkdir -p /run/ryu-peer-down
+            mkdir -p /run/ryu-peer-down /run/ryu-peer-dead
             while true; do
               pm=$(get_redis_master)
               if [ -z "$pm" ]; then sleep 2; continue; fi
               peers=$(ip route 2>/dev/null | awk '/proto ospf/{dst=$1; via=""; for(i=1;i<=NF;i++) if($i=="via") via=$(i+1); if(dst==via && dst ~ /^10\.255\./) print dst}' | sort -u)
               for pip in $peers; do
                 if ping -c1 -W1 "$pip" > /dev/null 2>&1; then
-                  rm -f "/run/ryu-peer-down/${pip}" 2>/dev/null || true
+                  # Peer responde: limpiar contador y marca de muerto (si revivio, una
+                  # futura caida volvera a publicarse).
+                  rm -f "/run/ryu-peer-down/${pip}" "/run/ryu-peer-dead/${pip}" 2>/dev/null || true
                 else
                   f=$(cat "/run/ryu-peer-down/${pip}" 2>/dev/null || echo 0); f=$((f + 1))
                   echo "$f" > "/run/ryu-peer-down/${pip}"
-                  if [ "$f" -ge 2 ]; then
+                  # Publicar switch:dead UNA SOLA VEZ por muerte (transicion vivo->muerto).
+                  # Republicar en cada iteracion mientras el nodo sigue muerto generaba
+                  # churn continuo (flush/recompute/flood en todos los Ryu) -> el path
+                  # flapeaba en ciclos de ~30s sin estabilizar. switch:alive del nodo
+                  # muerto queda borrado hasta que reviva y lo re-publique su propio
+                  # ovs-configurator, asi que basta con publicar una vez.
+                  if [ "$f" -ge 2 ] && [ ! -f "/run/ryu-peer-dead/${pip}" ]; then
                     dd=$(redis-cli -h "$pm" HGETALL topology:node_ips 2>/dev/null | paste - - | awk -v i="$pip" '$2==i{print $1; exit}')
                     if [ -n "$dd" ]; then
-                      echo "PROBE: peer $pip sin respuesta (${f}x); publicando switch:dead $dd"
+                      echo "PROBE: peer $pip sin respuesta (${f}x); publicando switch:dead $dd (una vez)"
                       redis-cli -h "$pm" PUBLISH switch:dead "$dd" > /dev/null 2>&1 || true
+                      touch "/run/ryu-peer-dead/${pip}"
                     fi
                   fi
                 fi
