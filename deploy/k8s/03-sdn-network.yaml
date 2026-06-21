@@ -178,8 +178,16 @@ spec:
             # peer revive, su ovs-configurator re-publica switch:alive y el primer OK
             # limpia el contador. Corre en segundo plano, desacoplado del loop pesado.
             mkdir -p /run/ryu-peer-down /run/ryu-peer-dead
+            pm=""
+            probe_n=0
             while true; do
-              pm=$(get_redis_master)
+              probe_n=$((probe_n + 1))
+              # Cachear el master de Redis: resolverlo en cada iteracion (3 reintentos
+              # x 2s via Sentinel) hacia LENTO el loop (~varios s/iteracion) y retrasaba
+              # la deteccion. Se resuelve solo al inicio, cada ~30s, o si se pierde.
+              if [ -z "$pm" ] || [ $((probe_n % 30)) -eq 0 ]; then
+                pm=$(get_redis_master)
+              fi
               if [ -z "$pm" ]; then sleep 2; continue; fi
               peers=$(ip route 2>/dev/null | awk '/proto ospf/{dst=$1; via=""; for(i=1;i<=NF;i++) if($i=="via") via=$(i+1); if(dst==via && dst ~ /^10\.255\./) print dst}' | sort -u)
               for pip in $peers; do
