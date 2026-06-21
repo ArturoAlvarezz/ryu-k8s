@@ -292,8 +292,17 @@ spec:
             # viaja por el cable directo (OSPF). Reemplaza al viejo LLDP-sobre-br0.
             VXLAN_PEERS=$(ip route 2>/dev/null | awk '/proto ospf/{dst=$1; via=""; for(i=1;i<=NF;i++) if($i=="via") via=$(i+1); if(dst==via && dst ~ /^10\.255\./) print dst}' | sort -u)
 
-            # Actualizar link_cost (RTT real) de peers que (re)aparecen, antes de
-            # publicar vxlan_peers, para que Dijkstra de Ryu use la ruta directa.
+            # Publicar vxlan_peers PRIMERO (rapido), ANTES del costeo de enlaces, que
+            # es lento (ping -c3 por peer nuevo) en el hub de 1 vCPU. Antes, si OSPF
+            # acababa de instalar varias rutas a la vez, la iteracion tardaba decenas
+            # de segundos midiendo costes y la publicacion de peers se retrasaba ->
+            # Ryu seguia sin las aristas y los guests detras del nodo (p.ej. leaf
+            # b0ff27 -> SM5) quedaban aislados mucho mas tiempo del necesario tras un
+            # reboot. Publicar primero corta ese retraso; el coste por defecto (1.0)
+            # rige hasta que se mida, sin bloquear la reconvergencia.
+            redis-cli -h "$MASTER_IP" HSET topology:vxlan_peers "$DPID" "$VXLAN_PEERS" > /dev/null 2>&1 || true
+
+            # Actualizar link_cost (RTT real) de peers que (re)aparecen.
             if [ -n "$PREV_VXLAN_PEERS" ]; then
               for remote_ip in $VXLAN_PEERS; do
                 if ! echo "$PREV_VXLAN_PEERS" | grep -qx "$remote_ip"; then
@@ -304,8 +313,6 @@ spec:
               done
             fi
             PREV_VXLAN_PEERS="$VXLAN_PEERS"
-
-            redis-cli -h "$MASTER_IP" HSET topology:vxlan_peers "$DPID" "$VXLAN_PEERS" > /dev/null 2>&1 || true
 
             for remote_ip in $VXLAN_PEERS; do
               PORT_NAME="vx$(echo $remote_ip | tr -d '.')"
