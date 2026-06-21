@@ -311,6 +311,24 @@ spec:
                   redis-cli -h "$MASTER_IP" HSET "topology:link_cost" "$edge_key" "$cost" > /dev/null 2>&1 || true
                 fi
               done
+
+              # Peers que DESAPARECIERON (estaban en PREV y ya no): OSPF retiro su
+              # ruta /32 -> el enlace/nodo murio. Publicar switch:dead para que TODOS
+              # los Ryu borren su switch:alive y lo excluyan del calculo de caminos de
+              # INMEDIATO, sin esperar el TTL ~45s del heartbeat (causa de los paths
+              # stale que seguian usando el nodo caido). Con OSPF de deteccion rapida
+              # (hello/dead bajos) esto reroutea en ~pocos segundos. El DPID se resuelve
+              # por la IP en topology:node_ips (persistente). Auto-corrige si fue un
+              # blip: el ovs-configurator del nodo vivo re-publica su switch:alive.
+              for old_ip in $PREV_VXLAN_PEERS; do
+                if ! echo "$VXLAN_PEERS" | grep -qx "$old_ip"; then
+                  dead_dpid=$(redis-cli -h "$MASTER_IP" HGETALL topology:node_ips 2>/dev/null | paste - - | awk -v ip="$old_ip" '$2==ip{print $1; exit}')
+                  if [ -n "$dead_dpid" ]; then
+                    echo "Peer $old_ip ($dead_dpid) desaparecio de OSPF; publicando switch:dead"
+                    redis-cli -h "$MASTER_IP" PUBLISH switch:dead "$dead_dpid" > /dev/null 2>&1 || true
+                  fi
+                fi
+              done
             fi
             PREV_VXLAN_PEERS="$VXLAN_PEERS"
 

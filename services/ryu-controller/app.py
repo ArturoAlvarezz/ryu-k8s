@@ -708,7 +708,29 @@ class DistributedL2Switch(app_manager.RyuApp):
         try:
             target_dpid = self._raw_dpid_to_decimal(raw_dpid)
             self.logger.info("Clearing mac_to_port entries for dead switch %s", target_dpid)
+            # Invalidar la liveness del switch muerto INMEDIATAMENTE: sin esto, su
+            # heartbeat switch:alive seguia vigente hasta el TTL (~45s) y tanto el
+            # grafo de Ryu como /api/sdn-trace seguian usando el nodo caido como
+            # transito durante esa ventana (path stale). Borrarlo aqui desacopla la
+            # invalidacion del TTL: en cuanto CUALQUIER nodo detecta y publica la
+            # muerte (switch:dead), todos los Ryu lo excluyen del calculo de caminos.
+            # Si fuese un falso positivo, el ovs-configurator del nodo vivo re-setea
+            # su switch:alive en el siguiente heartbeat (auto-correccion).
+            try:
+                self.redis.delete(f"switch:alive:{raw_dpid}")
+                if target_dpid:
+                    self.redis.delete(f"switch:alive:{target_dpid}")
+            except redis.RedisError:
+                pass
             self._cache_delete_prefix("path_next_hop:")
+            # Forzar recomputo del grafo/MST para reinstalar flows por la ruta
+            # alternativa sin esperar al ciclo periodico.
+            try:
+                self.topology_manager.last_mst_computation = 0
+                if self.topology_manager.recompute():
+                    self._forwarding_flush_pending = True
+            except Exception:
+                pass
             for dpid in list(self.datapaths.keys()):
                 mac_table_key = f"mac_to_port:{dpid}"
                 try:
