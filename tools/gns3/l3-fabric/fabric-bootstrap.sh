@@ -24,9 +24,24 @@ case "$(hostname)" in
     *) IS_CP=no ;;
 esac
 
-# --- 1. Capturar gestión ANTES del teardown (vive en br0, no en la física) ----
+# --- 1. Capturar gestión (CP) de forma ROBUSTA y PERSISTENTE ------------------
+# La IP de gestión del control-plane (192.168.122.x del Mgmt-Switch) ya NO puede
+# leerse solo de br0: erradicamos br0 en cada arranque, así que en boots posteriores
+# 'ip addr show br0' está vacío -> sin MGMT_IP la detección de edge se salta y el CP
+# pierde su IP de gestión (regresión real observada). Cadena de fuentes:
+#   br0 (legacy, si aún existe) -> netplan viejo -> /etc/l3-fabric/mgmt.env persistido.
+# Se persiste en la primera captura para los arranques donde br0/netplan ya no estén.
+# (Excepción de bootstrap permitida para los planos de control.)
+PERSIST=/etc/l3-fabric/mgmt.env
+mkdir -p /etc/l3-fabric
 MGMT_IP="$(ip -4 -o addr show br0 2>/dev/null | awk '{print $4; exit}')"        # 192.168.122.X/24
+[ -z "$MGMT_IP" ] && MGMT_IP="$(grep -hoE '192\.168\.122\.[0-9]+/[0-9]+' /etc/netplan/*.yaml 2>/dev/null | head -1)"
+[ -z "$MGMT_IP" ] && [ -f "$PERSIST" ] && MGMT_IP="$(awk -F= '/^MGMT_IP=/{print $2}' "$PERSIST")"
 MGMT_GW="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+[ -z "$MGMT_GW" ] && [ -n "$MGMT_IP" ] && MGMT_GW="$(echo "$MGMT_IP" | sed 's#\.[0-9]\{1,3\}/.*#.1#')"
+if [ "$IS_CP" = yes ] && [ -n "$MGMT_IP" ]; then
+    printf 'MGMT_IP=%s\nMGMT_GW=%s\n' "$MGMT_IP" "$MGMT_GW" > "$PERSIST"
+fi
 # El edge se detecta abajo por ALCANCE DIRECTO del gateway (1 salto L2): solo la
 # interfaz físicamente en el Mgmt-Switch/NAT responde. NO se usa la FDB (daría el
 # uplink multi-salto hacia ese nodo) ni LLDP (inservible aquí).
