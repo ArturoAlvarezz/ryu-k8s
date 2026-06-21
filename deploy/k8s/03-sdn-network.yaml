@@ -204,7 +204,7 @@ spec:
                   # flapeaba en ciclos de ~30s sin estabilizar. switch:alive del nodo
                   # muerto queda borrado hasta que reviva y lo re-publique su propio
                   # ovs-configurator, asi que basta con publicar una vez.
-                  if [ "$f" -ge 2 ] && [ ! -f "/run/ryu-peer-dead/${pip}" ]; then
+                  if [ "$f" -ge 3 ] && [ ! -f "/run/ryu-peer-dead/${pip}" ]; then
                     dd=$(redis-cli -h "$pm" HGETALL topology:node_ips 2>/dev/null | paste - - | awk -v i="$pip" '$2==i{print $1; exit}')
                     if [ -n "$dd" ]; then
                       echo "PROBE: peer $pip sin respuesta (${f}x); publicando switch:dead $dd (una vez)"
