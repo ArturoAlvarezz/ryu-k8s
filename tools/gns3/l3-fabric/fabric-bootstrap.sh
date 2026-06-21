@@ -39,15 +39,25 @@ LOOPBACK="${FABRIC_SUPERNET}.${b1}.${b2}"
 ip addr replace "${LOOPBACK}/32" dev lo
 echo "fabric-bootstrap: role=${IS_CP} loopback=${LOOPBACK}/32 edge=${EDGE_IFACE:-none} gw=${MGMT_GW:-none}"
 
-# --- 2-bis. Neutralizar el netplan/cloud-init que recrea br0 -----------------
-# CRÍTICO: la imagen base trae un netplan de cloud-init que define el viejo
-# bridge L2 'br0' enslavando ens3-6. systemd-networkd lo RECREA en cada arranque
-# (y cloud-init regenera el netplan), así que un simple 'ip link del br0' se
-# deshace en segundos -> las interfaces fabric quedan esclavas de br0 y NO admiten
-# la loopback /32 -> OSPF unnumbered muerto -> el nodo reiniciado sale del fabric.
-# Se neutraliza en el origen: deshabilitar la regeneración de red de cloud-init y
-# sustituir el netplan por uno mínimo (todas las ens UP, sin direcciones ni br0).
-# Idempotente; solo se reaplica si el netplan aún define un bridge.
+# --- 2-bis. Erradicar TODOS los mecanismos que recrean el viejo bridge L2 br0 --
+# CRÍTICO: la imagen base (arquitectura L2 previa) trae VARIAS fuentes que crean
+# br0 y enslavan ens3-6 en cada arranque -> las interfaces fabric quedan esclavas
+# del bridge y NO admiten la loopback /32 -> el OSPF unnumbered de FRR no se activa
+# -> el nodo reiniciado sale del fabric (kubelet sin ruta al API; leaf detrás
+# cascadean). Un simple 'ip link del br0' se deshace porque el creador vuelve a
+# correr. Hay que neutralizar las fuentes EN EL ORIGEN. Detectadas:
+#   1) /usr/local/bin/configure-br0-tree.sh — script L2 (lo invoca cloud-init/boot)
+#      que hace 'ip link add br0' + enslave. Se reduce a no-op.
+#   2) /etc/systemd/network/*br0* — units .network/.netdev de systemd-networkd.
+#   3) /etc/netplan/*.yaml con br0 + regeneración de red de cloud-init.
+# Todo idempotente.
+if [ -f /usr/local/bin/configure-br0-tree.sh ] \
+   && ! grep -q 'L3-FABRIC-NEUTRALIZED' /usr/local/bin/configure-br0-tree.sh; then
+    printf '#!/bin/bash\n# L3-FABRIC-NEUTRALIZED: br0 L2 ya no se usa en el fabric L3.\nexit 0\n' \
+        > /usr/local/bin/configure-br0-tree.sh
+    chmod +x /usr/local/bin/configure-br0-tree.sh
+fi
+rm -f /etc/systemd/network/*br0* 2>/dev/null || true
 printf 'network: {config: disabled}\n' > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 if grep -qE 'br0|bridges' /etc/netplan/*.yaml 2>/dev/null; then
     rm -f /etc/netplan/*.yaml
@@ -61,10 +71,12 @@ network:
       optional: true
 NETPLAN
     chmod 600 /etc/netplan/50-l3-fabric.yaml
-    netplan apply 2>/dev/null || true
-    ip link del br0 2>/dev/null || true
-    echo "fabric-bootstrap: netplan br0 neutralizado (cloud-init net desactivado)"
 fi
+# Aplicar y derribar br0 ya neutralizadas todas sus fuentes.
+netplan apply 2>/dev/null || true
+for i in ens3 ens4 ens5 ens6; do ip link set "$i" nomaster 2>/dev/null || true; done
+ip link del br0 2>/dev/null || true
+echo "fabric-bootstrap: br0 erradicado (configure-br0-tree neutralizado, networkd/netplan limpios)"
 
 # --- 3. Clasificar ens3-6 y montar el fabric ---------------------------------
 # 3a. Llevar ens3-6 a UP y ESPERAR a que GNS3 establezca el carrier del enlace.
