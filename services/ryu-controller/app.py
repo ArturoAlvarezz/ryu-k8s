@@ -731,6 +731,18 @@ class DistributedL2Switch(app_manager.RyuApp):
                     self._forwarding_flush_pending = True
             except Exception:
                 pass
+            # Disparar YA el barrido de flows de forwarding stale (los que egresan
+            # hacia el tunel del nodo muerto y harian blackhole). El borrado ocurre en
+            # flow_stats_reply_handler cuando _forwarding_flush_pending esta activo;
+            # normalmente se espera al poll de _monitor_datapaths (cada 5s), lo que
+            # sumaba varios segundos al reroute. Pedir las stats AQUI lo hace inmediato.
+            if self._forwarding_flush_pending:
+                for datapath in list(self.datapaths.values()):
+                    try:
+                        parser = datapath.ofproto_parser
+                        datapath.send_msg(parser.OFPFlowStatsRequest(datapath))
+                    except Exception:
+                        pass
             for dpid in list(self.datapaths.keys()):
                 mac_table_key = f"mac_to_port:{dpid}"
                 try:
