@@ -39,13 +39,65 @@ LOOPBACK="${FABRIC_SUPERNET}.${b1}.${b2}"
 ip addr replace "${LOOPBACK}/32" dev lo
 echo "fabric-bootstrap: role=${IS_CP} loopback=${LOOPBACK}/32 edge=${EDGE_IFACE:-none} gw=${MGMT_GW:-none}"
 
+# --- 2-bis. Neutralizar el netplan/cloud-init que recrea br0 -----------------
+# CRÍTICO: la imagen base trae un netplan de cloud-init que define el viejo
+# bridge L2 'br0' enslavando ens3-6. systemd-networkd lo RECREA en cada arranque
+# (y cloud-init regenera el netplan), así que un simple 'ip link del br0' se
+# deshace en segundos -> las interfaces fabric quedan esclavas de br0 y NO admiten
+# la loopback /32 -> OSPF unnumbered muerto -> el nodo reiniciado sale del fabric.
+# Se neutraliza en el origen: deshabilitar la regeneración de red de cloud-init y
+# sustituir el netplan por uno mínimo (todas las ens UP, sin direcciones ni br0).
+# Idempotente; solo se reaplica si el netplan aún define un bridge.
+printf 'network: {config: disabled}\n' > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+if grep -qE 'br0|bridges' /etc/netplan/*.yaml 2>/dev/null; then
+    rm -f /etc/netplan/*.yaml
+    cat > /etc/netplan/50-l3-fabric.yaml <<'NETPLAN'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    fabric-ens:
+      match: {name: "ens*"}
+      optional: true
+NETPLAN
+    chmod 600 /etc/netplan/50-l3-fabric.yaml
+    netplan apply 2>/dev/null || true
+    ip link del br0 2>/dev/null || true
+    echo "fabric-bootstrap: netplan br0 neutralizado (cloud-init net desactivado)"
+fi
+
 # --- 3. Clasificar ens3-6 y montar el fabric ---------------------------------
-# 3a. Candidatos con carrier; soltar de br0.
+# 3a. Llevar ens3-6 a UP y ESPERAR a que GNS3 establezca el carrier del enlace.
+# GNS3/QEMU negocian el carrier varios segundos DESPUÉS de que arranca la VM; si
+# clasificamos en el instante exacto del bootstrap, una interfaz aún sin carrier
+# quedaba fuera del fabric PARA SIEMPRE (sin loopback /32 -> el OSPF unnumbered de
+# FRR nunca se activa en ella) -> al reiniciar, el worker quedaba aislado de OSPF y
+# no reingresaba al clúster (kubelet sin ruta al API), y los workers leaf detrás
+# cascadeaban a NotReady. Esperar a que el conjunto con carrier se estabilice
+# (máx 60s, salida temprana) elimina ese race de orden de arranque.
+for i in ens3 ens4 ens5 ens6; do
+    [ -e "/sys/class/net/$i" ] || continue
+    ip link set "$i" up || true
+done
+prev=""; stable=0
+for _ in $(seq 1 60); do
+    cur=""
+    for i in ens3 ens4 ens5 ens6; do
+        [ "$(cat "/sys/class/net/$i/carrier" 2>/dev/null)" = "1" ] && cur="${cur} ${i}"
+    done
+    if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
+        stable=$((stable + 1)); [ "$stable" -ge 5 ] && break
+    else
+        stable=0
+    fi
+    prev="$cur"; sleep 1
+done
+
+# 3a-bis. Candidatos con carrier ya estable; soltar de br0.
 candidates=""
 for i in ens3 ens4 ens5 ens6; do
     [ -e "/sys/class/net/$i" ] || continue
     [ "$(cat "/sys/class/net/$i/carrier" 2>/dev/null)" = "1" ] || continue
-    ip link set "$i" up || true
     ip link set "$i" nomaster 2>/dev/null || true
     ip addr flush dev "$i" scope global 2>/dev/null || true
     candidates="${candidates} ${i}"
