@@ -166,6 +166,41 @@ spec:
             fi
           }
 
+          peer_liveness_probe() {
+            # PROBE ACTIVO de caida de los PEERS directos (loopbacks OSPF /32). GNS3
+            # no propaga la perdida de carrier, asi que sin esto un nodo muerto solo
+            # se detecta por el dead-interval de OSPF (~40s) o el TTL de switch:alive
+            # (~45s) -> el trace/grafo de Ryu seguian usando el nodo caido como
+            # transito todo ese tiempo (paths stale, ping con perdida alta). Aqui se
+            # ping-ea cada peer cada 1s; a los 2 fallos consecutivos se publica
+            # switch:dead (DPID resuelto por IP en topology:node_ips, persistente) ->
+            # cada Ryu borra su switch:alive y reroutea en ~2-3s. Auto-corrige: si el
+            # peer revive, su ovs-configurator re-publica switch:alive y el primer OK
+            # limpia el contador. Corre en segundo plano, desacoplado del loop pesado.
+            mkdir -p /run/ryu-peer-down
+            while true; do
+              pm=$(get_redis_master)
+              if [ -z "$pm" ]; then sleep 2; continue; fi
+              peers=$(ip route 2>/dev/null | awk '/proto ospf/{dst=$1; via=""; for(i=1;i<=NF;i++) if($i=="via") via=$(i+1); if(dst==via && dst ~ /^10\.255\./) print dst}' | sort -u)
+              for pip in $peers; do
+                if ping -c1 -W1 "$pip" > /dev/null 2>&1; then
+                  rm -f "/run/ryu-peer-down/${pip}" 2>/dev/null || true
+                else
+                  f=$(cat "/run/ryu-peer-down/${pip}" 2>/dev/null || echo 0); f=$((f + 1))
+                  echo "$f" > "/run/ryu-peer-down/${pip}"
+                  if [ "$f" -ge 2 ]; then
+                    dd=$(redis-cli -h "$pm" HGETALL topology:node_ips 2>/dev/null | paste - - | awk -v i="$pip" '$2==i{print $1; exit}')
+                    if [ -n "$dd" ]; then
+                      echo "PROBE: peer $pip sin respuesta (${f}x); publicando switch:dead $dd"
+                      redis-cli -h "$pm" PUBLISH switch:dead "$dd" > /dev/null 2>&1 || true
+                    fi
+                  fi
+                fi
+              done
+              sleep 1
+            done
+          }
+
           # Esperar SOLO la loopback del fabric (necesaria para derivar el DPID).
           # NO se espera a Redis aqui: br-sdn debe crearse cuanto antes para que las
           # probes (que verifican br-exists br-sdn) pasen y el contenedor NO entre en
@@ -254,6 +289,10 @@ spec:
           COST_INTERVAL_FILE="/run/ryu-link-cost-interval"
           COST_INTERVAL=${COST_INTERVAL:-30}
           PREV_VXLAN_PEERS=""
+
+          # Probe activo de liveness de peers en segundo plano (deteccion rapida de
+          # caida de nodo, ~2-3s, independiente del loop pesado y de los timers OSPF).
+          peer_liveness_probe &
 
           while true; do
             refresh_table_miss

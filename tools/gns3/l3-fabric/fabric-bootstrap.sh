@@ -190,19 +190,14 @@ fi
 {
     echo "frr version 8.4"; echo "frr defaults traditional"; echo "hostname $(hostname)"
     echo "log syslog informational"; echo "service integrated-vtysh-config"; echo "ip forwarding"; echo "!"
-    # Timers OSPF RAPIDOS de deteccion de caida. GNS3/QEMU NO propagan perdida de
-    # carrier, asi que un nodo/enlace muerto solo se detecta por el dead-interval de
-    # OSPF. Con el default (hello 10s / dead 40s) el reroute tardaba ~40s y el path
-    # seguia usando el nodo caido. hello 1s / dead 4s detecta la caida en ~4s ->
-    # OSPF retira la ruta -> el ovs-configurator quita el peer y publica switch:dead
-    # -> reroute en pocos segundos. Enlaces point-to-point: sin DR/BDR, seguro.
-    # Configurable por si el hub (1 vCPU) necesita timers mas tolerantes.
-    OSPF_HELLO="${OSPF_HELLO:-1}"
-    OSPF_DEAD="${OSPF_DEAD:-4}"
+    # Nota: la deteccion RAPIDA de caida de nodo NO se hace bajando los timers de
+    # OSPF (hello/dead): en GNS3 sobre 1 vCPU, timers agresivos hacen flapear el hub
+    # y un cambio incremental rompe adyacencias por mismatch de intervalos. En su
+    # lugar, el ovs-configurator corre un probe activo de liveness (ping a los peers)
+    # que publica switch:dead en ~2-3s -> Ryu excluye el nodo del grafo de inmediato.
+    # OSPF mantiene sus defaults (estable) y converge el underlay a su ritmo.
     for i in $fabric_ifaces; do
-        echo "interface ${i}"; echo " ip ospf network point-to-point"
-        echo " ip ospf hello-interval ${OSPF_HELLO}"; echo " ip ospf dead-interval ${OSPF_DEAD}"
-        echo " ip ospf area 0"; echo "!"
+        echo "interface ${i}"; echo " ip ospf network point-to-point"; echo " ip ospf area 0"; echo "!"
     done
     echo "interface lo"; echo " ip ospf area 0"; echo "!"
     echo "router ospf"; echo " ospf router-id ${LOOPBACK}"; echo " maximum-paths 8"; echo " passive-interface lo"
