@@ -716,6 +716,16 @@ class DistributedL2Switch(app_manager.RyuApp):
                 self.redis.delete(f"switch:alive:{raw_dpid}")
                 if target_dpid:
                     self.redis.delete(f"switch:alive:{target_dpid}")
+                # Marcar el nodo como CONFIRMADO muerto (no un simple blip de
+                # heartbeat): el dashboard de Operaciones usa esta marca para
+                # quitar el nodo del mapa SDN de inmediato (sin esperar la ventana
+                # de gracia de ~600s), igual de rapido que Grafana. La marca caduca
+                # sola y el ovs-configurator del nodo la borra al revivir (re-set de
+                # switch:alive), evitando que un falso positivo lo deje fantasma.
+                # TTL 900s > NODE_STALE_GRACE (600s) del dashboard: asi la marca cubre
+                # toda la ventana de gracia y el nodo muerto NO reaparece en el mapa
+                # cuando la marca caducaria antes que la gracia (evita flicker).
+                self.redis.set(f"switch:dead:{raw_dpid}", "1", ex=900)
             except redis.RedisError:
                 pass
             self._cache_delete_prefix("path_next_hop:")

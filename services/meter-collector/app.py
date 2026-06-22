@@ -471,6 +471,15 @@ def observed_workers(redis):
     # workers. La liveness se refleja en "online"/"stale", no ocultando el nodo.
     switches, node_names, node_ips, _degraded = read_node_registry(redis)
     known = known_switch_dpids(redis, node_names, switches)
+    # Seguridad (a diferencia del mapa): además de los vivos/en-gracia, mostrar los
+    # nodos CONFIRMADOS muertos (marca switch:dead que pone Ryu vía probe) aunque
+    # excedan la ventana de gracia, para reflejarlos como INACTIVO de forma
+    # persistente —como Grafana— mientras siguen caídos. La marca caduca sola y se
+    # borra al revivir el nodo, así que NO reaparecen entradas stale (las viejas no
+    # tienen marca). El mapa, en cambio, los oculta (exclude_dead=True).
+    for raw_dpid in node_names:
+        if redis.exists(f"switch:dead:{raw_dpid}"):
+            known.add(normalize_dpid(raw_dpid))
     workers = []
     for raw_dpid, name in sorted(node_names.items(), key=lambda item: item[1]):
         if not looks_like_worker_name(name):
@@ -739,11 +748,17 @@ def alive_switch_dpids(redis, node_names, switches):
     return alive
 
 
-def known_switch_dpids(redis, node_names, switches):
+def known_switch_dpids(redis, node_names, switches, exclude_dead=False):
     """Todos los switches conocidos del registro persistente, visibles aunque su
     heartbeat haya expirado mientras sigan dentro de la ventana de gracia
     (node_last_seen) o estén vivos. Así un nodo que solo reconverge no se borra
     de la topología, pero los realmente ausentes caen tras NODE_STALE_GRACE.
+
+    Con exclude_dead=True se omiten además los nodos CONFIRMADOS muertos (marca
+    switch:dead:{dpid} que pone Ryu cuando un vecino detecta la caída vía probe
+    activo). El mapa SDN usa este modo para que el nodo desaparezca de inmediato
+    —tan rápido como Grafana— sin esperar la ventana de gracia. La sección de
+    seguridad NO lo usa: ahí el nodo sigue listado pero marcado inactivo.
     """
     last_seen = redis.hgetall("topology:node_last_seen") or {}
     now = time.time()
@@ -753,6 +768,8 @@ def known_switch_dpids(redis, node_names, switches):
         if redis.exists(f"switch:alive:{raw}"):
             known.add(normalize_dpid(dpid))
             continue
+        if exclude_dead and redis.exists(f"switch:dead:{raw}"):
+            continue  # confirmado muerto por el probe: fuera del mapa ya
         seen = last_seen.get(raw) or last_seen.get(str(dpid))
         if seen:
             try:
@@ -850,7 +867,10 @@ def build_sdn_topology(redis):
     # en la topología marcado "stale" en vez de desaparecer: así reconvergencia
     # de un worker no vacía la vista global.
     switches, node_names, node_ips, degraded = read_node_registry(redis)
-    dpids = known_switch_dpids(redis, node_names, switches)
+    # exclude_dead=True: un nodo confirmado muerto (switch:dead) desaparece del
+    # mapa al instante, sin esperar NODE_STALE_GRACE. Seguridad sí lo conserva
+    # (marcado inactivo) usando known_switch_dpids sin exclude_dead.
+    dpids = known_switch_dpids(redis, node_names, switches, exclude_dead=True)
     alive = alive_switch_dpids(redis, node_names, switches)
     nodes = []
     edges_by_id = {}

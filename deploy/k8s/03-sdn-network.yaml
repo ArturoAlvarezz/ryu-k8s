@@ -493,6 +493,11 @@ spec:
               # de nodo-caido NO depende de este TTL (la reruta usa vxlan_peers via
               # LLDP y eventos de puerto, ~15-25s).
               redis-cli -h $MASTER_IP SET "switch:alive:$DPID" "1" EX "${SWITCH_ALIVE_TTL:-45}" > /dev/null 2>&1 || true
+              # Este nodo esta VIVO: borrar cualquier marca switch:dead que un
+              # vecino hubiera publicado por un falso positivo del probe. Asi un
+              # nodo que revive (o que nunca murio) vuelve a aparecer en el mapa de
+              # Operaciones de inmediato, sin quedar fantasma hasta el TTL de la marca.
+              redis-cli -h $MASTER_IP DEL "switch:dead:$DPID" > /dev/null 2>&1 || true
             fi
             sleep 2
           done
