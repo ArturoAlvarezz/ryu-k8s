@@ -444,10 +444,6 @@ class ArpHandler:
             data=reply.data,
         )
         datapath.send_msg(out)
-        self.logger.info(
-            "ARP proxy reply: dpid=%s in_port=%s %s->%s reply_mac=%s",
-            datapath.id, in_port, src_ip, dst_ip, src_mac,
-        )
 
     def _decimal_to_raw(self, dpid):
         return hex(int(dpid))[2:].zfill(16)
@@ -1645,11 +1641,18 @@ class DistributedL2Switch(app_manager.RyuApp):
     def _start_metrics_server(self):
         try:
             from wsgiref.simple_server import make_server
+            from wsgiref.simple_server import WSGIRequestHandler
         except ImportError:
             self.logger.warning("wsgiref not available, metrics server disabled")
             return
         if not self._is_metrics_exporter():
             return
+
+        class MetricsRequestHandler(WSGIRequestHandler):
+            def log_message(self, format, *args):
+                if self.path.startswith("/metrics"):
+                    return
+                super().log_message(format, *args)
 
         def app(environ, start_response):
             path = environ.get("PATH_INFO", "")
@@ -1661,7 +1664,7 @@ class DistributedL2Switch(app_manager.RyuApp):
             return []
 
         try:
-            httpd = make_server("0.0.0.0", METRICS_PORT, app)
+            httpd = make_server("0.0.0.0", METRICS_PORT, app, handler_class=MetricsRequestHandler)
             self.logger.info("Metrics server listening on port %d", METRICS_PORT)
             httpd.serve_forever()
         except Exception as e:

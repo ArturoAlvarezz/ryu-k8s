@@ -33,7 +33,7 @@ spec:
         app: meter-collector
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "5000"
+        prometheus.io/port: "8081"
         prometheus.io/path: "/metrics"
     spec:
       hostNetwork: true
@@ -43,7 +43,12 @@ spec:
         image: arturoalvarez/sdn-meter-collector:latest
         imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: 5000
+        # hostNetwork: el dashboard/API escucha DIRECTAMENTE en el puerto 8081 del
+        # host en cada nodo. Asi cualquier nodo (y el VIP cuando lo tiene) sirve
+        # :8081 hacia su meter-collector local, SIN depender del ServiceLB/svclb de
+        # K3s (cuya cadena NAT etp=Local quedaba rota e indetectable tras reiniciar
+        # un control-plane, dejando Operaciones caido sin auto-recuperarse).
+        - containerPort: 8081
           name: http
           protocol: TCP
         - containerPort: 5555
@@ -63,7 +68,7 @@ spec:
         - name: UDP_PORT
           value: "5555"
         - name: FLASK_PORT
-          value: "5000"
+          value: "8081"
         - name: MAX_READINGS_PER_DEVICE
           value: "100"
         - name: HMAC_ENABLED
@@ -97,7 +102,7 @@ spec:
         livenessProbe:
           httpGet:
             path: /api/health
-            port: 5000
+            port: 8081
           initialDelaySeconds: 10
           timeoutSeconds: 5
           periodSeconds: 30
@@ -105,7 +110,7 @@ spec:
         readinessProbe:
           httpGet:
             path: /api/ready
-            port: 5000
+            port: 8081
           initialDelaySeconds: 5
           timeoutSeconds: 5
           periodSeconds: 10
@@ -123,16 +128,16 @@ metadata:
   labels:
     app: meter-collector
 spec:
-  type: LoadBalancer
-  externalTrafficPolicy: Local
-  sessionAffinity: ClientIP
-  sessionAffinityConfig:
-    clientIP:
-      timeoutSeconds: 10800
+  # ClusterIP (ya NO LoadBalancer): el acceso externo es por hostNetwork :8081
+  # directo (VIP:8081 -> nodo:8081 -> meter-collector local). Asi K3s NO crea pods
+  # svclb/Klipper y eliminamos su cadena NAT fragil (etp=Local) que quedaba rota e
+  # indetectable tras reiniciar el control-plane que tenia el VIP. Este Service queda
+  # solo para DNS/ClusterIP interno.
+  type: ClusterIP
   ports:
   - name: http-dashboard
     port: 8081
-    targetPort: 5000
+    targetPort: 8081
     protocol: TCP
   selector:
     app: meter-collector
