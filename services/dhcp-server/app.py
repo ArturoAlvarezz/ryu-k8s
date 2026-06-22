@@ -29,7 +29,23 @@ while True:
         print(f"Esperando a Redis Sentinel en {SENTINEL_HOST}:{SENTINEL_PORT}... ({e})")
         time.sleep(3)
 
+import re as _re
+# MAC determinista que pone el entrypoint del smart-meter: 02:42:53:4d:00:NN, donde
+# NN (hex) es el numero del meter. La IP es SIEMPRE 10.0.0.{10+NN} -> estable ante
+# reboots aunque GNS3 no aplique la MAC estatica del nodo (causa de las IP cambiantes).
+_DETERMINISTIC_MAC = _re.compile(r"^02:42:53:4d:00:([0-9a-f]{2})$", _re.IGNORECASE)
+
 def get_ip_for_mac(mac):
+    # 0) Asignacion DETERMINISTA por MAC que codifica el numero de meter.
+    det = _DETERMINISTIC_MAC.match(mac or "")
+    if det:
+        n = int(det.group(1), 16)
+        if 1 <= n <= 240:
+            det_ip = f"10.0.0.{10 + n}"
+            r.set(f"dhcp:bind:{mac}", det_ip)
+            r.hset("topology:guest_ips", mac, det_ip)
+            return det_ip
+
     allocated = r.get(f"dhcp:bind:{mac}")
     if allocated:
         r.hset("topology:guest_ips", mac, allocated)
