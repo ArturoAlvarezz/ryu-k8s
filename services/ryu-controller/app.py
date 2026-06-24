@@ -54,6 +54,39 @@ ACTIVE_METER_MAX_AGE_SECONDS = int(os.environ.get("ACTIVE_METER_MAX_AGE_SECONDS"
 MONITOR_INTERVAL_SECONDS = float(os.environ.get("MONITOR_INTERVAL_SECONDS", 5))
 FORWARDING_FLOW_IDLE_TIMEOUT = int(os.environ.get("FORWARDING_FLOW_IDLE_TIMEOUT", 120))
 SECURITY_LEARNING_MODE = os.environ.get("SECURITY_LEARNING_MODE", "false").lower() == "true"
+# Anti-spoofing en el plano de datos (MAC/IP/ARP). Cuando esta deshabilitado el
+# controlador no evalua amenazas (comportamiento previo). En modo learning solo
+# registra eventos sin instalar drops.
+SECURITY_ENFORCE = os.environ.get("SECURITY_ENFORCE", "true").lower() in ("1", "true", "yes", "on")
+# Exigir que un MAC registrado se observe en su dpid/in_port de alta. La sincro
+# del meter-collector mantiene esta ubicacion fresca; si causa falsos positivos
+# se puede desactivar sin perder el resto de validaciones.
+SECURITY_ENFORCE_LOCATION = os.environ.get("SECURITY_ENFORCE_LOCATION", "true").lower() in ("1", "true", "yes", "on")
+# Prioridades de flow (br-sdn). El ovs-sdn-initializer instala
+# `priority=200,ip,nw_dst=10.0.0.1 -> LOCAL` para entregar la telemetria al host
+# SIN pasar por el controlador. Para validar la identidad L2 de esa telemetria
+# (un atacante puede forjar la IP/device_id de un meter legitimo) se desvia a
+# CONTROLLER con un flow de prioridad superior (DIVERT), y el veredicto
+# (allow->LOCAL / drop) se instala por encima del divert para no re-disparar
+# Packet-In continuo.
+SECURITY_DIVERT_PRIORITY = int(os.environ.get("SECURITY_DIVERT_PRIORITY", 210))
+SECURITY_DROP_PRIORITY = int(os.environ.get("SECURITY_DROP_PRIORITY", 220))
+SECURITY_DROP_HARD_TIMEOUT = int(os.environ.get("SECURITY_DROP_HARD_TIMEOUT", 60))
+SECURITY_TELEMETRY_ALLOW_IDLE = int(os.environ.get("SECURITY_TELEMETRY_ALLOW_IDLE", 60))
+SECURITY_EVENTS_MAXLEN = int(os.environ.get("SECURITY_EVENTS_MAXLEN", 500))
+GUEST_GATEWAY_IP = os.environ.get("GUEST_GATEWAY_IP", "10.0.0.1")
+# Guard de telemetria: desvia la telemetria guest->gateway al controlador para
+# validar su MAC Ethernet real (cierra el MAC-spoofing que el collector no ve).
+TELEMETRY_UDP_PORT = int(os.environ.get("METER_UDP_PORT", 5555))
+SECURITY_TELEMETRY_GUARD = os.environ.get("SECURITY_TELEMETRY_GUARD", "true").lower() in ("1", "true", "yes", "on")
+# Dispositivo DESCONOCIDO (MAC no registrada que NO suplanta ninguna identidad ni
+# IP ajena): por defecto NO se dropea, solo se registra como observacion y se deja
+# fluir para que sea DESCUBRIBLE en la pagina de Operaciones y registrable por un
+# operador (su telemetria llega al collector, que es fail-closed mientras el
+# device_id no este dado de alta). La suplantacion ACTIVA de identidades/IP
+# registradas (ip_claim_conflict, ip_mismatch, mac_location_mismatch, status_*,
+# arp_*) SIEMPRE se dropea. Poner a true para bloquear tambien lo desconocido.
+SECURITY_DROP_UNREGISTERED = os.environ.get("SECURITY_DROP_UNREGISTERED", "false").lower() in ("1", "true", "yes", "on")
 # Intervalo del recompute periodico de topologia. Los nodos de TRANSITO (que no
 # reciben eventos LLDP del enlace caido) dependen de este ciclo para detectar el
 # cambio de grafo y re-resolver caminos; 30s era demasiado lento para el reroute.
@@ -652,6 +685,7 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.datapaths = {}
         self.packet_in_total = {}
         self.flow_mod_total = {}
+        self.security_events_total = {}
         self.installed_flows = {}
         self.port_stats = {}
         self.metrics_started_at = time.time()
@@ -1043,6 +1077,45 @@ class DistributedL2Switch(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions, 0, 0)
 
+        self._install_telemetry_guard(datapath, ports)
+
+    def _install_telemetry_guard(self, datapath, ports):
+        """Desvia la telemetria (UDP->10.0.0.1:5555) de cada puerto de guest al
+        controlador para validar su identidad L2 antes de entregarla al host.
+
+        Sin esto, el flow `priority=200,ip,nw_dst=10.0.0.1 -> LOCAL` del
+        ovs-sdn-initializer entrega la telemetria directo al collector sin que Ryu
+        vea la MAC Ethernet real: un atacante que forje la IP/device_id de un meter
+        legitimo (con HMAC valido) pasaria. El divert (prioridad > 200) fuerza
+        Packet-In; `_evaluate_security_threats` decide allow (flow a LOCAL) o drop.
+        Solo afecta puertos de guest (no vxlan, no LOCAL); el resto del trafico al
+        gateway sigue por el flow LOCAL original.
+        """
+        if not (SECURITY_ENFORCE and SECURITY_TELEMETRY_GUARD):
+            return
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        for port_no_str, port_name in (ports or {}).items():
+            try:
+                port_no = int(port_no_str)
+            except (TypeError, ValueError):
+                continue
+            if port_no >= ofproto_v1_3.OFPP_MAX:
+                continue
+            if str(port_name).startswith("vx"):
+                continue
+            match = parser.OFPMatch(
+                in_port=port_no, eth_type=0x0800, ip_proto=17,
+                ipv4_dst=GUEST_GATEWAY_IP, udp_dst=TELEMETRY_UDP_PORT,
+            )
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+            mod = parser.OFPFlowMod(
+                datapath=datapath, command=ofproto.OFPFC_ADD,
+                priority=SECURITY_DIVERT_PRIORITY, match=match, instructions=inst,
+            )
+            datapath.send_msg(mod)
+
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
         datapath = ev.msg.datapath
@@ -1061,6 +1134,9 @@ class DistributedL2Switch(app_manager.RyuApp):
                 pipe.execute()
             except redis.RedisError as e:
                 self.logger.warning("Redis error saving port desc stats: %s", e)
+            # Reafirmar el guard de telemetria periodicamente (idempotente): cubre
+            # reconexiones de OVS o flushes de flujos que pudieran borrar el divert.
+            self._install_telemetry_guard(datapath, ports)
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     def port_status_handler(self, ev):
@@ -1083,6 +1159,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                 self.redis.hset(key, str(port_no), port_name)
                 self.logger.info("Port updated in switch_ports: dpid=%s port=%s name=%s reason=%s",
                                  datapath.id, port_no, port_name, reason)
+                self._install_telemetry_guard(datapath, {str(port_no): port_name})
         except redis.RedisError as e:
             self.logger.warning("Redis error updating port status: %s", e)
 
@@ -1113,11 +1190,6 @@ class DistributedL2Switch(app_manager.RyuApp):
         self.logger.debug("packet in %s %s %s %s", dpid, src, dst, in_port)
 
         mac_table_key = f"mac_to_port:{dpid}"
-        try:
-            self.redis.hset(mac_table_key, src, in_port)
-            self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=180)
-        except redis.RedisError as e:
-            self.logger.warning("Redis unavailable while learning MAC %s on %s: %s", src, dpid, e)
 
         try:
             ports = self._get_switch_ports(dpid)
@@ -1125,6 +1197,38 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.logger.warning("Redis unavailable while reading ports for %s: %s", dpid, e)
             ports = {}
         in_port_name = str(ports.get(str(in_port), ""))
+
+        udp_pkt = pkt.get_protocol(udp.udp)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
+
+        # Anti-spoofing: validar identidad L2/L3 de paquetes de guests ANTES de
+        # aprender MAC/ubicacion en Redis, para no envenenar el estado compartido
+        # con datos falsificados (MAC/IP/ARP spoofing). Un paquete malicioso se
+        # registra como evento y se silencia con un drop flow de alta prioridad.
+        allowed, reason, detail = self._evaluate_security_threats(
+            eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name
+        )
+        if not allowed:
+            # Un dispositivo DESCONOCIDO (mac_not_registered) no suplanta ninguna
+            # identidad/IP registrada: se registra como observacion pero NO se
+            # dropea, para que aparezca en Operaciones y un operador pueda darlo de
+            # alta (su telemetria llega al collector, fail-closed hasta el registro).
+            # La suplantacion activa de identidades/IP conocidas si se bloquea.
+            enforce = SECURITY_DROP_UNREGISTERED if reason == "mac_not_registered" else True
+            enforce = enforce and not SECURITY_LEARNING_MODE
+            self._record_security_event(reason, src, src_ip, dpid, in_port, detail, enforced=enforce)
+            if enforce:
+                self._drop_guest_packet(datapath, in_port, src, reason)
+                return
+
+        try:
+            self.redis.hset(mac_table_key, src, in_port)
+            self.redis.set(f"active_mac:{dpid}:{src}", "1", ex=180)
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while learning MAC %s on %s: %s", src, dpid, e)
 
         known_worker_macs = self._known_worker_macs()
         if (
@@ -1137,11 +1241,19 @@ class DistributedL2Switch(app_manager.RyuApp):
             except redis.RedisError as e:
                 self.logger.warning("Redis unavailable while updating guest location: %s", e)
 
-        udp_pkt = pkt.get_protocol(udp.udp)
-        arp_pkt = pkt.get_protocol(arp.arp)
-        ip_pkt = pkt.get_protocol(ipv4.ipv4)
-
-        src_ip = ip_pkt.src if ip_pkt else (arp_pkt.src_ip if arp_pkt else "")
+        # Telemetria guest->gateway VALIDADA (llego via el divert del guard de
+        # telemetria): entregarla al host (LOCAL) e instalar un allow por fuente.
+        # Llegar aqui implica que _evaluate_security_threats la dejo pasar; el
+        # spoofing (p.ej. MAC falsa con IP de SM1) ya fue bloqueado arriba.
+        if (
+            ip_pkt is not None and udp_pkt is not None
+            and str(ip_pkt.dst) == GUEST_GATEWAY_IP
+            and getattr(udp_pkt, "dst_port", 0) == TELEMETRY_UDP_PORT
+            and in_port != ofproto.OFPP_LOCAL
+            and not in_port_name.startswith("vx")
+        ):
+            self._deliver_gateway_telemetry(datapath, in_port, src, msg)
+            return
 
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
             is_dup = self.arp_handler.is_duplicate(
@@ -1627,19 +1739,213 @@ class DistributedL2Switch(app_manager.RyuApp):
         except redis.RedisError as e:
             self.logger.warning("Redis unavailable while learning guest IP %s=%s: %s", mac, ip_addr, e)
 
+    def _security_device_id_for_ip(self, ip_addr):
+        def load():
+            try:
+                return self.redis.get(f"security:ip_to_device:{ip_addr}")
+            except redis.RedisError:
+                return None
+        return self._cached(f"security:ip_to_device:{ip_addr}", RYU_CACHE_SECURITY_SECONDS, load)
+
+    def _dhcp_lease_for_mac(self, mac):
+        try:
+            return self.redis.get(f"dhcp:bind:{mac}")
+        except redis.RedisError:
+            return None
+
     def _evaluate_security_threats(self, eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name):
+        """Valida la identidad L2/L3 de un paquete que ingresa por un puerto de guest.
+
+        Devuelve (allowed, reason, detail). allowed=True deja pasar el paquete;
+        allowed=False indica spoofing o violacion de politica (el caller registra
+        el evento e instala un drop flow). Solo se evaluan paquetes de guests: el
+        overlay VXLAN, el puerto LOCAL del bridge (gateway/DHCP) y la infra
+        (MAC de worker) quedan exentos. fail-open ante incertidumbre de estado
+        para no romper el plano de datos legitimo ante un blip de Redis.
+        """
+        if not SECURITY_ENFORCE:
+            return True, None, None
+
+        if in_port == ofproto_v1_3.OFPP_LOCAL:
+            return True, None, None
+        if in_port_name.startswith("vx"):
+            return True, None, None
+
+        src_mac = str(eth.src).lower()
+        if src_mac in self._known_worker_macs():
+            return True, None, None
+
+        # DHCP/bootstrap: permitir DISCOVER/REQUEST/replies aun de MAC no registrada.
+        if udp_pkt is not None and (
+            getattr(udp_pkt, "src_port", 0) in (67, 68)
+            or getattr(udp_pkt, "dst_port", 0) in (67, 68)
+        ):
+            return True, None, None
+
+        is_arp = arp_pkt is not None
+        if is_arp:
+            src_ip = str(arp_pkt.src_ip or "")
+        elif ip_pkt is not None:
+            src_ip = str(ip_pkt.src or "")
+        else:
+            src_ip = ""
+
+        # --- ARP: comprobaciones estructurales (siempre maliciosas) ---
+        if is_arp:
+            arp_hwsrc = str(getattr(arp_pkt, "src_mac", "") or "").lower()
+            if arp_hwsrc and arp_hwsrc != src_mac:
+                return False, "arp_mac_mismatch", {
+                    "eth_src": src_mac, "arp_hwsrc": arp_hwsrc, "arp_psrc": src_ip,
+                }
+            if src_ip == GUEST_GATEWAY_IP:
+                return False, "arp_gateway_spoof", {"arp_psrc": src_ip, "src_mac": src_mac}
+
+        device = self._get_security_device_by_mac(src_mac)
+        my_id = device.get("device_id") if device else None
+
+        # IP origen reclamada por OTRO dispositivo registrado (uso de IP ajena).
+        # Nota: 10.0.0.1 (gateway) NO se exime aqui: si una IP de gateway llega
+        # por un puerto de guest es spoofing (el gateway real entra por LOCAL).
+        if src_ip and src_ip != "0.0.0.0":
+            ip_owner = self._security_device_id_for_ip(src_ip)
+            if ip_owner and ip_owner != my_id:
+                reason = "arp_ip_mismatch" if is_arp else "ip_claim_conflict"
+                return False, reason, {
+                    "src_ip": src_ip, "src_mac": src_mac, "ip_owner": ip_owner,
+                }
+
+        # MAC no registrada en puerto de guest (no era DHCP/LLDP/infra) -> bloquear.
+        if device is None:
+            return False, "mac_not_registered", {"src_mac": src_mac, "src_ip": src_ip}
+
+        status = str(device.get("status", "")).lower()
+        if status and status != "authorized":
+            reason = "status_blocked" if status == "blocked" else (
+                "status_quarantined" if status in ("quarantine", "quarantined")
+                else f"status_{status}"
+            )
+            return False, reason, {
+                "src_mac": src_mac, "device_id": my_id, "status": status,
+            }
+
+        # IP origen debe coincidir con la IP registrada (o lease DHCP) del MAC.
+        # Un guest que use 10.0.0.1 como IP origen cae aqui como ip_mismatch
+        # (su IP registrada nunca es la del gateway).
+        expected_ip = device.get("ip") or self._dhcp_lease_for_mac(src_mac)
+        if src_ip and src_ip != "0.0.0.0" and expected_ip and src_ip != expected_ip:
+            reason = "arp_ip_mismatch" if is_arp else "ip_mismatch"
+            return False, reason, {
+                "src_mac": src_mac, "src_ip": src_ip,
+                "expected_ip": expected_ip, "device_id": my_id,
+            }
+
+        # MAC registrada pero observada en dpid/in_port distinto al de alta.
+        if SECURITY_ENFORCE_LOCATION:
+            reg_dpid = str(device.get("dpid") or "")
+            reg_port = str(device.get("in_port") or "")
+            if reg_dpid and reg_dpid != str(dpid):
+                return False, "mac_location_mismatch", {
+                    "src_mac": src_mac, "device_id": my_id,
+                    "expected_dpid": reg_dpid, "observed_dpid": str(dpid),
+                }
+            if reg_port and reg_port != str(in_port):
+                return False, "mac_location_mismatch", {
+                    "src_mac": src_mac, "device_id": my_id,
+                    "expected_in_port": reg_port, "observed_in_port": str(in_port),
+                }
+
         return True, None, None
+
+    def _record_security_event(self, reason, src_mac, src_ip, dpid, in_port, detail=None, enforced=None):
+        if not reason:
+            return
+        if enforced is None:
+            enforced = not SECURITY_LEARNING_MODE
+        self.security_events_total[reason] = self.security_events_total.get(reason, 0) + 1
+        event = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "src_mac": str(src_mac or ""),
+            "src_ip": str(src_ip or ""),
+            "dpid": str(dpid),
+            "in_port": str(in_port),
+            "node": NODE_NAME,
+            "component": "ryu",
+            "enforced": enforced,
+        }
+        if detail:
+            event["detail"] = detail
+        try:
+            payload = json.dumps(event)
+            pipe = self.redis.pipeline()
+            pipe.lpush("security:events", payload)
+            pipe.ltrim("security:events", 0, SECURITY_EVENTS_MAXLEN - 1)
+            pipe.incr(f"security:event_counter:{reason}")
+            pipe.incr("security:event_counter:total")
+            pipe.hset("security:last_event", str(src_mac or src_ip or "unknown"), payload)
+            pipe.execute()
+        except redis.RedisError as e:
+            self.logger.warning("Redis unavailable while recording security event %s: %s", reason, e)
+        self.logger.warning(
+            "SECURITY %s reason=%s mac=%s ip=%s dpid=%s in_port=%s detail=%s",
+            "BLOCK" if enforced else ("LEARN" if SECURITY_LEARNING_MODE else "OBSERVE"),
+            reason, src_mac, src_ip, dpid, in_port, detail,
+        )
+
+    def _drop_guest_packet(self, datapath, in_port, src_mac, reason):
+        """Instala un flow de drop de alta prioridad para la fuente ofensiva,
+        evitando un Packet-In continuo. El flow caduca solo (hard_timeout) para
+        re-evaluar si el dispositivo se autoriza/corrige mas adelante."""
+        try:
+            parser = datapath.ofproto_parser
+            ofproto = datapath.ofproto
+            match = parser.OFPMatch(in_port=int(in_port), eth_src=str(src_mac))
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                command=ofproto.OFPFC_ADD,
+                priority=SECURITY_DROP_PRIORITY,
+                match=match,
+                instructions=[],  # sin instrucciones => drop
+                idle_timeout=0,
+                hard_timeout=SECURITY_DROP_HARD_TIMEOUT,
+            )
+            datapath.send_msg(mod)
+            self.flow_mod_total[datapath.id] = self.flow_mod_total.get(datapath.id, 0) + 1
+            self.logger.info(
+                "Drop flow installed: dpid=%s in_port=%s src=%s reason=%s",
+                datapath.id, in_port, src_mac, reason,
+            )
+        except Exception as e:
+            self.logger.warning("Failed to install drop flow for %s: %s", src_mac, e)
+
+    def _deliver_gateway_telemetry(self, datapath, in_port, src_mac, msg):
+        """Telemetria guest->gateway ya validada (llego via el divert del guard):
+        la entrega al host por LOCAL e instala un flow de allow por fuente
+        (prioridad sobre el divert) para que las siguientes lecturas del meter
+        legitimo no vuelvan a pasar por el controlador. idle_timeout re-valida si
+        el meter cambia de identidad/ubicacion."""
+        try:
+            parser = datapath.ofproto_parser
+            ofproto = datapath.ofproto
+            match = parser.OFPMatch(
+                in_port=int(in_port), eth_src=str(src_mac), eth_type=0x0800,
+                ip_proto=17, ipv4_dst=GUEST_GATEWAY_IP, udp_dst=TELEMETRY_UDP_PORT,
+            )
+            actions = [parser.OFPActionOutput(ofproto.OFPP_LOCAL)]
+            self.add_flow(datapath, SECURITY_DROP_PRIORITY, match, actions,
+                          idle_timeout=SECURITY_TELEMETRY_ALLOW_IDLE, hard_timeout=0)
+            out = parser.OFPPacketOut(
+                datapath=datapath, buffer_id=msg.buffer_id, in_port=int(in_port),
+                actions=actions, data=msg.data,
+            )
+            datapath.send_msg(out)
+        except Exception as e:
+            self.logger.warning("Failed to deliver gateway telemetry from %s: %s", src_mac, e)
 
     def _is_policy_block_reason(self, reason):
         return False
 
     def _record_policy_block(self, *args, **kwargs):
-        pass
-
-    def _record_security_event(self, *args, **kwargs):
-        pass
-
-    def _drop_guest_packet(self, *args, **kwargs):
         pass
 
     def _guest_mac_for_ip(self, ip_addr):
@@ -1729,6 +2035,17 @@ class DistributedL2Switch(app_manager.RyuApp):
         lines.append(f"# HELP ryu_broadcast_ports_blocked Non-MST VXLAN ports skipped during flood")
         lines.append(f"# TYPE ryu_broadcast_ports_blocked counter")
         lines.append(f'ryu_broadcast_ports_blocked{{node="{NODE_NAME}"}} {self.broadcast_controller.metrics.get("ports_blocked", 0)}')
+
+        lines.append(f"# HELP ryu_security_events_total Anti-spoofing blocks/detections (total)")
+        lines.append(f"# TYPE ryu_security_events_total counter")
+        total_security = sum(self.security_events_total.values())
+        lines.append(f'ryu_security_events_total{{node="{NODE_NAME}"}} {total_security}')
+        # Nombre/label esperados por el dashboard de Grafana (06-observability.yaml):
+        # panel "Eventos de Seguridad (por tipo)" -> ryu_security_events_by_type_total{type=...}
+        lines.append(f"# HELP ryu_security_events_by_type_total Anti-spoofing events per type")
+        lines.append(f"# TYPE ryu_security_events_by_type_total counter")
+        for reason, count in sorted(self.security_events_total.items()):
+            lines.append(f'ryu_security_events_by_type_total{{node="{NODE_NAME}",type="{reason}"}} {count}')
 
         for (dpid, port_no), stats in self.port_stats.items():
             p = stats
