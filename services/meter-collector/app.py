@@ -99,6 +99,15 @@ NODE_SNAPSHOT_TTL = float(os.environ.get("NODE_SNAPSHOT_TTL", "600"))
 # perder su heartbeat switch:alive. Evita que un nodo que solo reconverge
 # desaparezca de la topología; los nodos realmente ausentes caen al superarla.
 NODE_STALE_GRACE = float(os.environ.get("NODE_STALE_GRACE", "600"))
+# Ventana (s) tras la cual un nodo SIN switch:alive se considera AUSENTE para el
+# MAPA SDN (no solo stale) y se retira, aunque ningun vecino haya publicado
+# switch:dead (la deteccion por probe/OSPF falla cuando el nodo se ELIMINA de la
+# topologia: OSPF retira su ruta y el probe deja de medirlo). Mayor que el TTL de
+# switch:alive (~45s) para no parpadear ante un blip de heartbeat, y mucho menor
+# que NODE_STALE_GRACE (600s) para que un nodo borrado salga del mapa en ~2-3min
+# sin esperar la gracia completa. La SEGURIDAD conserva la gracia larga (lo marca
+# inactivo). Un nodo vivo refresca node_last_seen mucho antes de este umbral.
+NODE_MAP_DEAD_AFTER = float(os.environ.get("NODE_MAP_DEAD_AFTER", "150"))
 
 
 def canonical_json(payload: dict) -> bytes:
@@ -331,6 +340,37 @@ def _cleanup_recreated_meter(redis, device_id: str, current_mac: str, current_ip
             redis.delete(health_key)
 
 
+def _record_identity_rejection(reason: str, device_id: str, source_ip: str, detail: dict | None = None):
+    """Registra (sin mutar identidad) un intento de spoofing detectado al
+    sincronizar. Comparte el stream `security:events` con Ryu para que la
+    API/Grafana/Loki muestren un unico flujo de eventos de seguridad."""
+    with _cache_lock:
+        _memory_hmac_counters["identity_rejected_total"] += 1
+        _memory_hmac_counters[f"identity_rejected_total:{reason}"] += 1
+
+    redis = get_redis()
+    if redis is not None:
+        try:
+            event = {
+                "time": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+                "device_id": device_id,
+                "source_ip": source_ip,
+                "component": "meter-collector",
+            }
+            if detail:
+                event["detail"] = detail
+            pipe = redis.pipeline()
+            pipe.lpush("security:events", json.dumps(event))
+            pipe.ltrim("security:events", 0, 499)
+            pipe.incr(f"security:event_counter:{reason}")
+            pipe.incr("security:event_counter:total")
+            pipe.execute()
+        except Exception as e:
+            log.warning("No se pudo registrar rechazo de identidad reason=%s: %s", reason, e)
+    log.warning("Identidad AMI NO mutada reason=%s device=%s source=%s detail=%s", reason, device_id, source_ip, detail)
+
+
 def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
     if not device_id.startswith("SDNSmartMeter-"):
         return False
@@ -347,9 +387,19 @@ def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
     if not existing or existing.get("status") != "authorized":
         return False
 
+    # Ancla de confianza: la MAC observada debe coincidir con la MAC registrada
+    # (determinista por hostname, estable ante reboot/recreacion). Si difiere es
+    # un posible spoof L2 -> NO adoptar la identidad basandose solo en trafico.
+    observed_mac = registry.normalize_mac(observed.get("mac", ""))
+    registered_mac = registry.normalize_mac(existing.get("mac", ""))
+    if registered_mac and observed_mac and observed_mac != registered_mac:
+        _record_identity_rejection("identity_conflict", device_id, source_ip,
+                                   {"registered_mac": registered_mac, "observed_mac": observed_mac})
+        return False
+
     registry.save_device(redis, {
         "device_id": device_id,
-        "mac": observed["mac"],
+        "mac": registered_mac or observed_mac,
         "ip": source_ip,
         "role": "smart_meter",
         "allowed_dst_ip": "10.0.0.1",
@@ -358,8 +408,8 @@ def _register_observed_meter(redis, device_id: str, source_ip: str) -> bool:
         "dpid": observed.get("dpid", ""),
         "in_port": observed.get("in_port", ""),
     })
-    _cleanup_recreated_meter(redis, device_id, observed["mac"], source_ip)
-    log.info("Smart Meter recreado adoptado automaticamente device=%s source=%s mac=%s", device_id, source_ip, observed["mac"])
+    _cleanup_recreated_meter(redis, device_id, registered_mac or observed_mac, source_ip)
+    log.info("Smart Meter recreado adoptado automaticamente device=%s source=%s mac=%s", device_id, source_ip, registered_mac or observed_mac)
     return True
 
 
@@ -385,26 +435,53 @@ def sync_security_identity(device_id: str, source_ip: str):
         device = json.loads(raw)
         if device.get("role") != "smart_meter":
             return
-        old_id = device.get("device_id", current_id or device_id)
-        old_ip = device.get("ip", "")
-        old_mac = registry.normalize_mac(device.get("mac", ""))
-        old_dpid = device.get("dpid", "")
-        old_in_port = device.get("in_port", "")
+
+        # ENDURECIDO (anti-IP/MAC-spoofing): NUNCA mutar la identidad de un
+        # dispositivo ya autorizado basandose solo en trafico recibido. La MAC
+        # registrada es el ancla de confianza (alta manual, determinista por
+        # hostname). Solo se refresca IP/ubicacion cuando la MAC OBSERVADA en el
+        # binding L2 coincide con la registrada (caso real: VM recreada / IP nueva
+        # por DHCP). Cualquier discrepancia de MAC o de propietario de IP es un
+        # posible spoof: se registra el rechazo y NO se muta nada.
+        registered_mac = registry.normalize_mac(device.get("mac", ""))
         observed = _observed_guest_for_ip(redis, source_ip) or {}
         observed_mac = registry.normalize_mac(observed.get("mac", ""))
+
+        # La IP de origen ya pertenece a OTRO dispositivo registrado -> conflicto.
+        if current_id and current_id != device_id:
+            _record_identity_rejection("identity_conflict", device_id, source_ip,
+                                       {"ip_owner": current_id})
+            return
+
+        # Sin binding L2 observado confiable para esa IP no hay senal segura:
+        # se exige intervencion manual (no se auto-actualiza).
+        if not observed_mac:
+            _record_identity_rejection("identity_unverified", device_id, source_ip)
+            return
+
+        # MAC observada distinta de la registrada -> spoofing de MAC/identidad.
+        if registered_mac and observed_mac != registered_mac:
+            _record_identity_rejection("identity_conflict", device_id, source_ip,
+                                       {"registered_mac": registered_mac, "observed_mac": observed_mac})
+            return
+
+        # MAC verificada: refresco seguro de IP/ubicacion (la MAC no cambia).
+        old_id = device.get("device_id", current_id or device_id)
+        old_ip = device.get("ip", "")
+        old_dpid = device.get("dpid", "")
+        old_in_port = device.get("in_port", "")
         device["device_id"] = device_id
         device["ip"] = source_ip
-        if observed_mac:
-            device["mac"] = observed_mac
-            device["dpid"] = observed.get("dpid", device.get("dpid", ""))
-            device["in_port"] = observed.get("in_port", device.get("in_port", ""))
+        device["mac"] = registered_mac or observed_mac
+        device["dpid"] = observed.get("dpid", device.get("dpid", ""))
+        device["in_port"] = observed.get("in_port", device.get("in_port", ""))
         mac = registry.normalize_mac(device.get("mac", ""))
+
         if (
             old_id == device_id
             and old_ip == source_ip
-            and old_mac == mac
-            and (not observed.get("dpid") or old_dpid == str(observed.get("dpid", "")))
-            and (not observed.get("in_port") or old_in_port == str(observed.get("in_port", "")))
+            and old_dpid == str(device.get("dpid", ""))
+            and old_in_port == str(device.get("in_port", ""))
         ):
             return
         pipe = redis.pipeline()
@@ -417,13 +494,12 @@ def sync_security_identity(device_id: str, source_ip: str):
             pipe.delete(f"security:ip_to_device:{old_ip}")
         if mac:
             pipe.set(f"security:mac_to_device:{mac}", device_id)
-        if old_mac and old_mac != mac:
-            pipe.delete(f"security:mac_to_device:{old_mac}")
         if old_id != device_id:
             pipe.delete(f"security:device:{old_id}")
         pipe.execute()
         _cleanup_recreated_meter(redis, device_id, mac, source_ip)
-        log.info("Registro AMI sincronizado source=%s old_device=%s device=%s old_dpid=%s new_dpid=%s old_in_port=%s new_in_port=%s", source_ip, old_id, device_id, old_dpid, device.get("dpid"), old_in_port, device.get("in_port"))
+        log.info("Registro AMI refrescado (MAC verificada) source=%s old_device=%s device=%s old_ip=%s old_dpid=%s new_dpid=%s old_in_port=%s new_in_port=%s",
+                 source_ip, old_id, device_id, old_ip, old_dpid, device.get("dpid"), old_in_port, device.get("in_port"))
     except Exception as e:
         log.warning("No se pudo sincronizar identidad AMI source=%s device=%s: %s", source_ip, device_id, e)
 
@@ -756,9 +832,12 @@ def known_switch_dpids(redis, node_names, switches, exclude_dead=False):
 
     Con exclude_dead=True se omiten además los nodos CONFIRMADOS muertos (marca
     switch:dead:{dpid} que pone Ryu cuando un vecino detecta la caída vía probe
-    activo). El mapa SDN usa este modo para que el nodo desaparezca de inmediato
-    —tan rápido como Grafana— sin esperar la ventana de gracia. La sección de
-    seguridad NO lo usa: ahí el nodo sigue listado pero marcado inactivo.
+    activo) Y los nodos sin switch:alive cuyo último heartbeat supera
+    NODE_MAP_DEAD_AFTER: esto último cubre el caso de un nodo ELIMINADO de la
+    topología, donde OSPF retira su ruta y el probe deja de medirlo, así que nunca
+    se publica switch:dead y el nodo quedaría hasta NODE_STALE_GRACE (600s). El
+    mapa SDN usa este modo para retirar el nodo en ~2-3min. La sección de seguridad
+    NO lo usa: ahí el nodo sigue listado (hasta la gracia larga) pero inactivo.
     """
     last_seen = redis.hgetall("topology:node_last_seen") or {}
     now = time.time()
@@ -773,10 +852,15 @@ def known_switch_dpids(redis, node_names, switches, exclude_dead=False):
         seen = last_seen.get(raw) or last_seen.get(str(dpid))
         if seen:
             try:
-                if (now - float(seen)) < NODE_STALE_GRACE:
-                    known.add(normalize_dpid(dpid))
+                age = now - float(seen)
             except (TypeError, ValueError):
-                pass
+                continue
+            # Mapa: retirar un nodo sin heartbeat que lleva ausente más que el
+            # umbral de muerte (nodo borrado que nunca generó switch:dead).
+            if exclude_dead and age >= NODE_MAP_DEAD_AFTER:
+                continue
+            if age < NODE_STALE_GRACE:
+                known.add(normalize_dpid(dpid))
     return known
 
 
