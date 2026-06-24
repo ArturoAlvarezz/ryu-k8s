@@ -1,586 +1,391 @@
-# Informe del Proyecto: SDN Distribuida, Alta Disponibilidad y Recuperación Rápida
+# Informe del Proyecto: SDN Distribuida para Infraestructura AMI sobre K3s y GNS3
 
-## 1. Propósito General del Proyecto
+## Marco Teorico
 
-Este proyecto implementa una red SDN distribuida sobre un laboratorio virtualizado en GNS3, orquestada con K3s y diseñada con tres objetivos principales: distribución del plano de control, alta disponibilidad de los servicios críticos y recuperación rápida ante fallos de nodos, pods, enlaces o servicios auxiliares.
+Una red definida por software, o SDN, separa el plano de control del plano de datos. En una red tradicional, cada switch o router decide por si mismo como reenviar los paquetes. En una arquitectura SDN, los dispositivos de red ejecutan reglas y un controlador externo decide que reglas deben existir. Esta separacion permite programar la red, observar su estado y reaccionar ante fallos o amenazas con mas precision que una configuracion estatica basada solo en VLANs, rutas y ACLs.
 
-La solución no se limita a ejecutar un controlador SDN aislado. El resultado es una plataforma completa compuesta por controlador Ryu, Open vSwitch, Redis Sentinel, DHCP distribuido, descubrimiento de topología, telemetría de medidores inteligentes, observabilidad con Prometheus/Grafana/Loki y un módulo de seguridad para validar dispositivos AMI autorizados.
+El proyecto usa esta idea para construir una red AMI distribuida. AMI significa Advanced Metering Infrastructure y representa una infraestructura de medidores inteligentes. En este contexto, los Smart Meters no son simples hosts de prueba: simulan dispositivos de una red electrica que obtienen direccion IP, envian telemetria periodica, deben estar autorizados y pueden ser bloqueados si su comportamiento no coincide con su identidad registrada.
 
-La arquitectura final se organiza en capas:
+El controlador elegido fue Ryu. Ryu es un framework SDN escrito en Python que permite crear aplicaciones OpenFlow. Fue adecuado porque el proyecto necesitaba modificar la logica del controlador en profundidad: aprendizaje MAC distribuido, calculo de rutas, respuesta ARP, instalacion de flujos, metricas Prometheus, validacion de seguridad y coordinacion con Redis. Controladores como OpenDaylight, ONOS o Floodlight se consideraron, pero se descartaron para este laboratorio porque agregaban mas complejidad operacional que valor practico. OpenDaylight y ONOS son plataformas mas pesadas y pensadas para entornos empresariales o carrier. Floodlight es mas simple, pero esta basado en Java y no encajaba tan bien con el ecosistema Python usado por Ryu, Scapy, Flask y los servicios propios.
 
-| Capa | Implementación |
-| --- | --- |
-| Laboratorio físico/virtual | GNS3 con máquinas QEMU/KVM y guests Docker |
-| Orquestación | K3s sobre nodos Ubuntu |
-| Plano de gestión | Bridge Linux `br0`, red `192.168.122.0/24`, Flannel sobre `br0` |
-| Plano SDN | Open vSwitch `br-sdn`, red `10.0.0.0/24`, túneles VXLAN |
-| Controlador SDN | Ryu en `DaemonSet`, un controlador local por nodo |
-| Estado distribuido | Redis + Sentinel como backend compartido |
-| Servicios SDN | DHCP, topología, telemetría, seguridad y observabilidad |
-| Guests de prueba | Smart Meters y máquina atacante en GNS3 |
+OpenFlow es el protocolo que permite a Ryu programar Open vSwitch. Cuando OVS no sabe como tratar un paquete, envia un evento `Packet-In` al controlador. Ryu responde instalando reglas mediante mensajes `FlowMod`. Esas reglas pueden reenviar a un puerto fisico, a un tunel VXLAN, al puerto local del host o descartar el trafico. El identificador de cada switch se denomina DPID y permite asociar cada datapath con un nodo concreto de la topologia.
 
-La decisión más importante del diseño fue evitar depender de un único controlador remoto. Cada nodo K3s ejecuta su propio controlador Ryu con `hostNetwork: true`, y el OVS local se conecta a `127.0.0.1:6653`. De esta forma, si un nodo pierde conectividad temporal con otros nodos, su dataplane local mantiene un controlador disponible. La coordinación global se resuelve mediante Redis Sentinel.
+Open vSwitch se usa como switch virtual programable en cada nodo K3s. Cada nodo mantiene un bridge OVS llamado `br-sdn`, que representa el plano de datos SDN. A ese bridge se conectan los Smart Meters y los tuneles que enlazan nodos. OVS fue necesario porque permite mezclar OpenFlow, puertos locales, interfaces de GNS3 y tuneles VXLAN. Se probo ejecutar OVS desde una base Alpine, pero se descarto por problemas practicos de compatibilidad con kernel y modulos. El proyecto paso a una base Ubuntu para estabilizar el dataplane.
 
-## 2. Selección del Controlador SDN
+VXLAN permite extender una red de capa 2 sobre una red IP. En el proyecto se usa para que Smart Meters conectados a nodos distintos pertenezcan al mismo plano SDN `10.0.0.0/24`. La alternativa de crear una malla completa de VXLAN fue descartada. Una malla completa parece sencilla al comienzo, pero escala mal, crea enlaces artificiales entre nodos que no son vecinos reales y elimina el sentido de calcular rutas multi-hop. La arquitectura final mantiene vecinos directos del fabric y deja que Ryu calcule los caminos.
 
-Para el controlador SDN se eligió Ryu. La elección se fundamenta en el tipo de proyecto: un laboratorio académico y experimental donde era necesario modificar el comportamiento del controlador, integrar estado externo en Redis, exponer métricas propias, implementar reglas de seguridad y desplegar todo dentro de Kubernetes con recursos reducidos.
+El control de bucles evoluciono de forma importante. STP y RSTP se evaluaron porque son mecanismos clasicos para evitar loops de capa 2, pero se descartaron en el dataplane SDN final. STP bloquea enlaces completos, desperdicia redundancia fisica y no entiende la logica de la aplicacion AMI. La solucion final separa dos problemas: el broadcast se controla con un arbol minimo de expansion, y el trafico unicast se calcula con Dijkstra. El MST evita que los floods formen bucles. Dijkstra permite usar el mejor camino disponible entre Smart Meters sin quedar limitado por el arbol de broadcast.
 
-Ryu es un framework SDN escrito en Python, orientado a OpenFlow y muy adecuado para prototipado avanzado. Permite intervenir directamente en eventos OpenFlow como `EventOFPSwitchFeatures`, `EventOFPPacketIn`, estadísticas de puertos, estadísticas de flujos y eventos de topología. Esa flexibilidad fue clave para implementar aprendizaje MAC distribuido, bloqueo de tráfico malicioso, respuesta ARP del gateway virtual, métricas Prometheus y cálculo de caminos.
+Redis cumple el rol de estado distribuido. No es solo una cache. Es el contrato runtime que comparten Ryu, DHCP, el colector de telemetria, el dashboard, el registro de seguridad y las pruebas. En Redis viven los switches activos, las ubicaciones de los guests, el aprendizaje MAC, los leases DHCP, los peers VXLAN, los estados de seguridad, las lecturas de medidores, los nonces HMAC y los locks distribuidos. Redis simple fue reemplazado por Redis Sentinel para evitar que la caida de una instancia dejara sin estado al sistema.
 
-Comparación de alternativas evaluadas:
+K3s aporta la orquestacion. Se eligio K3s en lugar de Kubernetes completo porque el laboratorio corre sobre VMs QEMU dentro de GNS3 y los recursos son limitados. K3s permite ejecutar componentes como DaemonSets, StatefulSets y ConfigMaps sin cargar el entorno con una distribucion Kubernetes mas pesada. Los DaemonSets son clave porque garantizan un componente por nodo: Ryu, OVS initializer, DHCP, meter collector, Promtail y Node Exporter. El cambio mas importante fue abandonar el modelo de Ryu como Deployment con varias replicas detras de un balanceador. La arquitectura final ejecuta un Ryu local por nodo con `hostNetwork`, y cada OVS se conecta a `tcp:127.0.0.1:6653`. Esto elimina la dependencia de un controlador remoto para el dataplane local.
 
-| Controlador | Ventajas | Motivo para no elegirlo |
-| --- | --- | --- |
-| Ryu | Ligero, Python, fácil de modificar, integración directa con OpenFlow 1.3, simple de contenerizar | Fue elegido porque permite implementar rápido lógica propia y adaptarla a Redis/K3s/GNS3 |
-| OpenDaylight | Plataforma SDN muy completa, modular, madura para entornos empresariales | Es más pesado, basado en Java/Karaf/OSGi, con mayor complejidad operativa para un laboratorio con K3s y VMs pequeñas |
-| ONOS | Diseñado para control distribuido y alta disponibilidad a gran escala | Su modelo de cluster nativo era más complejo de operar que externalizar el estado en Redis para este caso de uso |
-| Floodlight | Controlador OpenFlow clásico y relativamente simple | Está basado en Java y ofrece menos flexibilidad práctica para integrar rápidamente lógica Python, Scapy, Redis y métricas propias |
+GNS3 permite construir un laboratorio de red con nodos, cables, apagados y fallos reales. Los control planes y workers son VMs Ubuntu sobre QEMU/KVM. Los Smart Meters son contenedores ligeros. La maquina atacante es Ubuntu porque las pruebas con Scapy, paquetes crudos y tcpdump requieren un entorno mas completo. GNS3 fue preferido frente a simulaciones mas simples porque el objetivo no era solo probar un algoritmo SDN, sino validar un cluster K3s real con servicios, reinicios, interfaces, OVS, Redis y fallos de nodos.
 
-La decisión de usar Ryu no significa ignorar la alta disponibilidad. En lugar de depender de un cluster interno del controlador, se implementó una arquitectura distribuida alrededor de Ryu: un Ryu por nodo, estado compartido en Redis Sentinel y mecanismos de expiración, locks y reconstrucción de estado.
+El DHCP del plano SDN se implementa con Scapy porque se necesitaba control fino sobre paquetes DHCP y ARP. Cada nodo tiene un servidor DHCP local. Como un broadcast puede atravesar VXLAN y llegar a varias instancias, se usan locks atomicos en Redis para que solo una responda. Esta decision evita leases duplicados y mantiene una unica verdad sobre la IP de cada Smart Meter.
 
-Esta estrategia encaja mejor con el objetivo del proyecto porque separa claramente responsabilidades. Ryu toma decisiones OpenFlow locales, Redis mantiene el contrato de estado global y Kubernetes se encarga de reiniciar o reubicar workloads cuando hay fallos.
+La telemetria AMI usa UDP hacia `10.0.0.1:5555`. Cada nodo expone localmente `10.0.0.1` en `br-sdn` y ejecuta un meter collector. Esta decision evita que todos los medidores dependan de un collector central y reduce trafico innecesario entre nodos. La telemetria se protege con HMAC-SHA256 y nonce. El HMAC valida integridad y autenticidad. El nonce evita replay de lecturas antiguas. El comportamiento es fail-closed: si la firma falta, es invalida, el nonce se repite, el dispositivo no esta autorizado o Redis no permite validar la fuente, la lectura se rechaza.
 
-## 3. Enfoque Distribuido y de Alta Disponibilidad
+La observabilidad se implementa con Prometheus, Grafana, Loki, Promtail y Node Exporter. Prometheus recolecta metricas de Ryu, del collector y de los nodos. Grafana permite visualizar salud, trafico, telemetria, seguridad y logs. Loki centraliza logs y Promtail los envia desde los pods. Ryu expone `/metrics` directamente, sin sidecar, porque agregar otro contenedor solo para metricas complicaba el despliegue sin aportar valor real.
 
-El diseño final prioriza la disponibilidad local del plano de control. En una arquitectura centralizada clásica, todos los switches OpenFlow dependen de una IP remota del controlador. Si esa instancia cae o si un enlace de gestión falla, el switch queda sin plano de control. En este proyecto, cada OVS se conecta al Ryu que corre en el mismo nodo mediante `tcp:127.0.0.1:6653`.
+El proyecto tambien evoluciono hacia un fabric L3 con FRR, OSPF, BGP, Calico y loopbacks `10.255.x.x`. Esta fase responde a un problema observado en el plano de gestion L2: un dominio broadcast con multiples cables puede generar tormentas si se reintroduce un loop. El fabric L3 elimina esa clase de fallo porque cada cable pasa a ser un enlace enrutado. OSPF entrega alcanzabilidad entre loopbacks, ECMP permite usar multiples caminos, y BGP puede integrar kube-vip y Calico. Esta evolucion reemplaza mecanismos anteriores como arboles estaticos de `br0`, puertos activos por hostname, failover L2 y storm guards.
 
-La arquitectura distribuida se apoya en las siguientes decisiones:
+Las tecnologias usadas de forma efectiva fueron Ryu, OpenFlow, Open vSwitch, VXLAN, K3s, Redis Sentinel, Scapy, Flask, GNS3, QEMU/KVM, Docker, Prometheus, Grafana, Loki, Promtail, Node Exporter, HMAC-SHA256, FRR, OSPF, BGP y Calico. Las tecnologias o enfoques descartados fueron OpenDaylight, ONOS, Floodlight, Kubernetes completo, Ryu centralizado detras de LoadBalancer, Redis simple, OVS Alpine, STP/RSTP en el dataplane SDN, VXLAN full-mesh, BFS como fuente de verdad para caminos, collector central unico y dashboards separados para seguridad.
 
-| Decisión | Justificación |
-| --- | --- |
-| Ryu como `DaemonSet` | Garantiza una instancia del controlador en cada nodo K3s |
-| `hostNetwork: true` | Permite que Ryu escuche en la red del host y que OVS acceda a `127.0.0.1` |
-| OVS local por nodo | Cada nodo controla su propio bridge SDN `br-sdn` |
-| Redis Sentinel | Evita depender de un Redis único sin failover |
-| Locks distribuidos | Previenen que varias instancias programen reglas contradictorias |
-| TTLs y heartbeats | Eliminan nodos, guests y enlaces obsoletos sin intervención manual |
-| Probes de Kubernetes | Detectan procesos colgados y fuerzan reinicio controlado |
-| ConfigMaps para código | Permiten hot reload de servicios Python sin reconstruir imágenes completas |
+## Metodologia
 
-Esta decisión reemplazó una etapa anterior del proyecto donde Ryu se planteaba como `Deployment` con varias réplicas detrás de un `LoadBalancer`. El historial de commits muestra la evolución hacia el diseño actual, especialmente en el cambio a `DaemonSet`, la eliminación de `hostPorts`, la conexión local de OVS a `127.0.0.1` y la migración de Redis simple a Redis Sentinel.
+### Problema a Resolver
 
-## 4. Virtualización en GNS3
+El problema central fue construir una red AMI distribuida capaz de mantener conectividad, telemetria y seguridad ante fallos de enlaces, nodos, pods y servicios auxiliares. Una red de Smart Meters no puede depender de configuracion manual ni de un controlador unico. Tampoco basta con que los paquetes pasen: el sistema debe saber que medidor esta conectado, donde esta, si esta autorizado, si su telemetria es valida y si la topologia mostrada corresponde al estado real.
 
-GNS3 se utiliza como plataforma de laboratorio para emular una red física distribuida. La decisión de usar GNS3 permite crear, destruir y reconectar nodos de red de forma visual, simulando fallos de enlaces, apagado de nodos, incorporación de workers y conexión de dispositivos IoT a puertos concretos.
+La metodologia fue incremental. El proyecto comenzo como un fork de Ryu y evoluciono hacia una plataforma completa. Cada decision importante surgio de una limitacion detectada en pruebas. Cuando un enfoque resolvia un problema pero creaba otro, se reemplazaba. Por eso el historial muestra STP y RSTP antes de MST y Dijkstra, Ryu Deployment antes de DaemonSet, Redis simple antes de Sentinel, VXLAN mas amplio antes de vecinos reales, y `br0` L2 antes del fabric L3.
 
-El entorno virtual se construye con máquinas QEMU/KVM para los nodos K3s y appliances Docker para los Smart Meters. Esto permite combinar dos niveles de virtualización: VMs completas para los nodos de infraestructura y contenedores ligeros para los dispositivos finales.
+El criterio de avance no fue teorico. Cada etapa se valido en GNS3 con K3s real, OVS real, pods reales y fallos provocados. Si el laboratorio quedaba con estado stale, loops, flows obsoletos, dashboards incorrectos o telemetria falsa aceptada, el diseno se corregia.
 
-GNS3 aporta ventajas importantes para este proyecto:
+La eleccion de K3s fue parte central de la metodologia porque el objetivo no era construir solo una aplicacion SDN, sino una arquitectura distribuida operable. K3s permitio trabajar con primitivas reales de Kubernetes, como DaemonSets, StatefulSets, Services, ConfigMaps y rolling restarts, pero con un consumo compatible con varias maquinas virtuales ejecutandose dentro de GNS3. Esto hizo posible validar el comportamiento del sistema en condiciones cercanas a una instalacion distribuida: un controlador Ryu por nodo, OVS local, servicios replicados, Redis Sentinel, observabilidad y reinicios controlados. En vez de simular la distribucion desde un proceso unico, el laboratorio obligo a resolver problemas propios de un cluster real, como descubrimiento de nodos, estado compartido, failover, pods que reinician, nodos que caen y diferencias entre conectividad local y conectividad remota.
 
-| Necesidad del proyecto | Aporte de GNS3 |
-| --- | --- |
-| Probar topologías variables | Permite conectar workers en línea, estrella, anillo o combinaciones manuales |
-| Simular fallos físicos | Basta con apagar nodos o desconectar enlaces del canvas |
-| Separar puertos de gestión y puertos SDN | Cada VM puede tener varios adaptadores `virtio` |
-| Probar guests reales | Los Smart Meters se conectan a puertos concretos de OVS |
-| Validar seguridad | Se puede conectar una máquina atacante al segmento SDN |
+K3s tambien ayudo a separar responsabilidades. Los componentes que debian estar en todos los nodos se modelaron como DaemonSets; los que necesitaban identidad estable y persistencia se desplegaron como StatefulSets; y el codigo de servicios Python se monto mediante ConfigMaps para acelerar iteraciones sin reconstruir imagenes en cada prueba. Esta forma de trabajo permitio que la metodologia fuera experimental y repetible: se introducia un cambio, se desplegaba en el cluster, se provocaba un fallo o ataque, y luego se observaba el efecto en conectividad, Redis, logs, metricas y dashboards.
 
-El laboratorio utiliza una red de gestión `192.168.122.0/24`, conectada al cloud `virbr0`, y una red SDN independiente `10.0.0.0/24` construida sobre `br-sdn`. Esta separación es fundamental: `br0` pertenece al plano de gestión y fabric de K3s, mientras que `br-sdn` pertenece al plano de datos SDN. El proyecto evita mezclar ambos bridges para no crear bucles ni contaminar el tráfico de control con el tráfico de guests.
+### Evolucion Tecnica del Proyecto
 
-## 5. Tipos de Máquinas Virtuales y Guests
+- La primera fase fue convertir Ryu en un controlador SDN con estado externo en Redis. Esto permitio que el aprendizaje MAC y la topologia dejaran de depender solo de la memoria del proceso.
 
-El proyecto usa varios tipos de nodos, cada uno con un rol específico dentro de la arquitectura.
+- La segunda fase fue llevar el controlador a Kubernetes. Se agregaron manifiestos, imagenes Docker y despliegue en K3s.
 
-| Tipo | Tecnología | Rol |
-| --- | --- | --- |
-| Nodo maestro | Ubuntu QEMU/KVM | Ejecuta K3s server, servicios anclados al master y acceso principal al laboratorio |
-| Nodo worker | Ubuntu QEMU/KVM clonado desde Golden Image | Ejecuta K3s agent, OVS, Ryu local, DHCP, collector y dataplane SDN |
-| Smart Meter | Appliance Docker en GNS3 | Simula un medidor eléctrico que pide DHCP y envía telemetría UDP firmada |
-| Máquina atacante | Ubuntu QEMU | Genera tráfico malicioso para validar detección de MAC spoofing, IP spoofing y ARP poisoning |
+- La tercera fase incorporo OVS por nodo. Se creo `br-sdn`, se estabilizo el DPID, se agregaron interfaces guest y se empezaron a construir tuneles VXLAN.
 
-El nodo maestro tiene IP fija `192.168.122.100` en `br0`. Esta IP actúa como punto estable para el API Server de K3s, para los servicios expuestos y para la conexión inicial de los workers.
+- La cuarta fase separo el plano de gestion del plano SDN. Se evito mezclar `br0` con `br-sdn` porque hacerlo podia romper K3s o introducir loops peligrosos.
 
-Los workers se preparan mediante una Golden Image. La decisión de usar una Golden Image reduce el esfuerzo operativo: se configura una única VM base y luego se clona en GNS3 tantas veces como sea necesario. Cada clon obtiene IP por DHCP, genera un hostname único basado en la MAC de `br0` y se une automáticamente al cluster K3s mediante un servicio `systemd` de auto-join.
+- La quinta fase cambio el modelo de Ryu. En lugar de un Deployment central o balanceado, se paso a un DaemonSet con un Ryu local por nodo. OVS quedo conectado al controlador local por `127.0.0.1`.
 
-Los Smart Meters son contenedores Alpine/BusyBox en GNS3. Esta elección reduce consumo de CPU y memoria, y permite crear muchos medidores sin levantar VMs completas. Cada Smart Meter ejecuta `udhcpc` hasta obtener una dirección en la red SDN y luego inicia el simulador Python de telemetría.
+- La sexta fase migro Redis a Sentinel. Esto convirtio el backend de estado en un componente con failover.
 
-La máquina atacante se implementa como Ubuntu QEMU porque Scapy y las pruebas de paquetes crudos requieren privilegios, paquetes de desarrollo y herramientas como `tcpdump`. Se usa para validar la seguridad del controlador en condiciones similares a una máquina real conectada a la red de acceso.
+- La septima fase agrego DHCP distribuido con Scapy y locks Redis. Esto hizo posible conectar Smart Meters reales de GNS3 al plano SDN.
 
-## 6. Diseño de Red: `br0` y `br-sdn`
+- La octava fase incorporo Smart Meters, meter collector y telemetria AMI. La red dejo de ser solo conectividad y paso a transportar datos de aplicacion.
 
-El diseño separa estrictamente el plano de gestión del plano SDN.
+- La novena fase agrego observabilidad. Prometheus, Grafana y Loki permitieron medir Packet-In, flows, estado de nodos, trafico, logs y seguridad.
 
-| Bridge | Red | Uso |
-| --- | --- | --- |
-| `br0` | `192.168.122.0/24` | Gestión, K3s, Flannel, comunicación entre nodos, LLDP físico |
-| `br-sdn` | `10.0.0.0/24` | Tráfico de guests, Smart Meters, DHCP SDN, telemetría AMI |
+- La decima fase agrego seguridad AMI. Se implemento registro de dispositivos, estados `authorized`, `blocked` y `quarantined`, validacion de MAC, IP, DPID, puerto, HMAC y nonce.
 
-En el maestro, `br0` usa IP fija `192.168.122.100`. En los workers, `br0` usa DHCP y `dhcp-identifier: mac` para que cada clon mantenga una IP estable tras reinicios de GNS3. Esta decisión evita que K3s y Flannel queden con IPs cruzadas después de recrear nodos.
+- La undecima fase estabilizo K3s HA, kube-vip, Golden Images, autojoin y recuperacion tras reinicios GNS3.
 
-Los puertos `ens3` a `ens6` pertenecen al bridge `br0` y forman el fabric físico/virtual entre nodos. Los puertos `ens7`, `ens8` o equivalentes quedan libres para guests SDN y son agregados dinámicamente a `br-sdn` por el inicializador de OVS.
+- La duodecima fase se centro en resiliencia. Se agrego propagacion de switches caidos, limpieza de flows stale, caducidad de presencia y reroute ante cambios de topologia.
 
-La red SDN usa `10.0.0.1/24` como gateway y punto local de colección. Un detalle importante es que `10.0.0.1` existe localmente en cada nodo sobre `br-sdn`. Ryu responde ARP por `10.0.0.1` usando una MAC derivada del DPID del nodo, lo que permite que un Smart Meter envíe telemetría al collector local de su mismo nodo sin depender de un collector remoto.
+- La decimotercera fase elimino STP/RSTP del dataplane SDN y lo reemplazo por MST para broadcast y Dijkstra para unicast.
 
-`br-sdn` usa la misma MAC que `br0`. Esta decisión evita inconsistencias entre el DPID, la MAC esperada por Ryu y la MAC aceptada por el kernel cuando se entrega tráfico al puerto local de OVS.
+- La decimocuarta fase rechazo la malla completa VXLAN y consolido tuneles a vecinos reales del fabric.
 
-## 7. Orquestación con K3s
+- La fase final incorporo fabric L3 con FRR/OSPF, loopbacks y deteccion mas rapida de peers caidos.
 
-K3s fue elegido como distribución Kubernetes por ser ligera, simple de instalar y suficiente para orquestar un laboratorio distribuido con VMs pequeñas. Frente a Kubernetes completo, K3s reduce consumo de recursos y complejidad operacional, lo que es importante cuando los nodos corren dentro de GNS3/QEMU.
+### Decisiones Tecnologicas
 
-El cluster se instala con `--flannel-iface=br0`. Esta decisión es crítica porque la IP de gestión vive en `br0`, no en una interfaz física individual. Si K3s se enlazara a `ens3`, el API Server, Flannel o los workers podrían quedar usando una interfaz sin IP.
+- Ryu fue elegido porque permite implementar logica propia en Python y modificar el comportamiento OpenFlow sin cargar con una plataforma SDN pesada.
 
-Los manifiestos se organizan por capas:
+- K3s fue elegido porque entrega Kubernetes real con menor consumo, adecuado para VMs dentro de GNS3.
 
-| Archivo | Responsabilidad |
-| --- | --- |
-| `00-namespace.yaml` | Namespace `sdn-controller` |
-| `01-database.yaml` | Redis + Sentinel |
-| `02-ryu-controller.yaml` | Ryu/OpenFlow |
-| `03-sdn-network.yaml` | OVS, VXLAN y DHCP distribuido |
-| `05-telemetry.yaml` | Collector de Smart Meters |
-| `06-observability.yaml` | Prometheus, Grafana, Loki, Promtail, Node Exporter |
-| `07-security-registry.yaml` | Registro web/API de dispositivos autorizados |
+- OVS fue elegido porque permite un dataplane programable con OpenFlow y VXLAN.
 
-Los servicios críticos por nodo se despliegan como `DaemonSet`: Ryu, OVS initializer, DHCP, meter collector, Promtail y Node Exporter. Esta decisión asegura presencia local en cada nodo y evita que un único pod central sea cuello de botella.
+- Redis Sentinel fue elegido porque el sistema necesita estado compartido con failover. Sin Redis, los controladores locales serian islas.
 
-Los servicios de visualización y administración se fijan al master con `nodeSelector`. Esto simplifica el acceso desde la red del laboratorio y evita inconsistencias de provisión en dashboards como Grafana. No forman parte del dataplane crítico, por lo que pueden centralizarse sin comprometer el objetivo principal de control distribuido.
+- El modelo de Ryu local por nodo fue elegido porque evita que la caida de un controlador remoto afecte a todos los switches.
 
-## 8. Controlador Ryu Implementado
+- El gateway `10.0.0.1` local por nodo fue elegido para mantener telemetria local y reducir dependencia de servicios centrales.
 
-El controlador principal está en `services/ryu-controller/app.py`. Implementa una aplicación Ryu llamada `DistributedL2Switch` con soporte OpenFlow 1.3.
+- DHCP distribuido fue elegido porque los Smart Meters pueden estar conectados a cualquier nodo y deben obtener IP aunque otros nodos esten fallando.
 
-Sus funciones principales son:
+- HMAC y nonce fueron incorporados porque en una red AMI no basta con transportar paquetes; las lecturas deben ser autenticas, integras y no repetidas.
 
-| Función | Implementación |
-| --- | --- |
-| Registro de switches | Guarda DPIDs en `topology:switches` |
-| Aprendizaje MAC | Guarda `mac_to_port:{dpid}` en Redis |
-| Instalación de flujos | Usa `OFPFlowMod` con locks distribuidos |
-| Entrega local | Envía tráfico a `OFPP_LOCAL` cuando el destino es `10.0.0.1` |
-| ARP gateway | Responde ARP por `10.0.0.1` desde Ryu |
-| Seguridad | Detecta spoofing y poisoning, instala drops de cuarentena |
-| Métricas | Expone `/metrics` en el puerto `8000` |
-| Topología | Exporta nodos, enlaces y caminos a Prometheus |
+- MST y Dijkstra reemplazaron STP/RSTP porque el proyecto necesita evitar loops sin bloquear de forma permanente enlaces utiles.
 
-El aprendizaje MAC no queda en memoria local del proceso. Cada entrada se guarda en Redis con claves como `mac_to_port:{dpid}`. Esto permite que el estado sobreviva a reinicios de una instancia Ryu y pueda ser consultado por otros servicios, como el dashboard de topología, el DHCP y el registro de seguridad.
+- VXLAN por vecinos reemplazo full-mesh porque conserva el grafo real y permite validar caminos multi-hop.
 
-Para evitar conflictos en entornos distribuidos, el controlador usa locks Redis antes de instalar reglas OpenFlow. La llave tiene el formato `lock:flow:{dpid}:{src}:{dst}`. Con esto, si varios eventos derivados del mismo flujo llegan casi al mismo tiempo, solo una instancia programa la regla y las demás evitan duplicar o contradecir la acción.
+- El fabric L3 reemplaza gradualmente el underlay L2 porque elimina la clase completa de fallos por loops broadcast en gestion.
 
-Los flujos reactivos de forwarding usan `FORWARDING_FLOW_IDLE_TIMEOUT=120`. Este valor reduce la latencia fria observada durante pruebas todos-contra-todos, porque evita que los flows expiren mientras se recorren varios pares de Smart Meters. La recuperación ante fallos no depende de esperar ese timeout: Ryu elimina activamente flows que apuntan a puertos VXLAN marcados como inactivos por los probes del inicializador.
+### Enfoques Descartados
 
-Ryu también implementa medidas específicas para el laboratorio:
+- OpenDaylight fue descartado por peso y complejidad operativa.
 
-| Problema | Solución implementada |
-| --- | --- |
-| DHCP necesita ver broadcasts | El controlador inyecta una copia a `OFPP_LOCAL` |
-| Tráfico al collector debe ser local | Paquetes IP con destino `10.0.0.1` salen por `OFPP_LOCAL` |
-| VXLAN puede generar loops de flood | No se reenvía flood de un puerto VXLAN a otro puerto VXLAN |
-| Guests obsoletos ensucian la topología | Se usan TTLs `active_mac:*`, `health:*` y limpieza de Redis |
-| Workers pueden parecer guests | Se detectan MACs derivadas de DPIDs y se auto-permiten |
+- ONOS fue descartado porque su cluster nativo era mas complejo que externalizar estado en Redis para este caso.
 
-La elección de implementar estas funciones en Ryu se justifica porque el proyecto necesitaba comportamiento a medida, especialmente alrededor de DHCP distribuido, local gateway, métricas y seguridad. Un controlador más pesado habría requerido adaptar plugins o módulos complejos, mientras que en Ryu la lógica se implementa directamente en Python.
+- Floodlight fue descartado porque no encajaba tan bien con el ecosistema Python del proyecto.
 
-## 9. Open vSwitch y VXLAN Dinámico
+- Kubernetes completo fue descartado porque K3s resuelve el mismo problema con menor consumo.
 
-Cada nodo K3s ejecuta Open vSwitch y mantiene un bridge `br-sdn`. Este bridge representa el switch SDN local del nodo y es controlado por Ryu mediante OpenFlow 1.3.
+- Ryu como Deployment balanceado fue descartado porque seguia dependiendo de conectividad hacia un endpoint remoto.
 
-El componente `ovs-sdn-initializer`, definido en `deploy/k8s/03-sdn-network.yaml`, corre como `DaemonSet` privilegiado con `hostNetwork` y `hostPID`. Su función es preparar el dataplane del host.
+- Redis simple fue descartado porque era un punto unico de fallo.
 
-Acciones principales del inicializador:
+- OVS Alpine fue descartado por incompatibilidades practicas.
 
-| Acción | Detalle |
-| --- | --- |
-| Instalar dependencias | Instala OVS, `lldpd`, herramientas IP y Redis CLI |
-| Crear `br-sdn` | Borra estado anterior y recrea el bridge SDN |
-| Fijar DPID | Deriva el DPID desde la MAC de `br0` |
-| Fijar MAC | Hace que `br-sdn` use la misma MAC que `br0` |
-| Asignar gateway | Configura `10.0.0.1/24` en `br-sdn` |
-| Conectar controlador | Configura `tcp:127.0.0.1:6653` |
-| Crear túneles | Usa LLDP para descubrir vecinos y crear VXLAN |
-| Agregar guests | Añade interfaces `ens*` libres a `br-sdn` |
-| Publicar heartbeats | Escribe `switch:alive:{dpid}` con TTL |
+- STP/RSTP en `br-sdn` fue descartado porque bloqueaba enlaces y no resolvia la logica de rutas AMI.
 
-La creación de VXLAN es dinámica. El inicializador observa vecinos LLDP en la red de gestión y crea puertos VXLAN con nombres derivados de la IP remota, por ejemplo `vx192168122101`. Si un vecino desaparece, el sistema acumula misses y elimina el túnel obsoleto después de varios ciclos.
+- VXLAN full-mesh fue descartado por escalabilidad y porque falseaba la topologia.
 
-Esta decisión evita hardcodear la topología. El usuario puede modificar cables en GNS3, y el sistema reconstruye los túneles según los vecinos observados. Es una decisión coherente con el objetivo de recuperación rápida, porque reduce la intervención manual tras cambios físicos o reinicios.
+- BFS fue reemplazado por Dijkstra porque no modelaba costes ni coincidia con el forwarding final.
 
-El historial de commits muestra que el diseño pasó por varias etapas: VXLAN fijo, topología en anillo, pruebas de mecanismos de bloqueo de puertos, inferencia por MAC learning y finalmente VXLAN dinámico vía Redis/LLDP sin mover las interfaces de gestión. Esa evolución llevó a la separación actual entre `br0` y `br-sdn`, que es más estable para K3s.
+- Un collector central fue descartado porque concentraba trafico y riesgo.
 
-## 10. Redis Sentinel como Estado Compartido
+- La UI separada de seguridad fue reemplazada por un dashboard operacional unificado.
 
-Redis es el contrato runtime del sistema. Se utiliza para almacenar topología, aprendizaje MAC, leases DHCP, ubicación de guests, estado de seguridad, telemetría y métricas derivadas.
+## Implementacion
 
-El despliegue actual usa un `StatefulSet` con tres réplicas Redis y Sentinel. Sentinel monitoriza el master `mymaster`, detecta caída con `down-after-milliseconds` bajo y ejecuta failover. Los pods tienen anti-affinity para distribuirse por nodos cuando el cluster lo permite.
+### Arquitectura General
 
-Claves relevantes:
+La implementacion final es una plataforma SDN distribuida sobre K3s y GNS3. Incluye un laboratorio virtual, un cluster Kubernetes ligero, un dataplane OpenFlow, un backend de estado compartido, servicios AMI, seguridad y observabilidad.
 
-| Grupo | Claves principales |
-| --- | --- |
-| Topología | `topology:switches`, `topology:node_names`, `topology:node_ips`, `topology:links` |
-| Puertos | `switch_ports:{dpid}` |
-| Aprendizaje MAC | `mac_to_port:{dpid}`, `active_mac:{dpid}:{mac}` |
-| Guests | `topology:guest_ips`, `topology:guest_locations`, `health:{mac}` |
-| DHCP | `dhcp:next_ip`, `dhcp:bind:{mac}`, `dhcp:lock:{mac}:{xid}:{msg_type}` |
-| Seguridad | `security:devices`, `security:device:{device_id}`, `security:mac_to_device:{mac}`, `security:ip_to_device:{ip}` |
-| Telemetría | `meter:devices`, `meter:history:{device_id}`, `meter:latest:{device_id}` |
-| HMAC | `meter:hmac:*`, `meter:nonce:{device_id}:{nonce}` |
+El laboratorio se ejecuta en GNS3. Los nodos de infraestructura son VMs Ubuntu. Los Smart Meters son contenedores. La maquina atacante es una VM Ubuntu. Esta combinacion permite simular una infraestructura distribuida con fallos reales de enlace y de nodo.
 
-Se eligió Redis porque ofrece estructuras simples y eficientes para este caso: sets, hashes, contadores, listas, TTLs y locks. Además, la integración desde Python es directa para Ryu, Flask y Scapy.
+K3s orquesta los servicios. Los componentes que deben existir en cada nodo se despliegan como DaemonSets. Redis se despliega como StatefulSet con Sentinel. El codigo Python de servicios como Ryu, DHCP y meter collector se inyecta mediante ConfigMaps para facilitar hot reload en laboratorio.
 
-En el despliegue actual Redis usa PVCs persistentes `data-redis-0`, `data-redis-1` y `data-redis-2` con `local-path`. Esta decisión evita perder estado por reinicios de pod y permite validar failover de Sentinel sin vaciar la base de datos runtime. Para producción, el equivalente debería usar almacenamiento persistente con política clara de backup, anti-affinity reforzada y recuperación documentada ante pérdida de nodo físico.
+El dataplane SDN vive en `br-sdn`. Cada nodo tiene su propio OVS y su propio Ryu. OVS no apunta a un servicio remoto, sino a `tcp:127.0.0.1:6653`. Esta es una de las decisiones mas importantes de la implementacion: el plano de control inmediato de cada switch esta en el mismo nodo.
 
-## 11. DHCP Distribuido
+El estado compartido vive en Redis Sentinel. Ryu escribe switches, MACs, puertos y caminos. DHCP escribe leases y ubicacion de guests. El collector escribe telemetria y consulta seguridad. El dashboard lee topologia y estado de dispositivos. Las pruebas inspeccionan esas mismas claves.
 
-El servicio DHCP está en `services/dhcp-server/app.py` y se despliega como `DaemonSet`. Cada nodo ejecuta una instancia local que escucha en interfaces de guests o en `br-sdn` usando Scapy.
+### Controlador Ryu
 
-El reto principal es que, por VXLAN, varios pods DHCP pueden recibir el mismo broadcast. Para evitar respuestas duplicadas, el servicio usa locks atómicos en Redis con `SET NX EX`. La llave incluye MAC, transaction ID y tipo de mensaje DHCP. El primer pod que adquiere el lock responde, y los demás descartan el evento.
+El controlador principal esta en `services/ryu-controller/app.py`. La aplicacion `DistributedL2Switch` procesa eventos OpenFlow y coordina decisiones con Redis.
 
-El DHCP asigna direcciones en `10.0.0.x` y registra el resultado en Redis:
+Ryu registra switches cuando se conectan. Aprende MACs observadas. Publica presencia con TTL. Instala flows reactivos. Entrega trafico destinado a `10.0.0.1` al puerto local. Fabrica respuestas ARP para el gateway y para destinos conocidos. Calcula flood controlado por MST. Calcula caminos unicast por Dijkstra. Expone metricas Prometheus en el puerto `8000`.
 
-| Dato | Clave |
-| --- | --- |
-| Lease por MAC | `dhcp:bind:{mac}` |
-| Siguiente IP | `dhcp:next_ip` |
-| IP visible en topología | `topology:guest_ips` |
-| Ubicación del guest | `topology:guest_locations` |
+Ryu tambien participa en seguridad. Valida si una MAC o IP observada corresponde a un dispositivo autorizado. Detecta intentos de suplantacion. Bloquea ARP malicioso para `10.0.0.1`. Instala drops de alta prioridad para dispositivos bloqueados o en cuarentena. Esta logica evita que la seguridad quede solo en la aplicacion.
 
-El servicio responde de tres maneras para mejorar compatibilidad con guests GNS3: broadcast por `br-sdn`, copia unicast L2 dirigida a la MAC cliente y copia directa por la interfaz física local cuando se identifica el puerto del guest. Esta mejora aparece en commits relacionados con respuestas unicast y respuestas por puertos locales.
+Los locks Redis evitan que varias instancias instalen reglas contradictorias. La llave `lock:flow:{dpid}:{src}:{dst}` serializa la instalacion de flows para un mismo par de comunicacion.
 
-También ejecuta healthchecks ARP periódicos para determinar si un guest sigue vivo. Para evitar envenenar caches ARP, los workers usan `psrc=0.0.0.0` en lugar de anunciarse como `10.0.0.1`. Ryu es el único responsable de responder ARP por el gateway virtual.
+### OVS y VXLAN
 
-Esta decisión mejora la frescura de la topología: si un guest deja de responder, se elimina de `mac_to_port` y `topology:guest_ips`, evitando que dashboards y métricas muestren nodos fantasmas.
+El `ovs-sdn-initializer` prepara `br-sdn` en cada nodo. Crea el bridge, fija DPID, asigna `10.0.0.1/24`, conecta el controlador local, agrega puertos guest y crea tuneles VXLAN hacia peers directos.
 
-## 12. Visualización de Topología
+El inicializador tambien publica heartbeats `switch:alive:{dpid}` y detecta peers caidos. Cuando un peer desaparece, publica eventos `switch:dead` y elimina flows que podrian seguir apuntando a puertos obsoletos. Esto reduce el riesgo de que el dataplane siga usando caminos muertos.
 
-La visualización de topología se implementa en la web de operaciones unificada. Grafana queda dedicado a métricas, logs y salud operacional mediante Prometheus/Loki.
+En el modelo mas reciente, los peers VXLAN se derivan de rutas OSPF hacia loopbacks `10.255.x.x`. Esto permite que el overlay use vecinos reales del fabric y evita una malla completa artificial.
 
-La web de operaciones está en `services/meter-collector/app.py` (pestaña "Topologia SDN"). Expone `/api/sdn-topology` y `/api/sdn-trace`. Lee Redis para construir nodos, enlaces, guests e información de caminos.
+### Underlay de Gestion
 
-La API construye la vista a partir de:
+El proyecto tuvo dos etapas de underlay. La primera uso `br0` como bridge Linux para la red de gestion. Como GNS3 permite topologias con anillos, `br0` debia mantenerse sin loops. Para eso se usaron puertos activos deterministas, failover controlado y guards contra tormentas.
 
-| Información | Fuente Redis |
-| --- | --- |
-| Switches activos | `topology:switches` y `switch:alive:*` |
-| Nombres de nodos | `topology:node_names` |
-| IPs de nodos | `topology:node_ips` |
-| Puertos OVS | `switch_ports:{dpid}` |
-| Guests | `mac_to_port:{dpid}`, `topology:guest_ips`, `health:{mac}` |
-| Enlaces VXLAN | Nombres de puertos `vx*` cruzados con IPs de nodos |
+La etapa posterior migra a fabric L3. En vez de construir un dominio L2 grande, cada enlace se trata como ruta IP. FRR anuncia loopbacks por OSPF. La alcanzabilidad entre nodos ya no depende de STP ni de un arbol manual. Esto hace el underlay mas robusto frente a cables redundantes y reinicios.
 
-El dashboard evita mostrar nodos desconectados mediante heartbeats. Si un switch no tiene `switch:alive:{dpid}`, se limpia su estado asociado. Esto mantiene la visualización coherente tras fallos y reinicios.
+La regla que se mantiene en ambas etapas es estricta: `br0` o el underlay de gestion no deben mezclarse con `br-sdn`. El plano de gestion sostiene Kubernetes. El plano SDN transporta Smart Meters.
 
-La web de operaciones es la herramienta directa de depuración y trazado de caminos basada en Redis. Grafana complementa la operación con métricas temporales, logs de Ryu, eventos de seguridad, estado de Redis, uso de recursos y telemetría agregada.
+### Redis Sentinel
 
-## 13. Smart Meters y Telemetría AMI
+Redis Sentinel mantiene el estado comun y el failover del backend. Los servicios consultan Sentinel para ubicar el master vigente. Esto evita acoplar el sistema a una instancia fija.
 
-El proyecto incluye una simulación de medidores inteligentes. El servicio `services/smart-meter/app.py` genera lecturas sintéticas de voltaje, corriente, potencia activa, potencia reactiva, factor de potencia y energía acumulada.
+Redis contiene la topologia, los peers VXLAN, el aprendizaje MAC, la presencia de switches, los leases DHCP, la ubicacion de guests, el estado de seguridad, la telemetria, los nonces y los locks. Esa centralizacion controlada permite que varias instancias locales actuen como un sistema distribuido.
 
-Cada Smart Meter:
+### DHCP Distribuido
 
-| Característica | Implementación |
-| --- | --- |
-| Obtención de IP | `udhcpc` en `entrypoint.sh` |
-| Reintento de DHCP | Bucle infinito hasta obtener lease |
-| Destino por defecto | `10.0.0.1:5555` |
-| Protocolo | UDP |
-| Seguridad | Firma HMAC-SHA256 |
-| Anti-replay | Campo `nonce` único por lectura |
-| Identidad | `DEVICE_ID` o hostname |
+El DHCP distribuido esta en `services/dhcp-server/app.py`. Cada nodo escucha trafico DHCP del plano SDN. Cuando recibe una solicitud, intenta adquirir un lock en Redis. Si lo consigue, responde. Si no lo consigue, descarta porque otra instancia ya gano.
 
-El appliance `smart-meter.gns3a` permite arrastrar el medidor al canvas de GNS3 y conectarlo al puerto SDN de un nodo. Al iniciar, el contenedor levanta `eth0`, pide DHCP y luego comienza a enviar telemetría.
+El DHCP guarda la IP asignada y la asocia a la MAC del Smart Meter. Tambien publica informacion que luego consume la topologia. Sus healthchecks ARP permiten saber si un guest sigue presente. Para no contaminar caches ARP, los workers hacen probes con `psrc=0.0.0.0`.
 
-La elección de enviar a `10.0.0.1` es deliberada. Cada nodo tiene un collector local escuchando en esa IP sobre `br-sdn`. Esto evita que todos los medidores dependan de un único collector central y reduce la latencia y el tráfico entre nodos.
+### Smart Meters
 
-## 14. Meter Collector Distribuido
+Los Smart Meters estan en `services/smart-meter/`. Al arrancar, levantan la interfaz, ejecutan `udhcpc` hasta obtener direccion y luego empiezan a enviar telemetria. El retry infinito de DHCP es intencional. En un entorno distribuido, el medidor no debe fallar solo porque arranco antes que DHCP.
 
-El collector está en `services/meter-collector/app.py` y se despliega como `DaemonSet` con `hostNetwork`. Escucha UDP `5555` para telemetría y HTTP `5000` para API, dashboard y métricas.
+Cada lectura contiene identidad del dispositivo, valores electricos simulados, timestamp, nonce y HMAC. El destino por defecto es `10.0.0.1:5555`.
 
-Funciones principales:
+### Meter Collector y Dashboard
 
-| Función | Detalle |
-| --- | --- |
-| Recepción UDP | Escucha en `0.0.0.0:5555` |
-| Validación HMAC | Verifica firma con secreto global, secretos por dispositivo o Redis |
-| Anti-replay | Usa nonces con TTL en Redis |
-| Tolerancia a Redis | Mantiene caché en memoria si Redis no está disponible |
-| Persistencia runtime | Guarda última lectura e historial en Redis |
-| API | Expone `/api/meters`, `/api/stats`, `/api/meters/<id>/history` |
-| Métricas | Expone `/metrics` para Prometheus |
+El meter collector esta en `services/meter-collector/app.py`. Recibe UDP en `5555` y expone HTTP en `8081`. Corre por nodo con `hostNetwork`, lo que permite recibir trafico local y exponer el dashboard operacional sin depender de ServiceLB para el camino critico.
 
-Las lecturas se almacenan en `meter:latest:{device_id}` y `meter:history:{device_id}`. La última lectura tiene TTL, por lo que un medidor que deja de reportar desaparece automáticamente de la vista de activos.
+El collector valida HMAC, nonce, estado administrativo y autorizacion de la fuente. Si la lectura es valida, guarda la ultima muestra y el historial en Redis. Si no es valida, incrementa contadores de rechazo y la descarta.
 
-El collector también consulta el registro de seguridad. Si la IP de origen pertenece a un dispositivo bloqueado o en cuarentena, oculta o descarta su telemetría. Esto conecta la seguridad del plano SDN con la seguridad de la capa de aplicación AMI.
+El dashboard unificado muestra telemetria, seguridad, guests, topologia y trazado de caminos. Las APIs mas importantes son `/api/stats`, `/api/guests`, `/api/telemetry-security`, `/api/sdn-topology` y `/api/sdn-trace`.
 
-## 15. Registro de Dispositivos y Seguridad SDN
+### Seguridad AMI
 
-El módulo `services/security-device-registry/` implementa una fuente de identidad para dispositivos AMI autorizados. Tiene dos interfaces: un CLI (`registry.py`) y una consola web/API (`web.py`).
+El registro de seguridad mantiene la identidad esperada de cada medidor. Para autorizar un dispositivo no basta su `device_id`. Tambien se considera MAC, IP, DPID, puerto, destino permitido, puerto UDP permitido y estado administrativo.
 
-El registro guarda cada dispositivo con campos como `device_id`, `mac`, `ip`, `role`, `allowed_dst_ip`, `allowed_udp_port`, `status`, `dpid` e `in_port`.
+Ryu y el collector aplican seguridad en capas. Ryu protege el borde de red contra spoofing y ARP poisoning. El collector protege la aplicacion contra telemetria falsa, replay y fuentes no autorizadas.
 
-Estados soportados:
+Los estados principales son `authorized`, `blocked` y `quarantined`. Un dispositivo autorizado puede enviar telemetria si coincide con su identidad. Un dispositivo bloqueado o en cuarentena no debe publicar telemetria aceptada.
 
-| Estado | Significado |
-| --- | --- |
-| `authorized` | El dispositivo está permitido |
-| `blocked` | El dispositivo está bloqueado administrativamente |
-| `quarantined` | El dispositivo fue aislado por seguridad |
+### Observabilidad
 
-El controlador Ryu usa este registro para validar tráfico observado. Detecta:
+Prometheus recolecta metricas de Ryu, collector y nodos. Ryu publica metricas como `ryu_packet_in_total`, `ryu_active_nodes`, `ryu_active_switches`, `ryu_installed_flows`, `ryu_port_rx_bytes_total`, `ryu_port_tx_bytes_total`, `ryu_topology_node_info` y `ryu_topology_edge_info`.
 
-| Amenaza | Condición detectada |
-| --- | --- |
-| MAC spoofing | MAC no registrada enviando telemetría o MAC observada en DPID/puerto incorrecto |
-| IP spoofing | IP de origen distinta a la registrada, IP usada por otro dispositivo o uso de `10.0.0.1` |
-| ARP poisoning | ARP anunciando `10.0.0.1`, mismatch entre MAC Ethernet y ARP, o IP ARP distinta a la registrada |
+Grafana visualiza esas metricas junto con logs y estado de seguridad. Loki y Promtail centralizan logs. El objetivo no es solo ver graficos, sino poder explicar por que una ruta cambio, por que un medidor desaparecio, por que una lectura fue rechazada o por que un nodo quedo marcado como caido.
 
-Cuando detecta una amenaza, Ryu registra un evento en Redis, incrementa contadores y, si no está en modo aprendizaje, instala un drop flow de prioridad alta para bloquear el tráfico del guest. Un hilo de sincronización revisa periódicamente dispositivos en cuarentena, bloqueados o reautorizados para instalar o eliminar reglas de drop.
+## Pruebas y Validaciones
 
-Los workers se auto-permiten si su MAC corresponde a una MAC derivada de DPID. Esta excepción es necesaria porque los nodos de infraestructura generan tráfico legítimo que no debe tratarse como dispositivo AMI.
+### Tipo de Pruebas
 
-El proyecto incluye una guía y un script de pruebas con Scapy para simular MAC spoofing, IP spoofing y ARP poisoning desde una máquina atacante Ubuntu conectada a la red SDN. Esto permite validar que los eventos aparecen en logs, Grafana y el registro de seguridad.
+Las pruebas del proyecto son principalmente de caja gris. Son de caja negra cuando se valida conectividad desde los Smart Meters, APIs del dashboard o disponibilidad de servicios sin mirar la implementacion interna. Son de caja gris porque tambien se inspeccionan Redis, logs de Ryu, flows OVS, pods de Kubernetes, rutas del fabric y metricas Prometheus. No son pruebas puramente de caja blanca porque el criterio final es el comportamiento observable de la red.
 
-## 16. Observabilidad
+Tambien hay pruebas de integracion. Ryu, OVS, Redis, DHCP, meter collector, seguridad, dashboard y Smart Meters se validan juntos. Un ping exitoso no basta si la topologia queda stale. Una lectura aceptada no basta si el dispositivo no estaba autorizado. Una API disponible no basta si los DPIDs caidos siguen apareciendo como camino activo.
 
-La observabilidad se implementa con Prometheus, Grafana, Loki, Promtail y Node Exporter.
+Las pruebas de resiliencia son una forma de chaos testing controlado. Se apagan nodos, se suspenden enlaces y se reinician componentes para medir si el sistema detecta el cambio, limpia estado obsoleto y reconstruye conectividad.
 
-Prometheus scrapea directamente Ryu mediante anotaciones de pod. Ryu expone `/metrics` sin sidecar, lo que simplifica el despliegue y reduce consumo. También scrapea Node Exporter para métricas del host y el collector para métricas de telemetría/HMAC.
+Las pruebas de seguridad generan trafico malicioso o invalido. Incluyen MAC spoofing, IP spoofing, ARP poisoning, telemetria sin HMAC, HMAC invalido y replay por nonce repetido.
 
-Métricas principales:
+Las pruebas de carga usan matrices ICMP y flujos concurrentes entre Smart Meters para verificar que los flows reactivos y los timeouts no degraden la conectividad.
 
-| Métrica | Uso |
-| --- | --- |
-| `ryu_packet_in_total` | Volumen de eventos Packet-In por switch |
-| `ryu_active_nodes` | Cantidad de nodos activos según heartbeats |
-| `ryu_active_switches` | Cantidad de switches activos |
-| `ryu_installed_flows` | Flujos instalados por switch |
-| `ryu_port_rx_bytes_total` | Tráfico recibido por puerto OpenFlow |
-| `ryu_port_tx_bytes_total` | Tráfico transmitido por puerto OpenFlow |
-| `ryu_topology_node_info` | Estado de nodos SDN para observabilidad |
-| `ryu_topology_edge_info` | Estado de enlaces SDN para observabilidad |
-| `ryu_security_events_total` | Eventos de seguridad detectados |
-| `meter_hmac_accepted_total` | Paquetes AMI válidos |
-| `meter_hmac_invalid_total` | Paquetes AMI rechazados |
+### Criterios de Aceptacion
 
-Grafana incluye un dashboard `SDN Observabilidad` con Packet-In por segundo, nodos activos, switches activos, flujos instalados, tráfico por puerto, CPU, memoria, logs de Ryu, eventos de seguridad, validación HMAC y potencia reportada por Smart Meters.
+- El baseline debe mostrar nodos Ready, pods criticos Running, Redis operativo, Smart Meters online y topologia sin elementos stale.
 
-Loki y Promtail centralizan logs de Ryu. Esto facilita correlacionar eventos de seguridad con cambios de topología, reconexiones OpenFlow o fallos de servicios.
+- La conectividad debe funcionar entre Smart Meters no aislados.
 
-## 17. Recuperación Rápida ante Fallos
+- Ante caida de enlace, el camino activo debe cambiar y el ping debe recuperarse por una alternativa.
 
-El proyecto incorpora varios mecanismos de recuperación automática.
+- Ante caida de nodo, el DPID caido no debe seguir siendo usado como camino activo una vez detectada la falla.
 
-| Fallo | Mecanismo de recuperación |
-| --- | --- |
-| Caída de un pod Ryu | Kubernetes reinicia el pod del `DaemonSet`; OVS reconecta al Ryu local |
-| Reinicio de nodo | `ovs-sdn-initializer` reconstruye `br-sdn`, VXLAN, controller y heartbeats |
-| Cambio de enlaces GNS3 | LLDP detecta vecinos y crea/elimina túneles VXLAN |
-| Redis master caído | Sentinel elige nuevo master y los servicios consultan Sentinel |
-| DHCP todavía no disponible | Smart Meter reintenta `udhcpc` indefinidamente |
-| Guest desconectado | Healthcheck ARP expira `health:{mac}` y se limpia la topología |
-| Topología stale | TTLs en `active_mac:*`, `switch:alive:*` y `meter:latest:*` eliminan información vieja |
-| Dispositivo reautorizado | Ryu elimina reglas de drop asociadas al guest |
-| Error temporal del collector con Redis | Collector mantiene caché en memoria y reconecta periódicamente |
+- Tras restauracion, el sistema debe estabilizar sin duplicar guests, enlaces ni flows obsoletos.
 
-La recuperación no depende de intervención manual para los casos normales. La base de datos puede limpiarse completamente con un procedimiento de reset documentado, útil para repetir pruebas desde cero.
+- La telemetria no autorizada, mal firmada o repetida debe rechazarse fail-closed.
 
-## 18. Evolución del Proyecto Según el Historial de Commits
+- La red no debe construir VXLAN full-mesh artificial.
 
-El historial de commits muestra una evolución incremental hacia la arquitectura actual.
+### Evidencias Usadas
 
-| Fase | Cambios principales |
-| --- | --- |
-| Base distribuida | Se implementó Ryu con Redis para externalizar estado y locks de concurrencia |
-| Kubernetes inicial | Se agregaron manifiestos K3s, servicios y despliegue del controlador |
-| OVS y VXLAN | Se incorporó un `DaemonSet` de OVS, auto-detección de interfaces y túneles VXLAN |
-| Estabilización de red | Se fijó DPID por MAC de `br0`, se separó `br0` de `br-sdn` y se evitó romper K3s |
-| Topología | Se agregó dashboard web, formato de DPID como MAC y deduplicación de enlaces |
-| DHCP distribuido | Se implementó DHCP con Scapy, locks Redis, leases y healthchecks |
-| Arquitectura final de control | Ryu pasó a `DaemonSet` con `hostNetwork` y OVS quedó conectado a `127.0.0.1` |
-| Redis HA | Se migró a Redis Sentinel y se consolidó el tracking de puertos |
-| Smart Meter | Se agregaron medidores, collector distribuido y entrega local a `10.0.0.1` |
-| Observabilidad | Se incorporaron Prometheus, Grafana, Loki, Promtail y Node Exporter |
-| Seguridad | Se agregó registro de dispositivos, dashboard de seguridad y enforcement en Ryu |
-| AMI seguro | Se añadió HMAC, nonces anti-replay y métricas de telemetría válida/inválida |
-| Correcciones finales | Se estabilizó frescura de guests, dashboards, cuarentena y reautorización |
+- Estado de Kubernetes con `kubectl get nodes` y pods del namespace `sdn-controller`.
 
-Algunos commits muestran decisiones descartadas. Por ejemplo, se probaron mecanismos automáticos de bloqueo de puertos, pero luego se removieron del proyecto SDN. El diseño vigente mantiene `br0` con un árbol determinístico de puertos y `br-sdn` con control explícito desde Ryu.
+- Estado de DaemonSets y rollouts de Ryu, OVS, DHCP y meter collector.
 
-También se observa que la documentación inicial hablaba de un Ryu como `Deployment` balanceado. El estado actual del código y los manifiestos reemplaza esa idea por un `DaemonSet` local por nodo, que es más coherente con el objetivo de recuperación rápida y control distribuido.
+- APIs `/api/sdn-topology`, `/api/sdn-trace`, `/api/stats`, `/api/guests` y `/api/telemetry-security`.
 
-## 19. Decisiones de Diseño Más Relevantes
+- Claves Redis como `switch:alive:*`, `topology:vxlan_peers`, `topology:guest_locations`, `topology:guest_ips`, `mac_to_port:*` y `switch_ports:*`.
 
-| Decisión | Fundamentación |
-| --- | --- |
-| Ryu en lugar de OpenDaylight/ONOS | Menor complejidad, Python, integración rápida con Redis, Scapy y Prometheus |
-| K3s en lugar de Kubernetes completo | Menor consumo y despliegue más simple en VMs de GNS3 |
-| `DaemonSet` para Ryu | Controlador local por nodo y menor dependencia de red externa |
-| Redis Sentinel | Estado común con failover y coordinación entre servicios |
-| OVS por nodo | Dataplane local programable mediante OpenFlow |
-| VXLAN dinámico | Extiende la red SDN entre nodos sin hardcodear enlaces |
-| `br0` separado de `br-sdn` | Evita bucles y separa gestión de dataplane |
-| DHCP distribuido con locks | Responde localmente sin duplicar leases |
-| Collector local en `10.0.0.1` | Reduce dependencia central y mejora continuidad local |
-| HMAC en telemetría AMI | Aporta autenticidad, integridad y protección anti-replay |
-| Registro de seguridad | Permite autorizar, bloquear y poner en cuarentena dispositivos |
-| Observabilidad integrada | Permite diagnosticar fallos y demostrar comportamiento del sistema |
+- Logs de Ryu, DHCP y meter collector.
 
-## 20. Limitaciones y Consideraciones
+- Metricas Prometheus y paneles Grafana.
 
-El sistema está diseñado para un laboratorio GNS3, no como despliegue productivo directo. Algunas decisiones son intencionales para facilitar pruebas, reinicios y recreación de nodos.
+- Estado de nodos y enlaces en GNS3.
 
-Limitaciones actuales:
+- Pings continuos entre pares de Smart Meters elegidos segun su camino activo.
 
-| Limitación | Implicancia |
-| --- | --- |
-| PVCs Redis locales `local-path` | Mejoran persistencia frente a reinicios de pod, pero siguen atados al nodo donde se creó cada volumen |
-| Dashboards fijados al master | Simplifica acceso, pero no da HA completa a la capa visual |
-| Secretos HMAC de laboratorio | Deben gestionarse con rotación y secretos robustos en producción |
-| Seguridad centrada en AMI | El enforcement está orientado a Smart Meters y amenazas L2/L3 concretas |
-| GNS3 como entorno base | Permite experimentación, pero no replica todos los aspectos de hardware físico real |
+### Resultados de Conectividad y Carga
 
-Estas limitaciones no contradicen el objetivo del proyecto. El objetivo principal es demostrar una SDN distribuida, resiliente y observable en un entorno reproducible, y las decisiones tomadas favorecen ese objetivo.
+En una validacion previa con 5 Smart Meters, el cluster tenia 7 de 7 nodos K3s Ready. Ryu, OVS initializer, DHCP y meter collector estaban disponibles en 7 de 7 nodos. Redis Sentinel tenia master operativo y replicas sincronizadas. La telemetria mostraba 5 de 5 Smart Meters online.
 
-## 21. Validación Experimental y Resultados Actuales
+La matriz ICMP estable entre los 5 Smart Meters completo 20 de 20 pares sin perdida persistente. La latencia media global quedo alrededor de 5 ms. La prueba de carga ejecuto 20 flujos concurrentes, 2000 paquetes totales y 0 por ciento de perdida. Este resultado demostro que la arquitectura podia operar como red SDN distribuida funcional con telemetria y observabilidad activas.
 
-La validación completa se ejecutó el 2026-06-09 sobre el laboratorio activo. La prueba incluyó estado base del cluster, APIs, métricas Prometheus consumidas por Grafana, conectividad Smart Meter, carga concurrente, caída de topología y recuperación posterior.
+### Resultados de Resiliencia Recientes
 
-Estado base verificado:
+La bateria destructiva mas reciente se ejecuto con 7 Smart Meters. Antes de cada caida se eligieron pares cuyo `/api/sdn-trace` atravesaba el enlace o nodo que se iba a fallar. El baseline inicial estaba sano: 7 de 7 nodos Kubernetes Ready, sin pods no Running en `sdn-controller`, 7 de 7 Smart Meters online, 7 de 7 workers o nodos SDN online, topologia de 15 nodos y 26 enlaces, matriz ICMP 42 de 42 OK y nodos GNS3 iniciados.
 
-| Elemento | Resultado |
-| --- | --- |
-| Nodos K3s | 7/7 `Ready` |
-| DaemonSet Ryu | 7/7 pods disponibles |
-| DaemonSet OVS initializer | 7/7 pods disponibles |
-| DaemonSet DHCP | 7/7 pods disponibles |
-| DaemonSet meter collector | 7/7 pods disponibles |
-| Redis Sentinel | Master `redis-0.redis-headless.sdn-controller.svc.cluster.local`, 2 replicas sincronizadas |
-| Topología API | 7 switches, 5 guests Smart Meter, 13 enlaces SDN/guest |
-| Grafana/Prometheus | Métricas de controladores, switches, telemetría, recursos y logs disponibles |
-| Telemetría AMI | 5/5 Smart Meters online |
+La caida del enlace `Master-1 <-> SDN-Worker-2` fue aprobada. El par probado fue SM2 hacia SM3. Antes de la caida, el camino pasaba por `2388559800552`, `2584416622385`, `2326098758569` y `3195622440816`. Durante la caida, el camino cambio y uso `2433129235981` como alternativa. El ping previo fue 5 de 5, durante la caida fue 45 de 45 y tras restaurar fue 30 de 30. La perdida fue 0 por ciento. Este es el comportamiento objetivo: el camino cambia y el trafico se mantiene.
 
-Durante la revisión se detectó una inconsistencia de topología: la web de operaciones mostraba un guest obsoleto mientras la telemetría real tenía 5 Smart Meters. La causa fue una MAC antigua de `SDNSmartMeter-5` retenida en Redis tras recreación del contenedor. Se limpió la entrada runtime de `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `health:*`, `active_mac:*` y `mac_to_port:*`. Tras expirar las ventanas de frescura, la vista operacional volvió a coincidir con la realidad: 5 guests y 5 meters.
+La caida de `SDN-Worker-1` fue parcial. El par probado fue SM3 hacia SM4. El trace siguio usando el DPID caido durante la ventana de fallo. El ping durante la caida tuvo 37.7778 por ciento de perdida. Tras restaurar, el sistema recupero baseline, pero aparecieron duplicados y una ventana de failback no limpia. Esto demuestra recuperacion final, pero no reconvergencia estricta.
 
-Pruebas de conectividad:
+La caida de `Master-3` fue parcial. El par probado fue SM1 hacia SM4. El trace mantuvo el DPID caido durante la caida. El ping durante la caida tuvo 24.4444 por ciento de perdida. No hubo 503 prolongado en esa ejecucion, pero la perdida y el estado stale indican que la exclusion de nodos caidos aun no era suficientemente rapida.
 
-| Prueba | Resultado |
-| --- | --- |
-| Matriz inicial 5 Smart Meters, 20 pares, 5 paquetes | Detectó convergencia lenta en algunos pares por expiración de flows reactivos |
-| Corrección aplicada | `FORWARDING_FLOW_IDLE_TIMEOUT` aumentado de 30s a 120s |
-| Rollout Ryu | 270s hasta 7/7 pods disponibles |
-| Matriz estable posterior, 20 pares, 10 paquetes | 0/20 fallos, 0% pérdida, promedio global 4.964 ms, peor promedio 17.387 ms |
-| Matriz final post-fallo, 20 pares, 5 paquetes | 0/20 fallos, 0% pérdida, promedio global 5.442 ms, peor promedio 14.495 ms |
+La caida de `Master-1` fue parcial. El par probado fue SM2 hacia SM3. El trace siguio mostrando el master apagado. El ping durante la caida tuvo 80 por ciento de perdida. Tras restaurar, el ping volvio a 0 por ciento de perdida y el sistema recupero baseline.
 
-Prueba de carga:
+El estado final de la bateria fue sano. Kubernetes volvio a 7 de 7 Ready, no quedaron pods no Running en `sdn-controller`, los 7 Smart Meters quedaron online, la topologia volvio a 15 nodos y 26 enlaces, la matriz ICMP final fue 42 de 42 OK y los nodos GNS3 quedaron iniciados.
 
-| Carga | Resultado |
-| --- | --- |
-| Tipo de carga | 20 flujos ICMP concurrentes todos-contra-todos |
-| Volumen | 100 paquetes por flujo, 2000 paquetes totales |
-| Duración medida | 2.31s |
-| Pérdida | 0% |
-| Promedio global por par | 12.856 ms |
-| Peor promedio por par | 25.633 ms |
-| Estado posterior | 5/5 meters online, 7/7 DaemonSets disponibles, 81 flows instalados reportados por Prometheus |
+La conclusion de resiliencia es directa. La caida de enlace cumple el objetivo de reroute automatico. Las caidas de worker, control-plane y master muestran recuperacion final, pero todavia no cumplen el criterio estricto de baja perdida y exclusion inmediata de DPIDs caidos. El siguiente trabajo tecnico debe enfocarse en invalidar mas rapido `switch:alive:*`, excluir switches no vivos en `/api/sdn-trace`, limpiar flows stale con mayor agresividad y reducir ventanas de failback.
 
-Prueba de caída y recuperación:
+### Resultados de Seguridad
 
-| Evento | Resultado medido |
-| --- | --- |
-| Nodo apagado | `SDN-Worker-2`, correspondiente a `worker-b56b35` |
-| Rol en topología | Nodo intermedio VXLAN y host de `SDNSmartMeter-3` |
-| Tráfico monitorizado | SM1 `10.0.0.14` hacia SM4 `10.0.0.12` |
-| Latencia base previa | Promedio 4.276 ms |
-| Recuperación SM1->SM4 tras caída | 87.5s desde orden de apagado |
-| Ventana de pérdida observada | 85.8s desde primer fallo hasta 5 éxitos consecutivos |
-| Estado durante caída | 6 nodos K3s `Ready`, `worker-b56b35` `NotReady`, topología reducida a 10 nodos, 4 guests y 10 enlaces |
-| Reinicio del worker | Nodo `Ready` en 94.1s desde orden de arranque |
-| Recuperación completa de topología/telemetría | 2.1s tras el primer chequeo posterior al rollout de DaemonSets |
-| Estado final | 7/7 nodos `Ready`, 7/7 DaemonSets disponibles, 12 nodos API, 5 guests, 13 enlaces, 5/5 meters online |
+Se valido el comportamiento fail-closed de HMAC con un paquete de telemetria sin firma. El contador `invalid_total` subio de `30915` a `30916`, y la razon registrada fue `missing_hmac_fields=1`. La conclusion es que el collector no acepta telemetria sin firma.
 
-Monitorización final de procesos y recursos:
+La arquitectura tambien contempla pruebas desde la maquina atacante GNS3 para MAC spoofing, IP spoofing y ARP poisoning. Estas pruebas no se validan solo mirando si un paquete pasa. Se validan revisando eventos en Ryu, estado del dispositivo en Redis, contadores de seguridad, logs y dashboard.
 
-| Métrica | Resultado |
-| --- | --- |
-| CPU por nodo tras pruebas | Entre 36.15% y 53.05% según Node Exporter |
-| Memoria por nodo tras pruebas | Entre 35.78% y 49.31% |
-| Redis | Master operativo y dos replicas `slave` |
-| Pods no `Running` | Ninguno en `sdn-controller` |
-| Logs Ryu durante caída | Eliminación esperada de flows hacia VXLAN inactivos y breves errores Redis mientras Sentinel/servicios reconvergían |
+### Resultado de VXLAN no Full-Mesh
 
-La arquitectura se recuperó correctamente de la caída de un worker intermedio sin malla completa VXLAN. La recuperación no fue instantánea porque depende de la detección de reachability, expiración/limpieza de estado y recomputo de camino, pero el sistema volvió a operar sin intervención manual. El resultado es suficiente para demostrar resiliencia de laboratorio y deja dos límites claros: el underlay virtualizado en GNS3 domina la latencia, y los flujos reactivos introducen latencia fria cuando no están instalados.
+Se valido que el sistema no construye una malla completa artificial. Con 7 nodos, una malla completa implicaria 6 peers por nodo. Redis mostro 2 a 3 peers por nodo y `missing_peer_entries=[]`. La conclusion es que la topologia VXLAN conserva vecindad real y no full-mesh.
 
-## 22. Comparación con Arquitecturas Alternativas
+### Evaluacion Final de Pruebas
 
-Para evaluar el valor del proyecto no basta compararlo solo con una SDN centralizada. En una red eléctrica real, especialmente en una red AMI con medidores inteligentes, también existe una alternativa tradicional: una red IP o Ethernet sin OpenFlow, construida con routers, switches gestionables, VLANs, ACLs, OSPF/Static Routing, VRRP/HSRP, firewalls perimetrales y sistemas de monitoreo separados. Esa arquitectura es habitual porque usa tecnologías maduras y conocidas por los equipos de operación, pero ofrece menos capacidad de reacción programable ante eventos de seguridad, cambios topológicos y grandes volúmenes de telemetría distribuida.
+El proyecto demuestra conectividad distribuida, telemetria segura, observabilidad y recuperacion final ante fallos. La parte mas fuerte es la arquitectura: cada nodo mantiene control local, Redis coordina el estado y la red puede reconstruirse sin intervencion manual en escenarios no particionados.
 
-Las tres opciones comparadas son:
+La limitacion actual esta bien identificada. En caidas completas de nodos, el sistema vuelve, pero puede conservar estado stale durante la ventana de fallo y perder mas paquetes de los aceptables para un objetivo de reconvergencia rapida. Esta conclusion no debilita el informe; lo fortalece, porque esta respaldada por pruebas reales y define con precision el trabajo pendiente.
 
-| Arquitectura | Descripción |
-| --- | --- |
-| Red tradicional sin OpenFlow | Switches/routers convencionales, VLANs, ACLs, routing estático o dinámico, firewalls y monitoreo externo |
-| SDN centralizada | OVS/OpenFlow con uno o varios controladores centrales detrás de una IP o servicio común |
-| SDN distribuida del proyecto | OVS/OpenFlow por nodo, Ryu local en `127.0.0.1`, Redis Sentinel como estado compartido, servicios distribuidos y observabilidad integrada |
+## Glosario
 
-### 22.1 Respuesta ante Caídas
+- AMI: Advanced Metering Infrastructure, infraestructura de medicion inteligente.
 
-En una red tradicional sin OpenFlow, la recuperación depende principalmente de protocolos de red clásicos. Mecanismos L2/L3 convencionales, OSPF o rutas estáticas redundantes pueden recuperar caminos, y VRRP/HSRP puede mover una gateway virtual entre routers. Estos mecanismos son robustos y ampliamente probados, pero operan con información limitada: reaccionan a enlaces, interfaces o vecinos de routing, no al estado semántico de los medidores, la seguridad AMI, la validez de la telemetría o la ubicación real de cada dispositivo final.
+- ARP: protocolo que resuelve direcciones IP a direcciones MAC dentro de una red local.
 
-En una SDN centralizada, el controlador tiene más visibilidad lógica que una red tradicional, pero introduce una dependencia fuerte del punto central. Si el controlador o su conectividad de gestión fallan, los switches pueden seguir reenviando flows ya instalados, pero no pueden resolver correctamente nuevos flujos, cambios de topología, nuevos medidores o eventos de seguridad que requieran nuevas reglas.
+- ARP poisoning: ataque que falsifica asociaciones IP-MAC para redirigir o interceptar trafico.
 
-En este proyecto, cada nodo mantiene su propio controlador Ryu local. OVS no necesita alcanzar un controlador remoto para procesar eventos OpenFlow, porque se conecta a `tcp:127.0.0.1:6653`. Redis Sentinel mantiene el estado compartido y los TTLs eliminan información obsoleta. En la prueba de caída de `SDN-Worker-2`, el sistema recuperó conectividad SM1->SM4 en 87.5s y volvió a topología completa tras reiniciar el worker sin intervención manual.
+- BGP: protocolo de routing usado para intercambiar rutas y anunciar prefijos.
 
-| Escenario de caída | Red tradicional sin OpenFlow | SDN centralizada | SDN distribuida del proyecto |
-| --- | --- | --- | --- |
-| Caída de enlace | Protocolos L2/L3 tradicionales reconvergen, pero sin conocimiento de guests AMI | El controlador recalcula si sigue accesible | LLDP/probes actualizan VXLAN, Ryu borra flows hacia peers inactivos |
-| Caída de nodo de acceso | Los dispositivos detrás del nodo quedan fuera; la red puede tardar en limpiar MAC/ARP | El controlador central detecta si recibe eventos o métricas | `switch:alive:*`, `health:*` y `active_mac:*` limpian topología y guests obsoletos |
-| Caída del controlador | No aplica si no hay controlador | Alto impacto si el endpoint central no está disponible | Impacto local: cada nodo tiene su Ryu local |
-| Reinicio de un nodo | Requiere scripts/servicios de host para reconstruir bridges y rutas | Depende de que OVS reconecte al controlador central | `ovs-sdn-initializer` reconstruye `br-sdn`, VXLAN, controller y heartbeats |
-| Recuperación observada en la prueba | No medida en este proyecto | No usada como arquitectura final | SM1->SM4 recuperó en 87.5s; worker volvió `Ready` en 94.1s |
+- Broadcast: trafico enviado a todos los equipos de un dominio de capa 2.
 
-La red tradicional puede reconverger más rápido en algunos escenarios puramente L3, sobre todo con hardware físico y protocolos bien ajustados. Sin embargo, no reconstruye por sí sola el estado lógico de una red AMI: qué medidor está autorizado, en qué puerto está, qué MAC/IP le corresponde, si su telemetría es válida o si debe quedar en cuarentena. Esa diferencia es central para el problema abordado.
+- Calico: CNI de Kubernetes que puede operar con BGP para distribuir rutas de pods.
 
-### 22.2 Seguridad
+- CNI: Container Network Interface, interfaz de red para contenedores en Kubernetes.
 
-En una red eléctrica, la seguridad no se limita a impedir acceso IP. Un medidor comprometido puede intentar suplantar otra MAC, usar la IP de otro dispositivo, enviar ARP falsos, repetir telemetría antigua, falsificar lecturas o inundar el segmento con tráfico que degrade la recolección.
+- ConfigMap: recurso Kubernetes usado para inyectar configuracion o codigo en pods.
 
-Una red tradicional suele resolver esto con VLANs, ACLs, DHCP snooping, Dynamic ARP Inspection, port security, firewalls y eventualmente NAC/802.1X. Estas medidas son útiles, pero normalmente viven repartidas en muchos equipos y no comparten contexto con la aplicación AMI. Por ejemplo, un switch puede limitar MACs por puerto, pero no necesariamente sabe si una lectura UDP firmada pertenece al medidor autorizado para ese `dpid/in_port`, ni puede correlacionar un nonce HMAC inválido con una cuarentena OpenFlow inmediata.
+- DaemonSet: recurso Kubernetes que ejecuta una copia de un pod en cada nodo.
 
-La SDN centralizada mejora la capacidad de enforcement porque el controlador puede instalar drops o redirecciones dinámicas. Su debilidad vuelve a ser la dependencia del controlador central: si hay pérdida de conectividad hacia él, la respuesta ante nuevas amenazas se degrada.
+- Dataplane: plano que reenvia paquetes segun reglas instaladas.
 
-En este proyecto, la seguridad se integra desde el acceso hasta la aplicación:
+- DHCP: protocolo de asignacion automatica de direcciones IP.
 
-| Capa | Red tradicional sin OpenFlow | SDN distribuida del proyecto |
-| --- | --- | --- |
-| Identidad del dispositivo | MAC/IP, DHCP snooping, NAC o inventario externo | Registro Redis con `device_id`, MAC, IP, DPID, puerto, rol y estado |
-| MAC spoofing | Port security por switch, configuración equipo por equipo | Ryu compara MAC observada contra registro y ubicación real |
-| IP spoofing | ACLs, DHCP snooping o reglas en firewall | Ryu valida IP observada contra dispositivo autorizado |
-| ARP poisoning | Dynamic ARP Inspection si está disponible | Ryu bloquea ARP por `10.0.0.1`, mismatches Ethernet/ARP y anuncios inválidos |
-| Telemetría falsa | Normalmente se valida en aplicación o firewall | Collector valida HMAC, nonce, timestamp y estado de seguridad |
-| Cuarentena | VLAN de cuarentena/NAC, usualmente dependiente de infraestructura externa | Ryu instala drops y el collector rechaza fuentes no autorizadas o en cuarentena |
-| Observabilidad de seguridad | Logs distribuidos entre switches/firewalls/NMS | Eventos, métricas Prometheus, Loki y dashboard unificado |
+- Dijkstra: algoritmo de camino mas corto usado para calcular rutas unicast.
 
-La ventaja de la arquitectura del proyecto es la correlación. La red no solo filtra paquetes; relaciona ubicación física/lógica, estado administrativo, identidad AMI y validez criptográfica de la telemetría. Para una red eléctrica, esto permite responder a ataques de forma más precisa: bloquear un medidor concreto sin afectar a otros, identificar si cambió de puerto, detectar si una IP fue reutilizada y reflejar el evento en Grafana.
+- DPID: Datapath ID, identificador unico de un switch OpenFlow.
 
-### 22.3 Grandes Cantidades de Tráfico
+- ECMP: Equal-Cost Multi-Path, uso de multiples rutas con igual coste.
 
-Una red eléctrica con muchos medidores produce tráfico constante y repetitivo: lecturas periódicas, eventos de calidad eléctrica, alarmas, reconexiones, mensajes de control y tráfico de mantenimiento. En una arquitectura tradicional, este tráfico se transporta bien si la red está sobredimensionada y segmentada por VLAN/subredes, pero la gestión fina del flujo suele depender de QoS estática, ACLs y capacidad de los routers/firewalls centrales.
+- Fail-closed: politica donde, ante error o falta de validacion, se deniega el trafico.
 
-El riesgo de una arquitectura tradicional es que el crecimiento se administra por configuración manual o por plantillas externas. A medida que crece el número de medidores, también crece la necesidad de mantener ACLs, rutas, reglas de firewall, listas de dispositivos y dashboards consistentes. Si se centraliza toda la telemetría en un collector único, aparece además un cuello de botella de aplicación.
+- FlowMod: mensaje OpenFlow usado para instalar, modificar o eliminar reglas.
 
-En este proyecto, el tráfico AMI se distribuye por diseño. Cada nodo tiene un collector local en `10.0.0.1`, DHCP local coordinado por Redis y Ryu local para instalar flows. Esto reduce dependencia de un collector central y evita que todos los medidores crucen la topología para entregar datos. La prueba de carga ejecutó 20 flujos ICMP concurrentes entre los 5 Smart Meters, con 2000 paquetes totales, 0% de pérdida y todos los servicios críticos disponibles al finalizar.
+- FRR: Free Range Routing, suite de protocolos de routing como OSPF y BGP.
 
-| Aspecto bajo carga | Red tradicional sin OpenFlow | SDN centralizada | SDN distribuida del proyecto |
-| --- | --- | --- | --- |
-| Instalación de política | ACL/QoS configuradas por equipo o automatización externa | Controlador central instala reglas | Ryu local instala flows y coordina estado en Redis |
-| Telemetría AMI | Puede concentrarse en uno o pocos collectors | Depende del diseño de servicios | Collector local por nodo con `hostNetwork` |
-| Escalamiento operativo | Aumenta complejidad de VLANs, ACLs, rutas y firewalls | Aumenta carga del controlador central | Aumentan instancias DaemonSet por nodo y estado compartido |
-| Fallo bajo ráfagas | Riesgo de saturar enlaces/firewalls/collectors centrales | Riesgo de saturar controlador si hay muchos Packet-In | Flujos reactivos se instalan localmente; timeout de 120s reduce Packet-In repetidos |
-| Visibilidad | NMS/SNMP/NetFlow separados de la aplicación | Métricas SDN centralizadas | Prometheus une topología, flows, CPU, memoria, logs y telemetría |
+- GNS3: plataforma de emulacion de redes usada para construir el laboratorio.
 
-La arquitectura tradicional puede ofrecer mayor rendimiento bruto si usa switches y routers físicos especializados. Esa es una ventaja real: ASICs dedicados pueden reenviar a línea de cable con latencias muy bajas. Pero el problema de este proyecto no es solo reenviar paquetes; es administrar una red eléctrica distribuida con medidores identificables, telemetría validada, recuperación automática y seguridad contextual. Para ese objetivo, la programabilidad de OpenFlow y la distribución por nodo aportan más valor que una red clásica puramente estática.
+- HMAC: codigo de autenticacion basado en hash que valida integridad y autenticidad.
 
-### 22.4 Evaluación Final
+- hostNetwork: modo Kubernetes donde el pod usa directamente la red del nodo.
 
-La arquitectura del proyecto es superior a una SDN centralizada cuando se prioriza continuidad local: la caída del controlador remoto deja de ser un punto único de falla porque cada OVS habla con el Ryu de su propio nodo. También es superior a una red tradicional sin OpenFlow cuando se requiere control dinámico basado en identidad, ubicación y estado de seguridad AMI, porque las decisiones no dependen solo de VLANs o ACLs estáticas.
+- K3s: distribucion ligera de Kubernetes.
 
-No obstante, una red tradicional sigue siendo válida para entornos donde los medidores solo deben enviar datos a un backend central, el inventario cambia poco, la seguridad se delega a firewalls/NAC externos y la operación prefiere protocolos conocidos antes que programabilidad. También puede ser mejor en rendimiento puro si se implementa con hardware especializado. La arquitectura propuesta es más adecuada cuando el requisito principal es resiliencia observable y control granular: detectar fallos, reconstruir topología, validar dispositivos, aislar amenazas y mantener telemetría distribuida aun durante cambios o caídas parciales.
+- kube-vip: componente que expone una IP virtual de alta disponibilidad.
 
-## 23. Conclusión
+- LLDP: protocolo de descubrimiento de vecinos de capa 2.
 
-El proyecto implementa una plataforma SDN distribuida completa sobre GNS3 y K3s. La arquitectura final evita un controlador central único, ejecuta Ryu localmente en cada nodo, coordina el estado mediante Redis Sentinel y reconstruye automáticamente dataplane, túneles, leases, topología y métricas tras reinicios o cambios de red.
+- Loki: sistema de agregacion de logs usado junto a Grafana.
 
-La selección de Ryu fue adecuada porque permitió modificar directamente la lógica OpenFlow y construir un controlador adaptado al laboratorio: aprendizaje MAC distribuido, locks Redis, respuesta ARP local, integración con DHCP, métricas Prometheus y enforcement de seguridad.
+- MAC spoofing: suplantacion de una direccion MAC.
 
-La solución también incorpora elementos de un sistema real: observabilidad completa, dispositivos IoT simulados, telemetría firmada, registro de dispositivos autorizados, cuarentena de guests y pruebas de ataques. Por eso el resultado no es solo una prueba de conectividad SDN, sino una infraestructura experimental de control, monitoreo y seguridad para redes AMI distribuidas.
+- Meter collector: servicio que recibe, valida y almacena telemetria AMI.
 
-En síntesis, el proyecto demuestra que es posible construir una SDN resiliente con herramientas ligeras y modificables, usando Ryu como controlador programable, K3s como orquestador, Open vSwitch como dataplane y Redis Sentinel como backend de coordinación distribuida.
+- MST: Minimum Spanning Tree, arbol minimo usado para evitar bucles en broadcast.
+
+- Nonce: valor unico usado para evitar repeticion de mensajes.
+
+- OFPP_LOCAL: puerto logico de OVS que entrega paquetes al host local.
+
+- OpenFlow: protocolo usado por Ryu para controlar OVS.
+
+- OSPF: protocolo de routing interior usado para construir el fabric L3.
+
+- OVS: Open vSwitch, switch virtual programable.
+
+- Packet-In: evento enviado por OVS al controlador cuando no existe una regla aplicable.
+
+- Prometheus: sistema de recoleccion de metricas.
+
+- Promtail: agente que envia logs a Loki.
+
+- QEMU/KVM: tecnologia de virtualizacion usada para nodos Ubuntu en GNS3.
+
+- Redis Sentinel: Redis con monitorizacion y failover automatico.
+
+- Ryu: framework SDN en Python usado como controlador.
+
+- Scapy: libreria Python para construir, enviar y capturar paquetes.
+
+- SDN: Software Defined Networking, red definida por software.
+
+- Smart Meter: medidor inteligente simulado que envia telemetria.
+
+- StatefulSet: recurso Kubernetes para servicios con identidad estable y persistencia.
+
+- STP/RSTP: protocolos de arbol de expansion usados para evitar loops de capa 2.
+
+- Telemetria: datos medidos y enviados por los Smart Meters.
+
+- Underlay: red base sobre la que se construye un overlay.
+
+- VXLAN: encapsulacion de capa 2 sobre UDP para extender redes entre nodos.
+
+- VTEP: extremo de un tunel VXLAN.

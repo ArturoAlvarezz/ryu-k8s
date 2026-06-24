@@ -145,11 +145,58 @@ for i in ens3 ens4 ens5 ens6; do sysctl -wq "net.ipv4.conf.${i}.rp_filter=0" 2>/
 
 # Permitir el FORWARDING de tránsito del fabric (loopback-a-loopback). K3s/Calico
 # instalan cadenas en FORWARD que, en los nodos de tránsito, descartan el reenvío
-# de paquetes 10.255->10.255 que no son de pods -> rompe la alcanzabilidad
-# multi-salto entre loopbacks (y el camino de vuelta). Esta regla ACCEPT lo
-# garantiza; cali-FORWARD (pos 1) hace RETURN del tránsito, así que esta la captura.
+# de paquetes 10.255->10.255 que no son de pods. El anillo del fabric usa rutas
+# ASIMÉTRICAS (OSPF: ida y vuelta por caminos distintos); en los nodos de tránsito
+# conntrack ve tráfico unidireccional -> marca INVALID -> KUBE-FORWARD lo DROPEA.
+# Esta regla ACCEPT, POR ENCIMA de KUBE-FORWARD, lo evita para ICMP/TCP/UDP por igual.
 iptables -C FORWARD -s "${FABRIC_SUPERNET}.0.0/16" -d "${FABRIC_SUPERNET}.0.0/16" -j ACCEPT 2>/dev/null \
   || iptables -I FORWARD 1 -s "${FABRIC_SUPERNET}.0.0/16" -d "${FABRIC_SUPERNET}.0.0/16" -j ACCEPT
+
+# be_liberal: que conntrack NO marque INVALID los TCP fuera de ventana del tránsito
+# asimétrico (defensa extra para TCP; NO rompe NAT, a diferencia de NOTRACK -que
+# romperia el DNAT del ClusterIP del apiserver, cuyos endpoints son loopbacks
+# 10.255.x). Persistido en sysctl.d.
+sysctl -wq net.netfilter.nf_conntrack_tcp_be_liberal=1 2>/dev/null || true
+echo "net.netfilter.nf_conntrack_tcp_be_liberal=1" > /etc/sysctl.d/99-fabric-conntrack.conf
+
+# DURABILIDAD del ACCEPT: el ACCEPT se inserta en FORWARD pos 1, pero kube-proxy y
+# Calico reprograman FORWARD DESPUÉS del bootstrap (corren Before=k3s) y empujan la
+# regla por DEBAJO de KUBE-FORWARD -> tras reinicio el fabric queda fragmentado
+# (pares de loopbacks sin alcanzarse, apiserver->kubelet 502, CNI sin llegar al API).
+# Un guard re-asegura la regla por encima de KUBE-FORWARD de forma continua.
+cat > /usr/local/bin/fabric-forward-guard.sh <<GUARD
+#!/bin/sh
+# Mantiene el ACCEPT de tránsito del fabric por ENCIMA de KUBE-FORWARD.
+SUPERNET="${FABRIC_SUPERNET}"
+while true; do
+    a=\$(iptables -L FORWARD --line-numbers -n 2>/dev/null | awk -v s="\${SUPERNET}.0.0/16" '\$0 ~ s && /ACCEPT/ {print \$1; exit}')
+    k=\$(iptables -L FORWARD --line-numbers -n 2>/dev/null | awk '/KUBE-FORWARD/ {print \$1; exit}')
+    if [ -z "\$a" ] || { [ -n "\$k" ] && [ "\$a" -gt "\$k" ]; }; then
+        while iptables -D FORWARD -s "\${SUPERNET}.0.0/16" -d "\${SUPERNET}.0.0/16" -j ACCEPT 2>/dev/null; do :; done
+        iptables -I FORWARD 1 -s "\${SUPERNET}.0.0/16" -d "\${SUPERNET}.0.0/16" -j ACCEPT
+    fi
+    sleep 20
+done
+GUARD
+chmod +x /usr/local/bin/fabric-forward-guard.sh
+cat > /etc/systemd/system/fabric-forward-guard.service <<'UNIT'
+[Unit]
+Description=Mantiene el ACCEPT de transito del fabric por encima de KUBE-FORWARD
+# NO poner After=k3s.service: fabric-bootstrap corre Before=k3s y arranca este
+# guard -> un After=k3s aquí crea un CICLO de orden (bootstrap espera al guard ->
+# guard espera a k3s -> k3s espera a bootstrap) que CUELGA el arranque antes de la
+# detección del edge y FRR (los CP se quedan sin IP de gestión -> VIP caída).
+[Service]
+Restart=always
+RestartSec=10
+ExecStart=/usr/local/bin/fabric-forward-guard.sh
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable fabric-forward-guard.service 2>/dev/null || true
+# --no-block: arrancar sin BLOQUEAR el bootstrap (evita cualquier espera circular).
+systemctl --no-block start fabric-forward-guard.service 2>/dev/null || true
 
 # 3b. Edge (solo CP): la interfaz por la que el gateway responde DIRECTO (1 salto).
 edge_iface=""

@@ -20,8 +20,6 @@ jobs:
             image: arturoalvarez/meter-collector
           - service: smart-meter
             image: arturoalvarez/sdn-smart-meter
-          - service: security-device-registry
-            image: arturoalvarez/security-device-registry
           - service: ovs-sdn-initializer
             image: arturoalvarez/ovs-sdn-initializer
 
