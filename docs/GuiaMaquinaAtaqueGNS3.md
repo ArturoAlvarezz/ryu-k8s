@@ -71,9 +71,9 @@ Antes de ejecutar ataques, confirmar que el lab esta sano:
 ```bash
 python3 tools/gns3/ssh_k3s.py 'kubectl get nodes --no-headers'
 python3 tools/gns3/ssh_k3s.py 'kubectl get pods -n sdn-controller --field-selector=status.phase!=Running'
-curl -s http://192.168.122.10:8081/api/guests
-curl -s http://192.168.122.10:8081/api/sdn-topology
-curl -s http://192.168.122.10:8081/api/telemetry-security
+curl -s http://192.168.122.100:8081/api/guests
+curl -s http://192.168.122.100:8081/api/sdn-topology
+curl -s http://192.168.122.100:8081/api/telemetry-security
 ```
 
 Baseline de la ejecucion documentada:
@@ -101,8 +101,8 @@ La idea de cada ataque fue:
 Para medir resultados, se reviso principalmente:
 
 ```bash
-curl -s http://192.168.122.10:8081/api/telemetry-security
-curl -s http://192.168.122.10:8081/api/guests
+curl -s http://192.168.122.100:8081/api/telemetry-security
+curl -s http://192.168.122.100:8081/api/guests
 python3 tools/gns3/ssh_k3s.py 'kubectl logs -n sdn-controller -l app=ryu --since=20m --prefix | grep -Ei "spoof|poison|security|DETECTED|blocked" || true'
 ```
 
@@ -157,7 +157,7 @@ Si el auto-registro altera un Smart Meter legitimo, restaurar su entrada. Para S
 Enviar ese JSON a:
 
 ```bash
-curl -X POST http://192.168.122.10:8081/api/devices \
+curl -X POST http://192.168.122.100:8081/api/devices \
   -H 'Content-Type: application/json' \
   --data '<json>'
 ```
@@ -165,9 +165,9 @@ curl -X POST http://192.168.122.10:8081/api/devices \
 Luego validar:
 
 ```bash
-curl -s http://192.168.122.10:8081/api/guests
-curl -s http://192.168.122.10:8081/api/sdn-topology
-curl -s http://192.168.122.10:8081/api/stats
+curl -s http://192.168.122.100:8081/api/guests
+curl -s http://192.168.122.100:8081/api/sdn-topology
+curl -s http://192.168.122.100:8081/api/stats
 ```
 
 Estado final de la ejecucion documentada:

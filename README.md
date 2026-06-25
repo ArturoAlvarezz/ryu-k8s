@@ -34,7 +34,7 @@ La aplicación dejó de ser un simple script sobre una terminal para convertirse
 
 ## 3. Cómo Desplegar en K3s
 
-Sigue estos pasos desde cualquier nodo control-plane o estación con kubeconfig apuntando al VIP HA `https://192.168.122.10:6443`. Para reconstruir el cluster completo usa [docs/GuiaDeDespliegue.md](docs/GuiaDeDespliegue.md); esa guía es la fuente única para desplegar K3s HA y el stack SDN.
+Sigue estos pasos desde cualquier nodo control-plane o estación con kubeconfig apuntando al VIP HA `https://10.255.255.1:6443`. Para reconstruir el cluster completo usa [docs/GuiaDeDespliegue.md](docs/GuiaDeDespliegue.md); esa guía es la fuente única para desplegar K3s HA y el stack SDN.
 
 ### Paso A: Compilar la Imagen Docker
 
@@ -107,7 +107,7 @@ docker push arturoalvarez/sdn-meter-collector:latest
 kubectl apply -f deploy/k8s/05-telemetry.yaml
 ```
 
-El registro queda vacío por defecto. La consola web se expone en el servicio `meter-collector` puerto `8081`, por ejemplo `http://192.168.122.10:8081` en el despliegue HA. Desde la pestaña `Seguridad AMI` puedes autorizar guests detectados por DHCP/Ryu, cambiar su estado o eliminarlos sin ejecutar `kubectl` manualmente. Los workers se destacan aparte y se permiten automáticamente porque pertenecen a la arquitectura.
+El registro queda vacío por defecto. La consola web se expone en el servicio `meter-collector` puerto `8081`, por ejemplo `http://192.168.122.100:8081` en el despliegue HA. Desde la pestaña `Seguridad AMI` puedes autorizar guests detectados por DHCP/Ryu, cambiar su estado o eliminarlos sin ejecutar `kubectl` manualmente. Los workers se destacan aparte y se permiten automáticamente porque pertenecen a la arquitectura.
 
 Pruebas rápidas:
 

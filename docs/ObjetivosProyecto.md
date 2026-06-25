@@ -44,7 +44,7 @@ La interfaz web de operaciones debe actuar como el centro de control del estado 
 
 El mapa de topología SDN es una representación gráfica fiel y dinámica del estado físico y lógico de la red.
 * **Representación Fiel**:
-  * Mostrar con precisión las conexiones de gestión de la infraestructura (`br0`) y de transporte de datos SDN (`br-sdn`) entre todos los nodos del clúster.
+  * Mostrar con precisión las conexiones de gestión de la infraestructura (el fabric L3 / enlaces OSPF entre nodos) y de transporte de datos SDN (`br-sdn`) entre todos los nodos del clúster.
   * Los Smart Meters deben mostrarse conectados gráficamente a su respectivo nodo físico de origen (el nodo K3s donde está corriendo el switch OVS al que está conectado el dispositivo).
 * **Visualización de Caminos Reales**:
   * Al seleccionar dos Smart Meters, la interfaz debe mostrar el **camino de red real** que toman los paquetes de datos.

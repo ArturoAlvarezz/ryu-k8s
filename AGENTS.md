@@ -7,19 +7,19 @@
 
 ## System Overview
 - This project is a distributed SDN lab on K3s/GNS3. Ryu, OVS, Redis Sentinel, DHCP, topology UI, telemetry, and observability run as Kubernetes workloads.
-- The data plane is Open vSwitch on every K3s node. `ovs-sdn-initializer` creates `br-sdn`, assigns `10.0.0.1/24`, connects OVS to local Ryu, adds guest-facing `ens*` ports, and creates VXLAN tunnels to LLDP-discovered physical neighbors.
+- The data plane is Open vSwitch on every K3s node. `ovs-sdn-initializer` creates `br-sdn`, assigns `10.0.0.1/24`, connects OVS to local Ryu, adds guest-facing `ens*` ports, and creates VXLAN tunnels to direct fabric neighbors (OSPF 1-hop neighbors; VTEPs are node loopbacks `10.255.x`).
 - The control plane is distributed. Each node runs one local Ryu controller with `hostNetwork: true`; switches connect to `tcp:127.0.0.1:6653`, and controllers coordinate through Redis instead of local-only memory.
 - Redis + Sentinel is the runtime state contract for topology, MAC learning, DHCP leases, guest locations, VXLAN peers, and meter telemetry.
-- Physical management/fabric connectivity is on Linux bridge `br0`; SDN guest traffic is on OVS bridge `br-sdn`. Never merge `br0` into `br-sdn`.
-- The physical GNS3 topology may contain rings. Loops are controlled by Ryu/MST on `br-sdn`, while `br0` is kept loop-free by deterministic active bridge ports. Do not collapse physical rings into a full-mesh VXLAN design.
-- The GNS3 management switch should use image `gns3/openvswitch:latest`. Resolve the runtime container with `docker ps` because IDs change after recreation.
+- Management/fabric connectivity is an **L3 routed fabric** (FRR/OSPF *unnumbered* over `ens3`-`ens6` + per-node loopback `/32` from `machine-id`, built by `fabric-bootstrap.service`), not a Linux bridge. There is no `br0`. SDN guest traffic is on OVS bridge `br-sdn`. Never enslave fabric interfaces into `br-sdn`.
+- The physical GNS3 topology may contain rings. There are no L2 loops to control (each cable is an L3 link; OSPF/ECMP handles redundancy). On `br-sdn`, Ryu/MST controls broadcast. Do not collapse physical rings into a full-mesh VXLAN design.
+- Internet/edge: a control-plane wired to the `Mgmt-Switch`/`NAT` keeps its `192.168.122.x` IP on that interface (auto-detected by `fabric-bootstrap`), NATs the fabric and originates the OSPF default. Workers have no `192.168.122.x` address.
 
 ## Services
 - `services/ryu-controller/app.py`: Ryu OpenFlow app, Redis-backed MAC learning, gateway ARP handling for `10.0.0.1`, topology/path metrics, Prometheus `/metrics` on `METRICS_PORT` default `8000`.
 - `services/dhcp-server/app.py`: distributed Scapy DHCP daemon on `br-sdn`; allocates `10.0.0.x` from Redis and runs L2 ARP healthchecks for guests.
 - `services/meter-collector/app.py`: UDP `5555` Smart Meter collector plus Flask API/dashboard on port `5000`; K8s service exposes dashboard on `8081`. Telemetry is deny-default and is accepted only for sources registered as `authorized` in the security registry.
 - `services/smart-meter/`: Alpine-based GNS3 guest image. `entrypoint.sh` obtains DHCP via `udhcpc` before running `app.py`; telemetry goes to `COLLECTOR_IP=10.0.0.1`, `COLLECTOR_PORT=5555` by default.
-- `services/security-device-registry/`: CLI registry for authorized AMI devices backed by Redis. The web UI now lives in the unified `meter-collector` dashboard on port `8081`. It registers/lists/queries/deletes devices and validates observed `mac`/`ip`/`dpid`/`in_port` tuples used by the meter collector. Worker MACs derived from switch DPID are auto-allowed and highlighted separately.
+- AMI device registry: lives in `services/meter-collector/registry.py` and is exposed by the unified `meter-collector` dashboard/API on port `8081` (`/api/devices` POST/PATCH/DELETE, `/api/guests`). It registers/lists/queries/deletes devices and validates observed `mac`/`ip`/`dpid`/`in_port` tuples. Worker MACs derived from switch DPID are auto-allowed and highlighted separately. (The old standalone `security-device-registry` service was removed; meter-collector absorbed it.)
 
 ## Redis Runtime Contract
 - Core keys: `topology:switches`, `topology:node_names`, `topology:node_ips`, `topology:vxlan_peers`, `topology:mgmt_switch_links`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, `topology:guest_names`, `switch:alive:{dpid}`.
@@ -42,13 +42,13 @@
 - Legacy upstream helper: `upstream-ryu/run_tests.sh -N <test path>` runs tests in the current environment, then pycodestyle unless `-P` is passed.
 - Style checks are `tox -e pycodestyle` and `tox -e autopep8` from `upstream-ryu/`; pycodestyle intentionally ignores W503/W504/E116/E402/E501/E722/E731/E741 per `upstream-ryu/tox.ini`.
 - Build controller image with `docker build -t arturoalvarez/ryu-controller:latest services/ryu-controller`; the Dockerfile pins Python 3.9 slim and `setuptools<58.0.0` for old Ryu compatibility.
-- Build project images with these contexts: `services/ryu-controller`, `services/dhcp-server`, `services/meter-collector`, `services/smart-meter`, and `services/security-device-registry`.
+- Build project images with these contexts: `services/ryu-controller`, `services/dhcp-server`, `services/meter-collector`, `services/smart-meter`, and `services/ovs-sdn-initializer`.
 
 ## Cluster Access
 - Do not assume local `kubectl` or Docker reaches the lab cluster. The K3s master is reached over SSH at `ubuntu@192.168.122.100` with password `ubuntu`; use `python tools/gns3/ssh_k3s.py "kubectl get pods -n sdn-controller"` for remote commands.
-- K3s runs on `br0`; master IP is `192.168.122.100`. K3s install and worker join must use `--flannel-iface=br0`.
+- K3s `--node-ip` is the node's fabric loopback (`10.255.x`, from `machine-id`). The server runs `--flannel-backend=none --disable-network-policy` (Calico BGP provides CNI); agents join with `--node-ip=<loopback>` only. SSH to Master-1 is still its edge IP `192.168.122.100`.
 - Never commit a K3s join token. `k3s_worker_command.sh` is ignored and should take `K3S_NODE_TOKEN` from the environment.
-- Use `sudo kubectl` until `~/.kube/config` is copied from `/etc/rancher/k3s/k3s.yaml` with user-readable permissions and rewritten to the VIP `https://192.168.122.10:6443`.
+- Use `sudo kubectl` until `~/.kube/config` is copied from `/etc/rancher/k3s/k3s.yaml` with user-readable permissions and rewritten to the API VIP `https://10.255.255.1:6443` (kube-vip BGP; fabric-internal).
 
 ## GNS3 API Access
 - The local GNS3 server is usually at `http://127.0.0.1:3080/v2`. It requires Basic auth when `auth = True` in `/home/artulita/.config/GNS3/2.2/gns3_server.conf`; read `user` and `password` from that local config at runtime instead of hardcoding credentials in repository files.
@@ -61,7 +61,7 @@
 - Python app code is mounted into pods via ConfigMaps, so small code changes usually do not require rebuilding images.
 - Reload Ryu controller code with `kubectl create configmap ryu-code --from-file=app.py=services/ryu-controller/app.py -n sdn-controller -o yaml --dry-run=client | kubectl replace -f -` then `kubectl rollout restart ds ryu -n sdn-controller`.
 - ConfigMaps used by the manifest: `ryu-code` for `services/ryu-controller/app.py`, `dhcp-code` for `services/dhcp-server/app.py`, and `meter-collector-code` for `services/meter-collector/app.py`. The security registry is a web/CLI image and does not preload seed devices.
-- Public lab endpoints should use the HA API/service VIP when deployed (`192.168.122.10` by default): Prometheus `http://192.168.122.10:9090`, Grafana `http://192.168.122.10:3000`, topology UI service port `8080`, and unified meter/security dashboard service port `8081`.
+- Public lab endpoints (hostNetwork DaemonSets) are reached from the host on a control-plane edge IP, e.g. Master-1 `192.168.122.100`: Prometheus `:9090`, Grafana `:3000`, unified meter/security dashboard `:8081`. The kube-vip VIP `10.255.255.1` fronts only the API (`:6443`, fabric-internal).
 - Apply manifests by layer with `kubectl apply -f deploy/k8s/00-namespace.yaml`, then `01-database`, `02-ryu-controller`, `03-sdn-network`, `05-telemetry`, and `06-observability`; or use `kubectl apply -k deploy/k8s/`.
 - `deploy/k8s/05-telemetry.yaml` must keep `externalTrafficPolicy: Local` because `meter-collector` uses `hostNetwork`; changing it to `Cluster` can make `8081` hang through asymmetric return paths.
 
@@ -73,22 +73,22 @@
 - Topology JSON from master: `curl -s http://localhost:8081/api/sdn-topology`.
 - Meter collector stats from master/fabric: `curl http://192.168.122.100:8081/api/stats`.
 - Telemetry security state: `curl http://192.168.122.100:8081/api/telemetry-security` and `curl http://192.168.122.100:8081/api/guests`.
-- Verify the deterministic `br0` tree on a node: inspect `/etc/default/gns3-br0-tree`, `ACTIVE_BR0_PORTS`, and `bridge link show` for the ports currently enslaved to `br0`.
-- Verify the GNS3 management switch connectivity by resolving the `gns3/openvswitch:latest` container with `docker ps`, then checking its `br0` ports with `ovs-vsctl list-ports br0`.
+- Verify the L3 fabric on a node: `ip -br -4 addr show lo` (loopback `10.255.x/32`), `systemctl status fabric-bootstrap.service frr.service`, and `sudo vtysh -c 'show ip ospf neighbor'` (FULL adjacencies per cable).
+- Verify edge/internet on a control-plane: `ip -br -4 addr show` shows `192.168.122.x` on the edge interface, and `sudo vtysh -c 'show bgp ipv4 summary'` shows kube-vip/Calico peering with the local FRR (`127.0.0.1`).
 
 ## Architecture Gotchas
-- **VXLAN topology is neighbor-only (LLDP), NOT full mesh.** `ovs-sdn-initializer` must read `topology:links` from Redis and create one VXLAN tunnel per LLDP-discovered physical neighbor, not one per known node in `topology:node_ips`. Full mesh was a rejected alternative: it is `O(n²)`, does not scale past ~50 nodes, and defeats the purpose of multi-hop Dijkstra path stitching. The MST/Dijkstra design in `services/ryu-controller/app.py` assumes a sparse graph (typically 2 neighbors per node in a ring/chain), not a clique.
+- **VXLAN topology is neighbor-only, NOT full mesh.** `ovs-sdn-initializer` creates one VXLAN tunnel per **direct fabric neighbor** — the OSPF 1-hop neighbors (`/32` routes where dst == next-hop), published to `topology:vxlan_peers` in Redis — not one per known node in `topology:node_ips`. VTEPs are the node loopbacks, so each tunnel rides the direct cable. Full mesh was a rejected alternative: it is `O(n²)`, does not scale, and defeats multi-hop Dijkstra path stitching. The MST/Dijkstra design in `services/ryu-controller/app.py` assumes a sparse graph (typically 2 neighbors per node in a ring/chain), not a clique.
 - Redis keys are part of the runtime contract: `topology:switches`, `topology:node_names`, `topology:node_ips`, `switch_ports:{dpid}`, `mac_to_port:{dpid}`, `topology:guest_ips`, `topology:guest_locations`, and `meter:*` are consumed across services.
 - DPID formatting differs by context: Ryu often uses decimal datapath IDs; topology/node metadata uses raw hex strings like `0000` plus 12 hex digits. Preserve existing conversions.
 - DHCP depends on Ryu sending broadcast traffic to `OFPP_LOCAL`; changing FLOOD/local OpenFlow behavior can break Scapy DHCP on `br-sdn` even if packets still traverse OVS.
-- `ovs-sdn-initializer` must not add management bridge `br0` to `br-sdn`; doing so risks L2 loops in the GNS3/K3s fabric.
+- `ovs-sdn-initializer` must not add fabric interfaces (`ens3`-`ens6`) to `br-sdn`; they must stay as L3 OSPF links. Mixing the management fabric into `br-sdn` breaks routing and the SDN plane.
 - Ryu metrics are served directly by `services/ryu-controller/app.py` on `METRICS_PORT` default `8000`; Prometheus discovers pods via scrape annotations in the manifest.
 - The DHCP ARP healthcheck must avoid poisoning guest ARP caches: only the master DHCP pod should use `psrc=10.0.0.1`; worker DHCP pods should use `psrc=0.0.0.0`.
-- `br-sdn` should use the same MAC as `br0`. Ryu derives the gateway MAC for `10.0.0.1` from the node DPID.
+- The `br-sdn` DPID is derived from the node's **fabric loopback** (`get_br0_ip()` in `03-sdn-network.yaml` returns the loopback, not a `br0` IP). Ryu derives the gateway MAC for `10.0.0.1` from the node DPID. Preserve this loopback-based derivation.
 - Smart Meters must obtain a DHCP lease before starting telemetry; do not revert `services/smart-meter/entrypoint.sh` to a finite retry loop unless deployment ordering guarantees DHCP availability.
 - The meter collector must remain fail-closed: if Redis/security lookup is unavailable or a source IP is not registered as `authorized`, telemetry is rejected and counted under `/api/telemetry-security`.
 - Guest freshness matters. Avoid reintroducing stale guests into metrics/topology without checking live state such as `active_mac:*`, `health:*`, or current OVS FDB evidence.
-- `ovs-sdn-initializer` must not hardcode GNS3 node names, worker IDs, or neighbor IPs. Topology data must come from runtime discovery such as LLDP, Kubernetes node metadata, and Redis heartbeats because lab nodes are frequently recreated.
+- `ovs-sdn-initializer` must not hardcode GNS3 node names, worker IDs, or neighbor IPs. Topology data must come from runtime discovery such as OSPF neighbor routes (fabric peers), Kubernetes node metadata, and Redis heartbeats because lab nodes are frequently recreated.
 
 ## Roadmap Context
 - Completed: Smart Meter guest image and telemetry collector.

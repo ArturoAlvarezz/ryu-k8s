@@ -6,9 +6,9 @@ La arquitectura SDN distribuida sobre K3s/GNS3 debe mantener la conectividad ent
 
 ## Arquitectura Actual
 
-- `br0` es el plano de gestión/fabric de K3s. Usa un árbol determinístico de puertos definido por `ACTIVE_BR0_PORTS` y aplicado por `gns3-br0-tree.service`.
+- El plano de gestión/fabric de K3s es un **fabric L3 enrutado** (FRR/OSPF *unnumbered* + loopbacks `/32` derivadas de `machine-id`, montado por `fabric-bootstrap.service`). OSPF da alcanzabilidad + ECMP (es el failover); ya no hay `br0`, ni árbol `ACTIVE_BR0_PORTS`, ni daemons de failover L2.
 - `br-sdn` es el dataplane de guests AMI. Es un OVS controlado por Ryu local en cada nodo mediante `tcp:127.0.0.1:6653`.
-- Los túneles VXLAN se crean solo hacia vecinos físicos directos descubiertos por LLDP. No se permite malla completa.
+- Los túneles VXLAN se crean solo hacia vecinos directos del fabric (vecinos OSPF de 1 salto); el VTEP es la loopback del nodo. No se permite malla completa.
 - Ryu calcula MST para broadcast controlado y Dijkstra para tráfico unicast multi-hop entre Smart Meters.
 - Redis Sentinel mantiene estado compartido de topología, MAC learning, leases DHCP, seguridad AMI y telemetría.
 
