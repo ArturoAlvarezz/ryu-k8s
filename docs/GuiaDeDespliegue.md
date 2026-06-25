@@ -10,9 +10,10 @@ Guía genérica para desplegar el laboratorio desde cero. El cableado y la canti
 > *unnumbered* punto a punto y cada nodo tiene una **loopback `/32`** estable
 > (`10.255.B1.B2`, derivada de `sha256(/etc/machine-id)`). Lo monta
 > `fabric-bootstrap.service` (`tools/gns3/l3-fabric/`) antes de K3s. OSPF da
-> alcanzabilidad + ECMP (es el failover; no hay daemons), kube-vip BGP anuncia el VIP del
-> API `10.255.255.1` y Calico BGP las rutas de pods. Detalle y motivación en
-> [`docs/MIGRACION_L3_FABRIC.md`](MIGRACION_L3_FABRIC.md).
+> alcanzabilidad + ECMP (es el failover; no hay daemons), kube-vip anuncia el VIP del
+> API (`10.255.255.1` por OSPF en el fabric + `192.168.122.10` por ARP para el host) y
+> Calico da la red de pods (CNI, VXLAN). FRR corre **solo `ospfd`** (BGP lo lleva Calico).
+> Detalle y motivación en [`docs/MIGRACION_L3_FABRIC.md`](MIGRACION_L3_FABRIC.md).
 
 ---
 
@@ -60,7 +61,8 @@ Guía genérica para desplegar el laboratorio desde cero. El cableado y la canti
 | Control-plane adicional | 2 | loopback `10.255.x` | `192.168.122.x` fija | `server` unido al primero |
 | Worker | Según topología | loopback `10.255.x` | — (sin IP de gestión) | `agent` con auto-join |
 | Smart Meter (guest) | Según topología | DHCP en `br-sdn` (`10.0.0.0/24`) | — | No es nodo del cluster |
-| VIP API Server | 1 | `10.255.255.1` | — | Anunciado por `kube-vip` (BGP) |
+| VIP API (fabric) | 1 | `10.255.255.1` | — | kube-vip **BGP** (interno al fabric, lo usan los agentes) |
+| VIP API (host) | 1 | — | `192.168.122.10` | kube-vip **ARP** (acceso del host + dashboards) |
 
 El endpoint final del cluster es siempre el VIP del API (interno al fabric):
 
@@ -272,30 +274,35 @@ sudo kubectl get nodes -o wide
 sudo kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide
 ```
 
-Con los 3 control-plane como miembros etcd, despliega **kube-vip en modo BGP** (peerea con el
-FRR local y anuncia el VIP del API `10.255.255.1/32`) e instala **Calico** (CNI) con peering
-BGP al FRR local:
+Con los 3 control-plane como miembros etcd, despliega **kube-vip híbrido** (VIP BGP
+`10.255.255.1` interno al fabric + VIP ARP `192.168.122.10` para el host) e instala **Calico**:
 
 ```bash
 cd ~/ryu-k8s
-sudo ./tools/gns3/deploy-kube-vip.sh all        # RBAC + DaemonSet BGP (deploy/k8s/l3-fabric/kube-vip-bgp.yaml)
+sudo ./tools/gns3/deploy-kube-vip.sh all   # kube-vip-arp (host) + kube-vip-bgp (fabric)
 
-# Calico (operador Tigera) + el BGPConfiguration/peers del fabric:
+# Calico (operador Tigera) + Installation (VXLAN) + APIServer:
 kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
-kubectl apply -f deploy/k8s/l3-fabric/calico-bgp.yaml
+kubectl apply -f deploy/k8s/l3-fabric/calico-fabric.yaml
 
-# Tras unos segundos los nodos pasan a Ready y el VIP responde (desde un CP):
+# Tras unos segundos los nodos pasan a Ready y el VIP responde:
 sudo kubectl get nodes -o wide
-curl -k https://10.255.255.1:6443/readyz
+sudo kubectl -n calico-system get pods -l k8s-app=calico-node   # deben quedar 1/1
+curl -k https://192.168.122.10:6443/readyz                       # VIP ARP, desde el host
 ```
 
-`ok` = credenciales locales válidas. `401 Unauthorized` = el VIP funciona (el API respondió sin
-credenciales). Lo que NO debe ocurrir es timeout, conexión rechazada o ruta inalcanzable.
-Verifica el peering BGP con `sudo vtysh -c 'show bgp ipv4 summary'` (kube-vip y Calico
-establecidos contra `127.0.0.1`).
+`401 Unauthorized` = el VIP funciona (el API respondió sin credenciales). Lo que NO debe ocurrir
+es timeout, conexión rechazada o ruta inalcanzable. El VIP BGP (`10.255.255.1`) se prueba **desde
+un nodo** (es interno al fabric): `curl -k https://10.255.255.1:6443/readyz`.
 
-> Ajusta la versión del operador de Calico (`v3.28.0`) a la del cluster si difiere. El
-> `calico-bgp.yaml` del repo desactiva la malla nativa y fija el peer al FRR local.
+> **Calico en este fabric (importante).** El dataplane es **VXLAN** (`encapsulation: VXLAN` en
+> `calico-fabric.yaml`). El routing **nativo** sin encap **NO funciona** en esta topología L3
+> multi-salto (Calico sin encap exige nodos L2-adyacentes; aquí el kernel no instala las rutas de
+> pod a nodos no adyacentes). Calico corre su **malla BGP** (BIRD) sobre las loopbacks → los
+> `calico-node` quedan `1/1`; para ello **FRR debe correr solo `ospfd`** (`bgpd=no`, lo fija
+> `fabric-bootstrap.sh`) y así el BIRD de Calico toma el `:179`. El `calico-apiserver` (CR
+> `APIServer` en `calico-fabric.yaml`) es **imprescindible**: sin él el operador no puede
+> gestionar los IPPools. Ajusta la versión del operador (`v3.28.0`) a la del cluster si difiere.
 
 ## 8. Configurar kubeconfig
 
@@ -306,6 +313,8 @@ mkdir -p ~/.kube
 sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
 sudo chown $(id -u):$(id -g) ~/.kube/config
 chmod 600 ~/.kube/config
+# En un nodo (alcanza el fabric): apunta al VIP BGP. Desde el HOST, usa el VIP ARP
+# 192.168.122.10 (el host no alcanza la /32 del fabric) o ejecuta kubectl vía ssh_k3s.py.
 sed -i 's#https://127.0.0.1:6443#https://10.255.255.1:6443#g' ~/.kube/config
 grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.bashrc || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.bashrc
 grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.profile || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.profile
@@ -647,15 +656,16 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" node-ip="}{.s
 CNI (Calico) y BGP sanos:
 
 ```bash
-kubectl -n calico-system get pods -o wide
-kubectl -n kube-system get pods -l app=kube-vip -o wide
-# Peering BGP (kube-vip + Calico contra el FRR local) desde un control-plane:
-sudo vtysh -c 'show bgp ipv4 summary'
-sudo vtysh -c 'show ip route 10.255.255.1'   # el VIP del API por BGP
+kubectl -n calico-system get pods -l k8s-app=calico-node -o wide   # 1/1
+kubectl -n kube-system get pods -l app=kube-vip-bgp -o wide        # VIP fabric
+kubectl -n kube-system get pods -l app=kube-vip -o wide            # VIP host (ARP)
+# La malla BGP de Calico (BIRD) la ves dentro de calico-node, no en FRR (que es solo OSPF):
+sudo vtysh -c 'show ip route 10.255.255.1'   # /32 del VIP, aprendida por OSPF
 ```
 
-El VIP del API (`10.255.255.1`) lo anuncia kube-vip por BGP desde cada control-plane; con
-ECMP no depende de un "líder" L2. Para ver kube-vip:
+El VIP `10.255.255.1` se propaga por **OSPF**: kube-vip-bgp lo añade a `lo` (que está
+OSPF-enabled) y OSPF lo inunda fabric-wide. El líder (lease `plndr-cp-lock-bgp`) lo sostiene;
+si cae, otro CP lo toma y reanuncia. Para ver kube-vip:
 
 ```bash
 kubectl -n kube-system logs -l app=kube-vip --tail=50 --prefix
@@ -764,24 +774,27 @@ sudo /usr/local/bin/k3s-agent-uninstall.sh
 sudo systemctl restart k3s-autojoin.service
 ```
 
-### 18.2 VIP del API no responde (kube-vip BGP)
+### 18.2 VIP del API no responde
 
 ```bash
+# VIP fabric (10.255.255.1):
+kubectl -n kube-system get pods -l app=kube-vip-bgp -o wide
+kubectl -n kube-system logs -l app=kube-vip-bgp --tail=120 --prefix
+# VIP host (192.168.122.10):
 kubectl -n kube-system get pods -l app=kube-vip -o wide
-kubectl -n kube-system logs -l app=kube-vip --tail=120 --prefix
 ```
 
-El VIP `10.255.255.1/32` se anuncia por **BGP** desde cada control-plane hacia su FRR local
-(`127.0.0.1`). Verifica el peering y la ruta (en un control-plane):
+El VIP `10.255.255.1/32` se propaga por **OSPF** (no por BGP en FRR): kube-vip-bgp lo añade a
+`lo` (OSPF-enabled) y OSPF lo inunda. Verifica la ruta y quién lo sostiene (en un control-plane):
 
 ```bash
-sudo vtysh -c 'show bgp ipv4 summary'        # vecino 127.0.0.1 Established
-sudo vtysh -c 'show ip route 10.255.255.1'   # /32 presente (vía BGP/OSPF)
-kubectl -n kube-system get ds kube-vip -o yaml | grep -E 'bgp_|vip_address|address'
+sudo vtysh -c 'show ip route 10.255.255.1'   # /32 presente (vía OSPF)
+ip -br -4 addr show lo | grep 10.255.255.1    # el CP líder lo tiene en lo
+kubectl -n kube-system get lease plndr-cp-lock-bgp -o jsonpath='{.spec.holderIdentity}{"\n"}'
 ```
 
-Si no aparece la ruta: revisa que `bgpd` esté activo (`/etc/frr/daemons`) y que el manifiesto
-`kube-vip-bgp.yaml` tenga `bgp_peeraddress=127.0.0.1` y el ASN del fabric (64512).
+Si no aparece la ruta: confirma que el pod `kube-vip-bgp` está `1/1` en algún CP y que su `lo`
+tiene el VIP. El VIP host `192.168.122.10` (ARP, lease `plndr-cp-lock`) es independiente.
 
 ### 18.3 InternalIP no es la loopback del fabric
 
@@ -939,7 +952,8 @@ Comprobaciones (en cualquier nodo):
 ```bash
 sudo vtysh -c 'show ip ospf neighbor'        # FULL en cada cable con vecino
 sudo vtysh -c 'show ip route 10.255.0.0/16'  # loopbacks alcanzables; multipath = ECMP
-sudo vtysh -c 'show bgp ipv4 summary'        # kube-vip + Calico Established (127.0.0.1)
+# La malla BGP es de Calico (BIRD), no de FRR; se ve dentro de calico-node:
+sudo kubectl -n calico-system get pods -l k8s-app=calico-node   # 1/1 = malla BGP OK
 ```
 
 ### 20.2 Prueba de caída de un enlace

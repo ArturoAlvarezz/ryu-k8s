@@ -111,6 +111,7 @@ sed -i "s#https://127.0.0.1:6443#https://${API_ENDPOINT}:6443#g; s#https://${NOD
 chown -R ubuntu:ubuntu /home/ubuntu/.kube
 
 echo "k3s-server-ha-install: $NODE_NAME server listo (node-ip=$NODE_IP, VIP=$API_ENDPOINT)."
-echo "  Tras el PRIMER server: aplica kube-vip BGP y Calico:"
+echo "  Tras los 3 servers: kube-vip híbrido + Calico (operador + apiserver):"
 echo "    sudo ./tools/gns3/deploy-kube-vip.sh all"
-echo "    kubectl apply -f deploy/k8s/l3-fabric/calico-bgp.yaml"
+echo "    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml"
+echo "    kubectl apply -f deploy/k8s/l3-fabric/calico-fabric.yaml"

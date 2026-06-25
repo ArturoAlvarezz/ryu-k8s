@@ -1,0 +1,37 @@
+# Calico para el fabric L3 (operador Tigera) — CONFIG QUE FUNCIONA EN ESTA TOPOLOGÍA.
+#
+# Aplicar DESPUÉS del operador:
+#   kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+#   kubectl apply -f deploy/k8s/l3-fabric/calico-fabric.yaml
+#
+# CLAVES de esta topología (fabric L3 multi-salto):
+#  - encapsulation: VXLAN. El routing NATIVO (sin encap) NO es viable aquí: Calico sin
+#    encap exige nodos L2-adyacentes o que el underlay distribuya los CIDR de pod; con
+#    nodos multi-salto (cada cable es L3/OSPF) el kernel no instala las rutas de pod.
+#    VXLAN encapsula sobre las loopbacks (que SÍ son alcanzables por OSPF) -> funciona.
+#  - bgp: Enabled. Calico corre su BIRD y forma una malla BGP node-to-node sobre las
+#    loopbacks -> los calico-node quedan 1/1 (su readiness chequea BIRD). REQUIERE que
+#    FRR corra SOLO ospfd (bgpd=no, lo fija fabric-bootstrap.sh) para que BIRD tome :179.
+#  - APIServer: imprescindible. Sin el calico-apiserver el operador no puede gestionar
+#    los IPPools ("Unable to modify IP pools while Calico API server is unavailable").
+---
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    bgp: Enabled
+    ipPools:
+    - name: default-ipv4-ippool
+      cidr: 10.42.0.0/16
+      encapsulation: VXLAN
+      natOutgoing: Enabled
+      nodeSelector: all()
+      blockSize: 26
+---
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}
