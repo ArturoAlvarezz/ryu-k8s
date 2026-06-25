@@ -990,7 +990,7 @@ class DistributedL2Switch(app_manager.RyuApp):
                 if peer_dpid_str and not self._is_switch_alive(peer_dpid_str):
                     return False
                 # El peer puede estar VIVO pero el enlace/tunel directo caido
-                # (corte de enlace br0): si ya no figura como vecino VXLAN de este
+                # (corte de cable del fabric): si ya no figura como vecino VXLAN de este
                 # switch, el tunel no transporta -> puerto no apto para forwarding.
                 # fail-open si vxlan_peers esta vacio (lapso transitorio del
                 # heartbeat) para no romper el forwarding sano.

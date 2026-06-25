@@ -77,7 +77,7 @@ spec:
         - /bin/bash
         - -c
         - |
-          get_br0_ip() {
+          get_fabric_ip() {
             # Fabric L3: el "IP de gestion" del nodo es su loopback /32 (no br0).
             # Se excluye el VIP anycast del API (10.255.255.1).
             ip -4 -o addr show lo 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
@@ -86,7 +86,7 @@ spec:
 
           wait_for_management_plane() {
             while true; do
-              MY_IP=$(get_br0_ip)
+              MY_IP=$(get_fabric_ip)
               if [ -z "$MY_IP" ]; then
                 echo "loopback del fabric aun no asignada; esperando..."
                 sleep 3
@@ -225,7 +225,7 @@ spec:
           # (Redis puede tardar segundos/minutos en ser alcanzable desde un worker
           # recien reiniciado). Los tuneles VXLAN y el registro en Redis se hacen
           # DESPUES (wait_for_management_plane), sin bloquear la creacion de br-sdn.
-          while [ -z "$(get_br0_ip)" ]; do
+          while [ -z "$(get_fabric_ip)" ]; do
             echo "loopback del fabric aun no asignada; esperando para el DPID..."
             sleep 2
           done
@@ -243,7 +243,7 @@ spec:
           # NO usar /etc/machine-id: en un pod es la del CONTENEDOR (igual en todos
           # los pods de la imagen) -> colisión de DPID. La loopball la pone el
           # fabric-bootstrap en el host y es única por nodo. MAC localmente-admin.
-          MAC6=$(get_br0_ip | sha256sum | cut -c1-10)
+          MAC6=$(get_fabric_ip | sha256sum | cut -c1-10)
           BR0_MAC="02:${MAC6:0:2}:${MAC6:2:2}:${MAC6:4:2}:${MAC6:6:2}:${MAC6:8:2}"
           MAC_ADDR=$(echo "$BR0_MAC" | tr -d ':')
           DPID="0000${MAC_ADDR}"
@@ -290,7 +290,7 @@ spec:
           wait_for_management_plane
 
           echo "Obteniendo IP del Redis Master via Sentinel..."
-          MY_IP=$(get_br0_ip)
+          MY_IP=$(get_fabric_ip)
           MASTER_IP=$(get_redis_master)
           if [ -n "$MASTER_IP" ] && redis-cli -h $MASTER_IP PING > /dev/null 2>&1; then
             redis-cli -h $MASTER_IP HSET topology:node_names $DPID $NODE_NAME || true
@@ -315,9 +315,9 @@ spec:
             refresh_table_miss
             refresh_gateway_flows
 
-            MY_IP=$(get_br0_ip)
+            MY_IP=$(get_fabric_ip)
             if [ -z "$MY_IP" ]; then
-              echo "br0 perdio IPv4 de gestion; pausando heartbeat SDN..."
+              echo "loopback del fabric no disponible; pausando heartbeat SDN..."
               sleep 3
               continue
             fi
@@ -449,13 +449,15 @@ spec:
               echo "$now" > "$COST_INTERVAL_FILE"
             fi
 
-            # Añadir Guests en cualquier interfaz ensX que NO pertenezca a br0
+            # Añadir Guests: las ensX de guest (ens7+) que NO sean del fabric ni
+            # esten ya enslavadas a un bridge. ens3-6 son enlaces L3 del fabric y
+            # se excluyen explicitamente de br-sdn.
             for fabric_intf in ens3 ens4 ens5 ens6; do
               ovs-vsctl --if-exists del-port br-sdn "$fabric_intf" > /dev/null 2>&1 || true
             done
 
             for intf in $(ls /sys/class/net | grep -E "^ens[7-9]$|^ens[1-9][0-9]$"); do
-              if ip link show $intf | grep -q "master br0"; then continue; fi
+              if ip link show $intf | grep -q "master "; then continue; fi
 
               if ! ovs-vsctl list-ports br-sdn | grep -q "^$intf$"; then
                 echo "Auto-detectado nuevo Guest en $intf. Añadiendo a la red SDN..."
