@@ -934,9 +934,9 @@ def physical_edges(redis, dpids, ip_to_dpid):
                 "id": edge_id,
                 "source": source,
                 "target": target,
-                "type": "br0_physical",
+                "type": "fabric_physical",
                 "status": "up",
-                "label": "br0 fisico",
+                "label": "Fabric fisico",
                 "port": "",
                 "remote_ip": remote_ip,
                 "details_list": [],
@@ -1048,16 +1048,16 @@ def build_sdn_topology(redis):
             if str(name).startswith("worker"):
                 continue
             edge_id = f"mgmt:{dpid}:mgmt-switch"
-            ports = redis.hget("topology:mgmt_switch_links", raw) or "br0"
+            ports = redis.hget("topology:mgmt_switch_links", raw) or "edge"
             edges_by_id[edge_id] = {
                 "id": edge_id,
                 "source": dpid,
                 "target": "mgmt-switch",
-                "type": "br0_mgmt_switch",
+                "type": "mgmt_link",
                 "status": "up" if dpid in alive else "stale",
-                "label": "br0 mgmt",
+                "label": "Gestion",
                 "port": ports,
-                "details": f"Plano de management br0 ({ports})",
+                "details": f"Plano de gestion / edge a internet ({ports})",
             }
 
     edges = []
