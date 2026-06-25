@@ -1,14 +1,15 @@
 #!/bin/bash
-# Prepare a GNS3 VM as the reusable K3s worker Golden Image.
+# Prepare a GNS3 VM as the reusable K3s worker Golden Image (L3 routed fabric).
+#
+# El nodo arranca en el fabric L3 (FRR/OSPF unnumbered + loopback /32 derivada de
+# /etc/machine-id), SIN br0 ni DHCP de gestion. `fabric-bootstrap.service` monta el
+# fabric antes de K3s y `k3s-autojoin.service` une el worker contra el VIP del API
+# (10.255.255.1, anunciado por kube-vip BGP). El br0/L2 antiguo queda erradicado.
 set -euo pipefail
 
 JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-${1:-}}}"
-API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-192.168.122.10}}"
-NODE_NAME="${RYU_K3S_NODE_NAME:-${K3S_NODE_NAME:-$(hostname)}}"
-NODE_PREFIX="${RYU_K3S_NODE_PREFIX:-24}"
-NODE_GATEWAY="${RYU_K3S_NODE_GATEWAY:-192.168.122.1}"
-NODE_DNS="${RYU_K3S_NODE_DNS:-$NODE_GATEWAY}"
-ALL_PORTS="${RYU_K3S_BR0_PORTS:-ens3 ens4 ens5 ens6}"
+API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-10.255.255.1}}"
+K3S_VERSION="${RYU_K3S_VERSION:-v1.35.5+k3s1}"
 REPO_DIR="${RYU_K3S_REPO_DIR:-$PWD}"
 SKIP_APT_UPGRADE="${RYU_K3S_SKIP_APT_UPGRADE:-false}"
 
@@ -19,7 +20,8 @@ Usage:
 
 Environment overrides:
   RYU_K3S_NODE_TOKEN        Required K3s cluster token for worker auto-join
-  RYU_K3S_API_ENDPOINT      API VIP, default 192.168.122.10
+  RYU_K3S_API_ENDPOINT      API VIP del fabric, default 10.255.255.1
+  RYU_K3S_VERSION           Version de K3s a instalar (debe coincidir con el cluster)
   RYU_K3S_SKIP_APT_UPGRADE  true to skip apt upgrade
 EOF
 }
@@ -37,6 +39,11 @@ validate_inputs() {
     usage >&2
     exit 1
   fi
+  if [ ! -f "$REPO_DIR/tools/gns3/l3-fabric/fabric-bootstrap.sh" ]; then
+    echo "ERROR: no encuentro tools/gns3/l3-fabric/fabric-bootstrap.sh bajo RYU_K3S_REPO_DIR=$REPO_DIR" >&2
+    echo "       Ejecuta el script desde la raiz del repo o define RYU_K3S_REPO_DIR." >&2
+    exit 1
+  fi
 }
 
 resize_root_if_possible() {
@@ -51,7 +58,8 @@ resize_root_if_possible() {
 install_base_packages() {
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    ca-certificates curl git net-tools cloud-guest-utils
+    ca-certificates curl git net-tools cloud-guest-utils \
+    frr frr-pythontools iptables
 }
 
 upgrade_packages() {
@@ -79,108 +87,60 @@ EOF
   usermod -aG docker ubuntu 2>/dev/null || true
 }
 
-yaml_list() {
-  printf '['
-  first_item=true
-  for item in $1; do
-    if [ "$first_item" = true ]; then
-      first_item=false
-    else
-      printf ', '
-    fi
-    printf '%s' "$item"
-  done
-  printf ']'
-}
-
-default_active_ports() {
-  case "$NODE_NAME" in
-    worker-24cf41) echo "ens5" ;;
-    worker-b0ff27) echo "ens3 ens4 ens5" ;;
-    worker-b56b35) echo "ens3 ens4" ;;
-    worker-ea7e34) echo "ens3" ;;
-    *) echo "ens3" ;;
-  esac
-}
-
 configure_hostname() {
+  # Hostname provisional de la imagen; el clon se renombra a worker-<mac> en el
+  # primer arranque (k3s-autojoin). preserve_hostname:false permite ese cambio.
   hostnamectl set-hostname worker-golden
   printf 'worker-golden\n' >/etc/hostname
   sed -i '/127.0.1.1/d' /etc/hosts
   printf '127.0.1.1 worker-golden\n' >>/etc/hosts
   mkdir -p /etc/cloud/cloud.cfg.d
   printf 'preserve_hostname: false\n' >/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
-  # Evitar que cloud-init regenere /etc/netplan/50-cloud-init.yaml en cada boot
-  # y sobrescriba el netplan del arbol loop-free (ver nota en el control-plane).
+  # Evitar que cloud-init regenere el netplan en cada boot y reintroduzca br0:
+  # la red del fabric L3 la gestiona por completo fabric-bootstrap.service.
   printf 'network: {config: disabled}\n' >/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 }
 
-write_netplan() {
-  dns_list=$(yaml_list "$NODE_DNS")
-  active_ports=${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}
-  port_list=$(yaml_list "$active_ports")
-
-  cat >/etc/netplan/50-cloud-init.yaml <<EOF
+write_l3_netplan() {
+  # Netplan minimo del fabric L3: ens* como interfaces L3 sueltas (sin br0, sin
+  # DHCP). fabric-bootstrap les asigna la loopback /32 unnumbered y levanta OSPF.
+  # Se elimina cualquier netplan previo con br0/bridges (imagen L2 antigua).
+  rm -f /etc/netplan/50-cloud-init.yaml
+  cat >/etc/netplan/50-l3-fabric.yaml <<'EOF'
 network:
   version: 2
+  renderer: networkd
   ethernets:
-    ens3:
-      dhcp4: false
+    fabric-ens:
+      match: {name: "ens*"}
       optional: true
-    ens4:
-      dhcp4: false
-      optional: true
-    ens5:
-      dhcp4: false
-      optional: true
-    ens6:
-      dhcp4: false
-      optional: true
-    ens7:
-      dhcp4: false
-      optional: true
-    ens8:
-      dhcp4: false
-      optional: true
-  bridges:
-    br0:
-      interfaces: $port_list
-      dhcp4: true
-      dhcp-identifier: mac
-      nameservers:
-        addresses: $dns_list
-      parameters:
-        stp: false
 EOF
-  chmod 600 /etc/netplan/50-cloud-init.yaml
-  netplan apply
+  chmod 600 /etc/netplan/50-l3-fabric.yaml
+  netplan generate >/dev/null 2>&1 || true
 }
 
-install_br0_service() {
-  install -m 0755 "$REPO_DIR/tools/gns3/configure-br0-tree.sh" /usr/local/bin/configure-br0-tree.sh
+install_fabric_service() {
+  # Artefactos canonicos del fabric L3 (identicos en CP y worker).
+  install -m 0755 "$REPO_DIR/tools/gns3/l3-fabric/fabric-bootstrap.sh" \
+    /usr/local/bin/fabric-bootstrap.sh
+  install -m 0644 "$REPO_DIR/tools/gns3/l3-fabric/fabric-bootstrap.service" \
+    /etc/systemd/system/fabric-bootstrap.service
+
+  # Erradicar el mecanismo L2 antiguo si la imagen base lo trae: el viejo
+  # gns3-br0-tree espera DHCP en br0 (inexistente en el fabric) y falla al boot.
+  systemctl disable --now gns3-br0-tree.service 2>/dev/null || true
+  rm -f /etc/systemd/system/gns3-br0-tree.service
   rm -f /etc/default/gns3-br0-tree
-
-  cat >/etc/systemd/system/gns3-br0-tree.service <<'EOF'
-[Unit]
-Description=Configurar br0 de gestion GNS3 sin STP
-DefaultDependencies=no
-After=systemd-udev-settle.service systemd-networkd.service
-Before=network-online.target k3s-agent.service
-Wants=systemd-udev-settle.service systemd-networkd.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  if [ -f /usr/local/bin/configure-br0-tree.sh ]; then
+    printf '#!/bin/bash\n# L3-FABRIC-NEUTRALIZED: br0 L2 ya no se usa en el fabric L3.\nexit 0\n' \
+      >/usr/local/bin/configure-br0-tree.sh
+    chmod +x /usr/local/bin/configure-br0-tree.sh
+  fi
+  rm -f /etc/systemd/system/k3s-iptables.service /usr/local/bin/k3s-br0-forwarding.sh
 
   systemctl daemon-reload
-  systemctl enable gns3-br0-tree.service
+  systemctl enable frr.service 2>/dev/null || true
+  systemctl enable fabric-bootstrap.service
 }
 
 configure_network_wait() {
@@ -194,40 +154,16 @@ EOF
 }
 
 configure_forwarding() {
+  # Base de k8s; fabric-bootstrap reafirma rp_filter=0, ip_forward y el ACCEPT de
+  # transito del fabric en runtime. Aqui solo se deja el modulo de bridge para
+  # contenedores docker y el forwarding habilitado desde el arranque.
   cat >/etc/sysctl.d/99-sdn.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 EOF
-  sysctl --system
-
-  cat >/usr/local/bin/k3s-br0-forwarding.sh <<'EOF'
-#!/bin/sh
-set -eu
-
-iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || \
-  iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT
-EOF
-  chmod +x /usr/local/bin/k3s-br0-forwarding.sh
-
-  cat >/etc/systemd/system/k3s-iptables.service <<'EOF'
-[Unit]
-Description=Regla iptables de forwarding para br0
-After=network-online.target k3s-agent.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/bin/sleep 1
-ExecStart=/usr/local/bin/k3s-br0-forwarding.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now k3s-iptables.service
+  modprobe br_netfilter 2>/dev/null || true
+  sysctl --system || true
 }
 
 install_autojoin_service() {
@@ -235,9 +171,9 @@ install_autojoin_service() {
 
   cat >/etc/systemd/system/k3s-autojoin.service <<'EOF'
 [Unit]
-Description=Instalacion automatica de K3S Worker
-After=gns3-br0-tree.service network-online.target
-Requires=gns3-br0-tree.service
+Description=Instalacion automatica de K3S Worker (fabric L3)
+After=fabric-bootstrap.service network-online.target
+Requires=fabric-bootstrap.service
 Wants=network-online.target
 
 [Service]
@@ -258,6 +194,7 @@ EOF
 [Service]
 Environment=RYU_K3S_NODE_TOKEN=$JOIN_TOKEN
 Environment=RYU_K3S_API_ENDPOINT=$API_ENDPOINT
+Environment=RYU_K3S_VERSION=$K3S_VERSION
 EOF
   chmod 600 /etc/systemd/system/k3s-autojoin.service.d/token.conf
 
@@ -267,9 +204,8 @@ EOF
 
 verify_units() {
   systemd-analyze verify \
-    /etc/systemd/system/gns3-br0-tree.service \
-    /etc/systemd/system/k3s-autojoin.service \
-    /etc/systemd/system/k3s-iptables.service
+    /etc/systemd/system/fabric-bootstrap.service \
+    /etc/systemd/system/k3s-autojoin.service
 }
 
 require_root
@@ -279,11 +215,11 @@ resize_root_if_possible
 upgrade_packages
 install_docker
 configure_hostname
-write_netplan
-install_br0_service
+write_l3_netplan
+install_fabric_service
 configure_network_wait
 configure_forwarding
 install_autojoin_service
 verify_units
 
-echo "prepare-k3s-worker-golden-image: Golden Image ready; do not start k3s-autojoin.service before sealing."
+echo "prepare-k3s-worker-golden-image: Golden Image (fabric L3) lista; no arranques k3s-autojoin.service antes de sellar."

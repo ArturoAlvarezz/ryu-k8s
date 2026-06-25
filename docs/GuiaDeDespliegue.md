@@ -319,14 +319,28 @@ df -h /
 
 No continúes si `/` sigue por debajo de 10 GB.
 
-## 10. Configurar auto-join del worker
+## 10. Configurar auto-join del worker (fabric L3)
 
-Prepara la VM base para que cada clon se una solo. El script instala utilidades y Docker, configura `br0` por DHCP temporal, instala `gns3-br0-tree.service`, configura forwarding y crea `k3s-autojoin.service` habilitado pero sin arrancar.
+> **Arquitectura L3.** El worker ya **no** usa `br0` ni DHCP de gestión. Arranca en
+> el **fabric L3** (FRR/OSPF *unnumbered* + loopback `/32` derivada de
+> `/etc/machine-id`) que monta `fabric-bootstrap.service` **antes** de K3s; el
+> auto-join se hace contra el VIP del API `10.255.255.1` (anunciado por kube-vip
+> BGP). El viejo `gns3-br0-tree.service` queda **erradicado** por el script.
 
-Antes, confirma que el VIP responde:
+El script `prepare-k3s-worker-golden-image.sh` deja la VM base lista:
+
+- Instala utilidades, Docker y **FRR** (`frr frr-pythontools`).
+- Escribe un netplan L3 mínimo (`ens*` sueltas, sin `br0` ni DHCP) y desactiva la
+  regeneración de red de cloud-init.
+- Instala y habilita `fabric-bootstrap.service` (y `frr.service`); **elimina** el
+  `gns3-br0-tree.service`/`configure-br0-tree.sh` heredados de la imagen L2.
+- Crea `k3s-autojoin.service` **habilitado pero sin arrancar**, con el token, el VIP
+  y la versión de K3s embebidos.
+
+Confirma primero que el VIP del API responde (desde un control-plane del fabric):
 
 ```bash
-curl -k https://192.168.122.10:6443/readyz
+curl -k https://10.255.255.1:6443/readyz
 ```
 
 Obtén el token real en un control-plane (normalmente `master`):
@@ -335,7 +349,8 @@ Obtén el token real en un control-plane (normalmente `master`):
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-Ejecuta la preparación en la VM base del worker (no guardes el token en archivos del repo):
+Ejecuta la preparación en la VM base del worker, **desde la raíz del repo** (no
+guardes el token en archivos del repo):
 
 ```bash
 cd ~/ryu-k8s
@@ -343,24 +358,30 @@ sudo RYU_K3S_NODE_TOKEN='<TOKEN_REAL_DEL_CLUSTER_HA>' \
   ./tools/gns3/prepare-k3s-worker-golden-image.sh
 ```
 
-Para evitar `apt upgrade`: agrega `RYU_K3S_SKIP_APT_UPGRADE=true`.
+Overrides útiles:
 
-La IP DHCP temporal solo sirve para preparar la imagen; en cada clon, `gns3-br0-tree.service` fija la IP propia como `NODE_IP`. Valida:
+- `RYU_K3S_API_ENDPOINT=10.255.255.1` — VIP del API (default del fabric L3).
+- `RYU_K3S_VERSION=v1.35.5+k3s1` — versión de K3s; **debe coincidir con el cluster**
+  (verifícala con `kubectl get nodes`).
+- `RYU_K3S_SKIP_APT_UPGRADE=true` — omitir `apt upgrade`.
+
+Valida que la imagen quedó en modo fabric (todavía **sin** loopback ni unión: eso
+ocurre en cada clon tras el sellado):
 
 ```bash
-ip -br addr show br0
-bridge link | grep 'master br0'
 df -h /
-systemctl is-enabled gns3-br0-tree.service
-systemctl is-enabled k3s-autojoin.service
+ls -l /usr/local/bin/fabric-bootstrap.sh        # instalado
+systemctl is-enabled fabric-bootstrap.service   # enabled
+systemctl is-enabled frr.service                # enabled
+systemctl is-enabled k3s-autojoin.service       # enabled
+systemctl is-active  k3s-autojoin.service || true  # debe estar inactive
+test ! -e /etc/systemd/system/gns3-br0-tree.service && echo "br0-tree eliminado OK"
 ```
 
-No arranques `k3s-autojoin.service` en la Golden Image: debe quedar habilitado para correr en cada clon tras el sellado. El hostname definitivo se genera al primer arranque del clon como `worker-<mac>`.
-
-```bash
-systemctl is-enabled k3s-autojoin.service
-systemctl is-active k3s-autojoin.service || true
-```
+No arranques `k3s-autojoin.service` en la Golden Image: debe quedar habilitado para
+correr en cada clon tras el sellado. En el primer arranque de cada clon,
+`fabric-bootstrap` deriva la loopback única y `k3s-autojoin` renombra el nodo a
+`worker-<mac de ens3>` y lo une al cluster con `--node-ip=<loopback>`.
 
 ## 11. Sellar la Golden Image
 
@@ -370,6 +391,11 @@ Al final, antes de apagar y exportar:
 cd ~/ryu-k8s
 sudo ./tools/gns3/seal-k3s-worker-golden-image.sh
 ```
+
+El sellado **vacía `/etc/machine-id`** (entre otra limpieza de identidad): es lo que
+garantiza que cada clon regenere un `machine-id` único en su primer arranque y, por
+tanto, una **loopback `/32` distinta** en el fabric (sin colisión de OSPF). Si no se
+sella, todos los clones compartirían loopback y romperían el fabric.
 
 Exporta el `.qcow2` sellado y úsalo como appliance de worker en GNS3.
 
@@ -385,13 +411,13 @@ Exporta el `.qcow2` sellado y úsalo como appliance de worker en GNS3.
 
 ### 12.2 Arrancar workers
 
-1. Mantén encendidos los 3 control-plane y activo el VIP `192.168.122.10`.
+1. Mantén encendidos los 3 control-plane y activo el VIP del API `10.255.255.1`.
 2. Arrastra la appliance `SDN-Worker` tantas veces como necesites.
-3. Conecta los workers solo a puertos libres de nodos control-plane (o a otros workers como hub). **No** conectes workers al switch de gestión, al switch básico de GNS3 ni a `NAT1`.
-4. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN.
-5. Enciende los workers. No asignes IP manualmente: `gns3-br0-tree.service` captura la IP DHCP de `br0` y la fija antes de que `k3s-autojoin.service` una el worker.
+3. Conecta los workers solo a puertos `ens3`-`ens6` de control-planes (o de otros workers como hub). Cada cable es un **enlace L3 punto a punto** del fabric (OSPF *unnumbered*). **No** conectes workers al switch de gestión, al switch básico de GNS3 ni a `NAT1`.
+4. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN (fuera del fabric).
+5. Enciende los workers. No asignes IP manualmente: `fabric-bootstrap.service` deriva la loopback `/32` única (de `machine-id`), levanta OSPF en cada cable con carrier, y luego `k3s-autojoin.service` une el worker con `--node-ip=<loopback>`.
 
-Cableado válido mínimo (un worker con un solo enlace de gestión):
+Cableado válido mínimo (un worker con un solo enlace de fabric):
 
 | Worker | Control-plane |
 | --- | --- |
@@ -399,7 +425,7 @@ Cableado válido mínimo (un worker con un solo enlace de gestión):
 | `SDN-Worker-2:e0` (`ens3`) | `Master2:e1` (`ens4`) |
 | `SDN-Worker-3:e0` (`ens3`) | `Master3:e1` (`ens4`) |
 
-Para redundancia de gestión, conecta `e0`-`e2` del worker a control-plane distintos. El árbol activo de `br0` se define por `ACTIVE_BR0_PORTS` en cada nodo. Para que un cable de respaldo se active solo ante la caída de un worker-hub (sin loop ni STP), instala el daemon `worker-mgmt-failover` (ver [Sección 20](#20-resiliencia-de-la-red-de-gestión)).
+Para redundancia, conecta varios `ens3`-`ens6` del worker a control-planes/workers distintos: **todos** los cables con carrier entran al fabric y OSPF usa ECMP entre ellos. No hay árbol activo ni daemons de failover (OSPF *es* el failover); ya no aplican `ACTIVE_BR0_PORTS`, `worker-mgmt-failover` ni STP.
 
 Valida desde un control-plane:
 

@@ -24,7 +24,10 @@ validate_golden_image_state() {
 }
 
 clean_identity_and_runtime_state() {
-  rm -f /etc/default/gns3-br0-tree
+  # CRITICO para el fabric L3: la loopback /32 de cada nodo se deriva de
+  # /etc/machine-id. Vaciarlo aqui obliga a systemd a regenerar uno UNICO en el
+  # primer arranque de cada clon -> loopbacks distintas (sin colision de OSPF).
+  rm -f /etc/default/gns3-br0-tree    # legado L2, inocuo si no existe
   truncate -s 0 /etc/machine-id
   rm -f /var/lib/dbus/machine-id
   ln -s /etc/machine-id /var/lib/dbus/machine-id
