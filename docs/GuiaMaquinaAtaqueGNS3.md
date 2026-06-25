@@ -2,21 +2,23 @@
 
 Esta guia describe como crear una maquina atacante dentro de la topologia GNS3 del laboratorio SDN y como ejecutar pruebas controladas de MAC spoofing, IP spoofing y ARP poisoning. El objetivo no es dejar trafico malicioso permanente, sino validar que el plano de seguridad rechaza fuentes no autorizadas y documentar que protecciones aun faltan en Ryu.
 
-## 1. Imagen Recomendada
+## 1. Appliance Recomendado
 
-La prueba mas reciente uso un nodo Docker de GNS3, no una VM QEMU pesada. La imagen usada fue `arturoalvarez/ryu-dhcp:latest` porque ya esta disponible localmente y trae Python 3.9 con Scapy instalado.
+La opcion recomendada es usar el appliance Docker `SDN Attacker`, definido en `services/sdn-attacker/sdn-attacker.gns3a`. Este appliance usa la imagen `arturoalvarez/sdn-attacker:latest` y trae Python, Scapy, `tcpdump`, `iproute2` y un menu interactivo para lanzar ataques controlados de MAC spoofing, IP spoofing y ARP poisoning.
 
-Se creo un template GNS3 llamado `SDN-Attacker` con estas propiedades:
+El template GNS3 queda con estas propiedades principales:
 
 ```text
 template_type: docker
-image: arturoalvarez/ryu-dhcp:latest
+image: arturoalvarez/sdn-attacker:latest
 adapters: 1
 console_type: telnet
-start_command: sleep infinity
+start_command:
 ```
 
-No se recomienda usar el template `Ubuntu Docker Guest` sin preparacion adicional. En la prueba real ese contenedor no traia Python y no podia instalar paquetes desde Internet porque queda dentro de la red aislada de GNS3.
+Al abrir la consola telnet del nodo, el contenedor ejecuta automaticamente el menu `sdn-attack`. Tambien acepta comandos no interactivos: `sdn-attack mac`, `sdn-attack ip`, `sdn-attack arp`, `sdn-attack arp-mismatch`, `sdn-attack all` y `sdn-attack config`.
+
+No se recomienda usar el template `Ubuntu Docker Guest` sin preparacion adicional. En pruebas previas ese contenedor no traia Python y no podia instalar paquetes desde Internet porque queda dentro de la red aislada de GNS3.
 
 ## 2. Creacion del Nodo Atacante
 
@@ -29,6 +31,8 @@ node_id: b4f0473a-c223-4cfe-9296-958740d46bb3
 container_id: 9afeadfc4e9fbbbb66d7ee92a66a3a671e6297facf8a29d13ecd4cfcb288671f
 imagen: arturoalvarez/ryu-dhcp:latest
 ```
+
+Para nuevas pruebas, usar la misma ubicacion fisica del atacante pero con el appliance `SDN Attacker` y la imagen `arturoalvarez/sdn-attacker:latest`.
 
 Se conecto a un puerto libre del nodo `SDN-ControlPlane-1`:
 
@@ -48,10 +52,10 @@ python3 tools/gns3/ssh_k3s.py 'kubectl exec -n sdn-controller ovs-sdn-initialize
 
 ## 3. Preparacion del Atacante
 
-Verificar que el contenedor tenga Python, Scapy e interfaz activa:
+Verificar que el contenedor tenga Python, Scapy, el menu e interfaz activa:
 
 ```bash
-docker exec 9afeadfc4e9fbbbb66d7ee92a66a3a671e6297facf8a29d13ecd4cfcb288671f sh -lc 'python3 --version; python3 -c "import scapy; print(scapy.__version__)"; ip addr show eth0'
+docker exec 9afeadfc4e9fbbbb66d7ee92a66a3a671e6297facf8a29d13ecd4cfcb288671f sh -lc 'python3 --version; python3 -c "import scapy; print(scapy.__version__)"; sdn-attack config; ip addr show eth0'
 ```
 
 Resultado esperado:
@@ -59,6 +63,7 @@ Resultado esperado:
 ```text
 Python 3.9.x
 Scapy 2.5.x
+sdn-attack disponible
 eth0 UP con MAC 02:42:f0:47:3a:00
 ```
 
@@ -88,7 +93,23 @@ ICMP Smart Meters: 42/42 OK
 
 ## 5. Ejecucion de Ataques
 
-Las pruebas se ejecutaron con Scapy desde `SDN-Attacker-1`. Para probar la autorizacion del collector, algunos paquetes se firmaron con HMAC valido usando el secreto de Kubernetes leido en runtime. No se debe guardar el secreto en archivos, scripts versionados ni documentacion.
+Las pruebas se ejecutan con Scapy desde `SDN-Attacker-1`. El appliance nuevo ofrece un menu interactivo:
+
+```bash
+sdn-attack
+```
+
+Tambien se pueden lanzar ataques individuales:
+
+```bash
+sdn-attack mac
+sdn-attack ip
+sdn-attack arp
+sdn-attack arp-mismatch
+sdn-attack all
+```
+
+Para probar la autorizacion del collector en escenarios avanzados, algunos paquetes se pueden firmar con HMAC valido usando el secreto de Kubernetes leido en runtime. No se debe guardar el secreto en archivos, scripts versionados ni documentacion.
 
 La idea de cada ataque fue:
 

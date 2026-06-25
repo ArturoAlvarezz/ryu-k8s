@@ -1,0 +1,24 @@
+{
+    "appliance_id": "7a0b81af-5cde-46f4-99a7-2d8b3419c4d2",
+    "name": "SDN Attacker",
+    "category": "guest",
+    "description": "Appliance Docker para ejecutar pruebas controladas de seguridad contra el laboratorio SDN/AMI.\n\nIncluye un menu interactivo para lanzar ataques de MAC spoofing, IP spoofing y ARP poisoning usando Scapy. Esta pensado para conectarse a un puerto guest de br-sdn dentro de GNS3 y validar que Ryu registre/bloquee eventos como ip_claim_conflict, ip_mismatch, arp_gateway_spoof y arp_mac_mismatch.\n\nLa consola telnet abre el menu automaticamente. Tambien se puede ejecutar sdn-attack con comandos no interactivos: mac, ip, arp, arp-mismatch, all o config.",
+    "vendor_name": "SDN Lab",
+    "vendor_url": "https://github.com/ArturoAlvarezz/ryu-k8s",
+    "documentation_url": "https://github.com/ArturoAlvarezz/ryu-k8s",
+    "product_name": "SDN Attacker",
+    "registry_version": 1,
+    "status": "stable",
+    "availability": "free",
+    "maintainer": "arturoalvarez",
+    "maintainer_email": "arturoalvarez@example.com",
+    "usage": "1. Importar el appliance en GNS3.\n2. Conectar eth0 a un puerto libre de un nodo SDN/OVS, igual que un Smart Meter.\n3. Abrir la consola telnet del nodo.\n4. Seleccionar una opcion del menu:\n   - 1: MAC spoofing\n   - 2: IP spoofing\n   - 3: ARP poisoning gateway spoof\n   - 4: ARP MAC mismatch\n   - 5: ejecutar todos\n5. Revisar Ryu, Redis security:events, Grafana o /api/telemetry-security para validar el resultado.\n\nComandos no interactivos desde la consola:\n   sdn-attack mac\n   sdn-attack ip\n   sdn-attack arp\n   sdn-attack arp-mismatch\n   sdn-attack all\n   sdn-attack config\n\nVariables configurables en las propiedades del nodo:\n   ATTACK_IFACE: interfaz de salida (default eth0)\n   PACKET_COUNT: paquetes por ataque (default 3)\n   PACKET_INTERVAL: segundos entre paquetes (default 1)\n   RANDOMIZE_MACS: cambia el ultimo octeto de MACs falsas para evitar drop flows previos (default true)\n   GATEWAY_IP: gateway SDN atacado (default 10.0.0.1)\n   VICTIM_DEVICE_ID: dispositivo victima usado en payloads (default SDN-SmartMeter-1)\n   VICTIM_MAC: MAC legitima victima (default 02:42:53:4d:00:01)\n   VICTIM_IP: IP legitima victima (default 10.0.0.11)\n   GUEST_DST_IP: IP guest destino para provocar Packet-In (default 10.0.0.13)\n   FORGED_MAC: MAC falsa base (default aa:bb:cc:dd:ee:ff)\n   FORGED_IP: IP falsa base (default 10.0.0.250)\n   ARP_MISMATCH_MAC: hwsrc ARP falsa para mismatch (default ca:fe:ca:fe:ca:fe)",
+    "symbol": ":/symbols/docker_guest.svg",
+    "docker": {
+        "adapters": 1,
+        "image": "arturoalvarez/sdn-attacker:latest",
+        "start_command": "",
+        "environment": "ATTACK_IFACE=eth0\nPACKET_COUNT=3\nPACKET_INTERVAL=1\nRANDOMIZE_MACS=true\nGATEWAY_IP=10.0.0.1\nVICTIM_DEVICE_ID=SDN-SmartMeter-1\nVICTIM_MAC=02:42:53:4d:00:01\nVICTIM_IP=10.0.0.11\nGUEST_DST_IP=10.0.0.13\nFORGED_MAC=aa:bb:cc:dd:ee:ff\nFORGED_IP=10.0.0.250\nARP_MISMATCH_MAC=ca:fe:ca:fe:ca:fe",
+        "console_type": "telnet"
+    }
+}
