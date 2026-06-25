@@ -76,8 +76,8 @@ apply_daemonset() {
     exit 1
   fi
   kubectl_cmd apply -f "$BGP_MANIFEST"
-  kubectl_cmd -n kube-system rollout status daemonset/kube-vip --timeout=240s || true
-  kubectl_cmd -n kube-system get pods -l app=kube-vip -o wide || true
+  kubectl_cmd -n kube-system rollout status daemonset/kube-vip-bgp --timeout=240s || true
+  kubectl_cmd -n kube-system get pods -l app=kube-vip-bgp -o wide || true
 }
 
 case "$MODE" in

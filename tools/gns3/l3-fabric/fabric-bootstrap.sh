@@ -253,8 +253,17 @@ fi
     echo "router bgp ${FABRIC_ASN}"; echo " bgp router-id ${LOOPBACK}"; echo " no bgp ebgp-requires-policy"
     echo " bgp listen range ${FABRIC_SUPERNET}.0.0/16 peer-group FABRIC"
     echo " neighbor FABRIC peer-group"; echo " neighbor FABRIC remote-as ${FABRIC_ASN}"; echo " neighbor FABRIC update-source lo"
+    # Solo CP: peer BGP con el kube-vip LOCAL (127.0.0.1), que anuncia el VIP del
+    # API 10.255.255.1/32. La propagacion fabric-wide la cubre OSPF (lo esta
+    # OSPF-enabled), asi que el VIP funciona aunque esta sesion no establezca; el
+    # peer existe para que kube-vip-bgp tenga su sesion BGP como espera su diseno.
+    if [ "$IS_CP" = yes ]; then
+        echo " neighbor 127.0.0.1 remote-as ${FABRIC_ASN}"
+    fi
     echo " address-family ipv4 unicast"; echo "  redistribute connected"
-    echo "  neighbor FABRIC activate"; echo "  neighbor FABRIC next-hop-self"; echo " exit-address-family"; echo "!"
+    echo "  neighbor FABRIC activate"; echo "  neighbor FABRIC next-hop-self"
+    [ "$IS_CP" = yes ] && echo "  neighbor 127.0.0.1 activate"
+    echo " exit-address-family"; echo "!"
 } > "${FRR_CONF}"
 
 sed -i 's/^ospfd=no/ospfd=yes/; s/^bgpd=no/bgpd=yes/' /etc/frr/daemons 2>/dev/null || true

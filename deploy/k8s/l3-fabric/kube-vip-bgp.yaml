@@ -1,29 +1,38 @@
-# kube-vip en modo BGP — anuncia el VIP del API server por BGP al FRR local.
+# kube-vip en modo BGP — anuncia el VIP del API server (10.255.255.1) en el fabric L3.
 #
-# En el fabric L3 NO usamos ARP/L2 para el VIP. kube-vip peerea con el bgpd de
-# FRR del propio nodo (127.0.0.1) y anuncia VIP_ADDRESS/32. FRR lo redistribuye
-# por OSPF/BGP -> el VIP es alcanzable fabric-wide y, si el control-plane que lo
-# sostiene cae, el anuncio se retira y otro control-plane lo toma (BGP failover).
+# kube-vip añade el VIP a `lo` (modo L3, sin ARP/GARP). Como `lo` está OSPF-enabled
+# (lo pone fabric-bootstrap: `interface lo / ip ospf area 0`), OSPF propaga la /32
+# fabric-wide automáticamente; si el control-plane líder cae, otro toma el lease
+# (leader-election), añade el VIP a su `lo` y OSPF reanuncia la ruta -> failover HA
+# sin depender de L2. Además kube-vip abre una sesión BGP al FRR local (127.0.0.1):
+# requiere `neighbor 127.0.0.1 remote-as 64512` en frr.conf (lo añade
+# fabric-bootstrap.sh). La propagación NO depende de esa sesión (OSPF la cubre).
 #
-# Constantes del cluster (mismas en todos los control-planes):
-#   VIP_ADDRESS  = 10.255.255.1   (la /32 del API, ancla conocida del cluster)
-#   FABRIC_ASN   = 64512          (mismo ASN del fabric; kube-vip <-> FRR local)
+#   VIP_ADDRESS = 10.255.255.1   (la /32 del API, ancla del cluster)
+#   FABRIC_ASN  = 64512          (mismo ASN del fabric)
 #
-# Solo corre en control-planes (nodeSelector node-role control-plane).
+# DESPLIEGUE HÍBRIDO (lab actual): este DS convive con el kube-vip ARP que sirve
+# 192.168.122.10 para acceso del host. Para coexistir, este usa nombre/lease/puerto
+# Prometheus DISTINTOS (kube-vip-bgp / plndr-cp-lock-bgp / :2113). En un despliegue
+# L3 PURO (sin kube-vip ARP) puedes renombrar a `kube-vip`, lease `plndr-cp-lock`
+# y prometheus_server :2112.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: kube-vip
+  name: kube-vip-bgp
   namespace: kube-system
+  labels:
+    app: kube-vip-bgp
 spec:
   selector:
     matchLabels:
-      app: kube-vip
+      app: kube-vip-bgp
   template:
     metadata:
       labels:
-        app: kube-vip
+        app: kube-vip-bgp
     spec:
+      serviceAccountName: kube-vip
       hostNetwork: true
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
@@ -39,20 +48,38 @@ spec:
           value: "10.255.255.1"
         - name: vip_interface
           value: "lo"
+        - name: vip_cidr
+          value: "32"
         - name: cp_enable
           value: "true"
+        - name: cp_namespace
+          value: "kube-system"
         - name: svc_enable
           value: "false"
+        - name: vip_leaderelection
+          value: "true"
+        - name: vip_leasename
+          value: "plndr-cp-lock-bgp"
+        - name: vip_leaseduration
+          value: "5"
+        - name: vip_renewdeadline
+          value: "3"
+        - name: vip_retryperiod
+          value: "1"
+        - name: port
+          value: "6443"
+        - name: prometheus_server         # :2113 para no chocar con el kube-vip ARP (:2112)
+          value: ":2113"
         - name: bgp_enable
           value: "true"
-        - name: bgp_routerid            # router-id = loopback del nodo (derivada)
+        - name: bgp_routerid              # router-id = loopback del nodo (= node-ip)
           valueFrom:
             fieldRef:
-              fieldPath: status.hostIP   # = node-ip = loopback
+              fieldPath: status.hostIP
         - name: bgp_as
           value: "64512"
         - name: bgp_peeraddress
-          value: "127.0.0.1"            # peerea con el FRR local del nodo
+          value: "127.0.0.1"              # peerea con el FRR local del nodo
         - name: bgp_peeras
           value: "64512"
         securityContext:
