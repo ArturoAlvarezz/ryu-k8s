@@ -572,6 +572,7 @@ def observed_workers(redis):
             "ip": node_ips.get(raw_dpid, ""),
             "name": name,
             "dpid": normalize_dpid(raw_dpid),
+            "raw_dpid": raw_dpid,
             "in_port": "",
             "port_name": "node",
             "node_name": name,
@@ -1874,6 +1875,67 @@ def api_delete_device(device_id):
         return jsonify({"deleted": registry.delete_device(redis, device_id)})
     except Exception as e:
         log.exception("No se pudo eliminar dispositivo %s", device_id)
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/nodes/<raw_dpid>", methods=["DELETE"])
+def api_delete_node(raw_dpid):
+    """Elimina un nodo INACTIVO del registro de topología (vista de seguridad/mapa).
+
+    Solo permite borrar nodos sin heartbeat `switch:alive` vigente: borrar uno vivo
+    sería inútil (su heartbeat lo re-registra al instante) y arriesgado. Si un nodo
+    borrado revive, se re-registra solo, así que esto solo limpia entradas de nodos
+    realmente ausentes (VM eliminada/recreada con otra loopback, etc.).
+    """
+    try:
+        redis = get_redis()
+        if redis is None:
+            return jsonify({"error": "Redis no disponible"}), 503
+
+        dec = normalize_dpid(raw_dpid)
+        # Resolver también la forma hex por si llega el dpid decimal.
+        raw = raw_dpid if not str(raw_dpid).isdigit() else raw_dpid_from(raw_dpid)
+
+        if redis.exists(f"switch:alive:{raw}") or redis.exists(f"switch:alive:{dec}"):
+            return jsonify({"error": "el nodo está activo (switch:alive); no se borra un nodo vivo"}), 409
+
+        name = (redis.hget("topology:node_names", raw)
+                or redis.hget("topology:node_names", dec) or "")
+        node_ip = (redis.hget("topology:node_ips", raw)
+                   or redis.hget("topology:node_ips", dec) or "")
+
+        pipe = redis.pipeline()
+        for key in ("topology:node_names", "topology:node_ips", "topology:node_last_seen",
+                    "topology:vxlan_peers", "topology:mgmt_switch_links"):
+            pipe.hdel(key, raw, dec)
+        pipe.srem("topology:switches", raw, dec)
+        for k in (f"switch:alive:{raw}", f"switch:alive:{dec}",
+                  f"switch:dead:{raw}", f"switch:dead:{dec}",
+                  f"mac_to_port:{raw}", f"mac_to_port:{dec}",
+                  f"switch_ports:{raw}", f"switch_ports:{dec}"):
+            pipe.delete(k)
+        pipe.execute()
+
+        # Limpiar referencias a este nodo en los vxlan_peers de los OTROS nodos
+        # (su IP listada como peer) para que no quede una arista fantasma en el mapa.
+        if node_ip:
+            for other, peers in (redis.hgetall("topology:vxlan_peers") or {}).items():
+                kept = " ".join(p for p in str(peers or "").split() if p != node_ip)
+                if kept != str(peers or ""):
+                    redis.hset("topology:vxlan_peers", other, kept)
+
+        # Borrar la última vista buena en memoria para que no reaparezca por el fallback.
+        with _node_registry_lock:
+            for reg_key in ("node_names", "node_ips"):
+                _node_registry_snapshot[reg_key].pop(raw, None)
+                _node_registry_snapshot[reg_key].pop(dec, None)
+            _node_registry_snapshot["switches"].discard(raw)
+            _node_registry_snapshot["switches"].discard(dec)
+
+        log.info("Nodo inactivo eliminado del registro: raw=%s dec=%s name=%s", raw, dec, name)
+        return jsonify({"deleted": True, "raw_dpid": raw, "name": name})
+    except Exception as e:
+        log.exception("No se pudo eliminar el nodo %s", raw_dpid)
         return jsonify({"error": str(e)}), 400
 
 
