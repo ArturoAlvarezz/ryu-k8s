@@ -1211,18 +1211,22 @@ class DistributedL2Switch(app_manager.RyuApp):
         allowed, reason, detail = self._evaluate_security_threats(
             eth, ip_pkt, arp_pkt, udp_pkt, dpid, in_port, in_port_name
         )
+        # discovery_only: un guest DESCONOCIDO (mac_not_registered) que NO se dropea
+        # del todo se deja DESCUBRIR (telemetria al gateway -> el collector lo ve y se
+        # puede registrar) pero queda AISLADO: NO puede hablar con otros guests. Solo
+        # se le permite ARP al gateway 10.0.0.1 y la telemetria udp:5555 al gateway.
+        discovery_only = False
         if not allowed:
-            # Un dispositivo DESCONOCIDO (mac_not_registered) no suplanta ninguna
-            # identidad/IP registrada: se registra como observacion pero NO se
-            # dropea, para que aparezca en Operaciones y un operador pueda darlo de
-            # alta (su telemetria llega al collector, fail-closed hasta el registro).
-            # La suplantacion activa de identidades/IP conocidas si se bloquea.
+            # La suplantacion activa de identidades/IP registradas (ip_claim_conflict,
+            # ip_mismatch, mac_location_mismatch, status_*, arp_*) SIEMPRE se dropea.
+            # mac_not_registered solo es "no enforced" si SECURITY_DROP_UNREGISTERED=false.
             enforce = SECURITY_DROP_UNREGISTERED if reason == "mac_not_registered" else True
             enforce = enforce and not SECURITY_LEARNING_MODE
             self._record_security_event(reason, src, src_ip, dpid, in_port, detail, enforced=enforce)
             if enforce:
                 self._drop_guest_packet(datapath, in_port, src, reason)
                 return
+            discovery_only = (reason == "mac_not_registered")
 
         try:
             self.redis.hset(mac_table_key, src, in_port)
@@ -1256,6 +1260,11 @@ class DistributedL2Switch(app_manager.RyuApp):
             return
 
         if arp_pkt and arp_pkt.opcode == arp.ARP_REQUEST:
+            # Aislamiento del no-registrado: solo puede resolver el gateway (10.0.0.1)
+            # para poder enviar telemetria. ARP hacia otros guests se dropea.
+            if discovery_only and str(arp_pkt.dst_ip) != GUEST_GATEWAY_IP:
+                return
+
             is_dup = self.arp_handler.is_duplicate(
                 dpid, src, arp_pkt.src_ip, arp_pkt.dst_ip, arp_pkt.opcode
             )
@@ -1273,6 +1282,10 @@ class DistributedL2Switch(app_manager.RyuApp):
             if proxy_reply:
                 return
 
+            # Un no-registrado no inunda ARP hacia otros guests.
+            if discovery_only:
+                return
+
             if should_flood:
                 self._do_controlled_flood(datapath, in_port, msg.data, ports, dpid, include_local=False)
                 return
@@ -1281,6 +1294,13 @@ class DistributedL2Switch(app_manager.RyuApp):
             self.arp_handler.learn_ip(src, arp_pkt.src_ip)
             self.arp_handler.learn_request_location(dpid, in_port, src)
             self.arp_handler.mark_arp(dpid, src, arp_pkt.src_ip, arp_pkt.src_ip, arp.ARP_REPLY)
+
+        # Un guest NO REGISTRADO no reenvia a otros guests: la telemetria al gateway
+        # ya se entrego arriba y el ARP al gateway ya se respondio; cualquier paquete
+        # que llegue aqui es trafico guest-a-guest -> se dropea (queda aislado pero
+        # descubrible). Asi un no-registrado no puede comunicarse con otros meters.
+        if discovery_only:
+            return
 
         # For known guest destinations always use Dijkstra (guest_locations → topology).
         # mac_to_port learns source MACs via MST flood, so a guest MAC may be recorded
