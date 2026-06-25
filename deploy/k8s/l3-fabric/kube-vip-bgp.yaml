@@ -5,8 +5,9 @@
 # fabric-wide automáticamente; si el control-plane líder cae, otro toma el lease
 # (leader-election), añade el VIP a su `lo` y OSPF reanuncia la ruta -> failover HA
 # sin depender de L2. Además kube-vip abre una sesión BGP al FRR local (127.0.0.1):
-# requiere `neighbor 127.0.0.1 remote-as 64512` en frr.conf (lo añade
-# fabric-bootstrap.sh). La propagación NO depende de esa sesión (OSPF la cubre).
+# NOTA: en este cluster FRR corre SOLO ospfd (bgpd está OFF para que Calico/BIRD
+# tenga el :179). Por eso la sesión BGP de kube-vip a 127.0.0.1 NO establece — y NO
+# importa: kube-vip añade el VIP a `lo` y OSPF lo propaga fabric-wide igual.
 #
 #   VIP_ADDRESS = 10.255.255.1   (la /32 del API, ancla del cluster)
 #   FABRIC_ASN  = 64512          (mismo ASN del fabric)

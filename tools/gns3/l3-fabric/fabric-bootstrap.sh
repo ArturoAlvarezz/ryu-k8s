@@ -233,7 +233,13 @@ if [ -n "$edge_iface" ] && [ -n "${MGMT_IP:-}" ]; then
     echo "fabric-bootstrap: edge=${edge_iface} mgmt=${MGMT_IP} -> NAT egress + default-origination"
 fi
 
-# --- 5. FRR (OSPF unnumbered + BGP) ------------------------------------------
+# --- 5. FRR (OSPF unnumbered SOLAMENTE; sin bgpd) ----------------------------
+# FRR corre SOLO ospfd. NO se habilita bgpd a proposito: Calico usa su propio
+# demonio BGP (BIRD) para la malla de rutas de pod y necesita el puerto :179 del
+# host. Si FRR tambien levantara bgpd, chocarian en :179 y los calico-node
+# quedarian 0/1. Sin bgpd, BIRD toma :179 y la malla BGP de Calico establece.
+# El VIP del API (kube-vip-bgp, 10.255.255.1) se propaga por OSPF: kube-vip lo
+# anade a `lo` (OSPF-enabled) y OSPF lo inunda fabric-wide; no necesita BGP en FRR.
 {
     echo "frr version 8.4"; echo "frr defaults traditional"; echo "hostname $(hostname)"
     echo "log syslog informational"; echo "service integrated-vtysh-config"; echo "ip forwarding"; echo "!"
@@ -250,23 +256,10 @@ fi
     echo "router ospf"; echo " ospf router-id ${LOOPBACK}"; echo " maximum-paths 8"; echo " passive-interface lo"
     [ "$NAT_EGRESS" = "yes" ] && echo " default-information originate"
     echo "!"
-    echo "router bgp ${FABRIC_ASN}"; echo " bgp router-id ${LOOPBACK}"; echo " no bgp ebgp-requires-policy"
-    echo " bgp listen range ${FABRIC_SUPERNET}.0.0/16 peer-group FABRIC"
-    echo " neighbor FABRIC peer-group"; echo " neighbor FABRIC remote-as ${FABRIC_ASN}"; echo " neighbor FABRIC update-source lo"
-    # Solo CP: peer BGP con el kube-vip LOCAL (127.0.0.1), que anuncia el VIP del
-    # API 10.255.255.1/32. La propagacion fabric-wide la cubre OSPF (lo esta
-    # OSPF-enabled), asi que el VIP funciona aunque esta sesion no establezca; el
-    # peer existe para que kube-vip-bgp tenga su sesion BGP como espera su diseno.
-    if [ "$IS_CP" = yes ]; then
-        echo " neighbor 127.0.0.1 remote-as ${FABRIC_ASN}"
-    fi
-    echo " address-family ipv4 unicast"; echo "  redistribute connected"
-    echo "  neighbor FABRIC activate"; echo "  neighbor FABRIC next-hop-self"
-    [ "$IS_CP" = yes ] && echo "  neighbor 127.0.0.1 activate"
-    echo " exit-address-family"; echo "!"
 } > "${FRR_CONF}"
 
-sed -i 's/^ospfd=no/ospfd=yes/; s/^bgpd=no/bgpd=yes/' /etc/frr/daemons 2>/dev/null || true
+# ospfd=yes, bgpd=NO: Calico (BIRD) es el unico BGP del host y necesita :179.
+sed -i 's/^ospfd=no/ospfd=yes/; s/^bgpd=yes/bgpd=no/' /etc/frr/daemons 2>/dev/null || true
 systemctl enable frr 2>/dev/null || true
 systemctl restart frr
 echo "fabric-bootstrap: FRR activo. fabric=[${fabric_ifaces} ] edge=${edge_iface:-none} nat=${NAT_EGRESS}"
