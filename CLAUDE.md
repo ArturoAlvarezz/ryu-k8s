@@ -14,7 +14,7 @@ python tools/gns3/ssh_k3s.py "kubectl -n sdn-controller get pods -o wide"
 ssh ubuntu@192.168.122.100   # password: ubuntu
 ```
 
-The HA VIP is `192.168.122.10` (kube-vip). The cluster uses `sudo kubectl` unless `~/.kube/config` is configured for the current user.
+The API HA VIP is `10.255.255.1` (kube-vip in **BGP** mode, announced into the L3 fabric). It is reachable from **inside** the fabric (i.e. on the nodes), not from the host — that is why all kubectl goes through `ssh_k3s.py` to run on Master-1. The cluster uses `sudo kubectl` unless `~/.kube/config` is configured for the current user.
 
 ## Hot Reload (no image rebuild needed)
 
@@ -93,23 +93,46 @@ python tools/gns3/ssh_k3s.py "sudo kubectl exec redis-0 -c sentinel -n sdn-contr
 
 ## Public Endpoints
 
-| Service       | VIP URL                          | Direct (Master-1)               |
-|---------------|----------------------------------|---------------------------------|
-| Grafana       | `http://192.168.122.10:3000`     | `http://192.168.122.100:3000`   |
-| Operations UI | `http://192.168.122.10:8081`     | `http://192.168.122.100:8081`   |
-| Prometheus    | `http://192.168.122.10:9090`     | `http://192.168.122.100:9090`   |
+The dashboards run as `hostNetwork` DaemonSets. The kube-vip BGP VIP (`10.255.255.1`)
+fronts **only the API** (`:6443`, fabric-internal), not these NodePorts. From the host,
+reach them on a control-plane's management IP (the edge that keeps `192.168.122.x`);
+Master-1 (`192.168.122.100`) is the canonical one. Workers have **no** `192.168.122.x`
+address (pure fabric loopbacks), so they are not reachable from the host directly.
 
-If the VIP is unreachable, use the direct Master-1 address. The VIP (`192.168.122.10`) depends on kube-vip holding a lease and `arp_accept=1` on the host's `virbr0`.
+| Service       | URL (from host, via Master-1)   |
+|---------------|---------------------------------|
+| Grafana       | `http://192.168.122.100:3000`   |
+| Operations UI | `http://192.168.122.100:8081`   |
+| Prometheus    | `http://192.168.122.100:9090`   |
+
+Any control-plane edge IP (`192.168.122.100/.106/.130`) also works.
 
 ## Architecture
 
-### Physical Layer (GNS3)
+### Physical Layer (GNS3) — L3 routed fabric
 
-QEMU VMs inside GNS3. All management traffic (K3s API, etcd, flannel) runs on Linux bridge `br0` (`192.168.122.0/24`). SDN guest traffic runs on OVS bridge `br-sdn` (`10.0.0.0/24`). These two bridges must never be merged.
+QEMU VMs inside GNS3. Management/control traffic (K3s API, etcd, Calico) runs over an
+**L3 routed fabric**, not an L2 bridge: every `ensX` cable is an OSPF *unnumbered*
+point-to-point link and each node has a stable **loopback `/32`** (`10.255.B1.B2`,
+derived from `sha256(/etc/machine-id)`). `tools/gns3/l3-fabric/fabric-bootstrap.sh`
+(systemd `fabric-bootstrap.service`, runs before K3s) builds this on every node:
+loopback on `lo`+`ensX`, FRR `frr.conf` (OSPF + iBGP listen-range, AS 64512), and it
+**eradicates** the legacy `br0` L2 bridge. K3s `--node-ip` is the loopback; OSPF gives
+reachability + ECMP, so there is no loop class and no failover daemons (OSPF *is* the
+failover). The old `br0` (`192.168.122.0/24`) + `ACTIVE_BR0_PORTS` + STP design is gone
+(see `docs/MIGRACION_L3_FABRIC.md`).
 
-The GNS3 `Mgmt-Switch` (OVS container) connects all 3 control-plane nodes and NAT1. NAT1 bridges the GNS3 L2 to the host's `virbr0` via a TAP interface (`gns3tap0-0`).
+SDN guest traffic still runs on the OVS bridge `br-sdn` (`10.0.0.0/24`) — independent of
+the fabric. Never bridge `br-sdn` into the fabric interfaces.
 
-Each K3s node's `br0` uses only a deterministic subset of its physical ports (`ACTIVE_BR0_PORTS` defined per hostname in `tools/gns3/configure-br0-tree.sh`) to keep `br0` loop-free.
+Control-planes wired to the GNS3 `Mgmt-Switch`/`NAT1` keep their `192.168.122.x`
+**management/edge IP** on that interface (auto-detected by `fabric-bootstrap` via a
+direct gateway ping): it provides internet, NATs the fabric (`10.255/16` → MASQUERADE)
+and originates the OSPF default. Workers have **no** `192.168.122.x` address. NAT1
+bridges the GNS3 L2 to the host's `virbr0` via a TAP interface (`gns3tap0-0`).
+
+Overlay (kube-vip BGP for the API VIP `10.255.255.1`, Calico BGP for pod routes) peers
+with the local FRR (`127.0.0.1`). Manifests in `deploy/k8s/l3-fabric/`.
 
 ### Control Plane: Ryu (distributed)
 
@@ -127,9 +150,9 @@ Key Redis contracts (do not rename keys without auditing all consumers):
 
 ### Data Plane: OVS + VXLAN
 
-`ovs-sdn-initializer` creates `br-sdn` on each node, assigns `10.0.0.1/24`, and creates VXLAN tunnels **only to LLDP-discovered neighbors** (read from `topology:links` in Redis). This is intentionally NOT a full mesh — full mesh defeats multi-hop Dijkstra path stitching. Never change this to full mesh.
+`ovs-sdn-initializer` creates `br-sdn` on each node, assigns `10.0.0.1/24`, and creates VXLAN tunnels **only to direct fabric neighbors** — the OSPF *unnumbered* neighbors (1-hop `/32` loopback routes where dst == next-hop), published to `topology:vxlan_peers` in Redis. VTEPs are the node **loopbacks** (`10.255.x`), so each tunnel rides the direct cable via OSPF shortest-path. This is intentionally NOT a full mesh — full mesh defeats multi-hop Dijkstra path stitching. Never change this to full mesh. (The DPID is derived from the node's fabric loopback, not from `br0`.)
 
-Ryu computes MST (Prim) over the physical LLDP graph, then uses Dijkstra for multi-hop forwarding between nodes. Flow installation is serialized per `(dpid, src_mac, dst_mac)` via Redis locks.
+Ryu computes MST (Prim) over the discovered neighbor graph, then uses Dijkstra for multi-hop forwarding between nodes. Flow installation is serialized per `(dpid, src_mac, dst_mac)` via Redis locks.
 
 Smart meters (`10.0.0.x`) get IPs from the `sdn-dhcp-server` DaemonSet (Scapy-based). The DHCP server on the master node uses `psrc=10.0.0.1`; worker DHCP pods use `psrc=0.0.0.0` to avoid ARP cache poisoning on non-local nodes.
 
@@ -162,14 +185,21 @@ Resolve node IDs dynamically (`GET /projects/{id}/nodes`) — they change after 
 
 ## Node Reference
 
-| K3s name       | IP                  | br0 MAC              | Role           |
-|----------------|---------------------|----------------------|----------------|
-| master         | 192.168.122.100     | 86:36:f7:5c:06:d4   | control-plane  |
-| control-2      | 192.168.122.106     | 3a:a7:4e:40:47:86   | control-plane  |
-| control-3      | 192.168.122.130     | 96:9c:1d:49:e5:84   | control-plane  |
-| worker-b0ff27  | 192.168.122.115     | 42:f5:e5:b0:ff:27   | worker         |
-| worker-b56b35  | 192.168.122.145     | fe:dc:a2:b5:6b:35   | worker         |
-| worker-ea7e34  | 192.168.122.70      | 8e:fc:06:ea:7e:34   | worker         |
-| worker-24cf41  | 192.168.122.170     | 62:ce:ca:24:cf:41   | worker         |
+`--node-ip` is the **fabric loopback** (`10.255.x`, derived from `machine-id`, stable
+across reboots). Only control-planes (edges) keep a `192.168.122.x` management IP;
+workers have none. Resolve current values with
+`ssh_k3s.py "sudo kubectl get nodes -o wide"` — they change if a VM's `machine-id` is
+regenerated.
 
-VIP: `192.168.122.10` (kube-vip, currently held by control-2). Host gateway: `192.168.122.1` (virbr0, MAC `52:54:00:87:4b:28`).
+| K3s name       | Fabric loopback (node-ip) | Mgmt/edge IP       | Role           |
+|----------------|---------------------------|--------------------|----------------|
+| master         | 10.255.227.204            | 192.168.122.100    | control-plane  |
+| control-2      | 10.255.3.188              | 192.168.122.106    | control-plane  |
+| control-3      | 10.255.114.158            | 192.168.122.130    | control-plane  |
+| worker-24cf41  | 10.255.12.224             | —                  | worker         |
+| worker-b0ff27  | 10.255.246.32             | —                  | worker         |
+| worker-b56b35  | 10.255.221.26             | —                  | worker         |
+| worker-ea7e34  | 10.255.224.42             | —                  | worker         |
+
+API VIP: `10.255.255.1` (kube-vip BGP, fabric-internal, `:6443`). Host gateway:
+`192.168.122.1` (virbr0). Fabric: supernet `10.255.0.0/16`, OSPF area 0, AS 64512.
