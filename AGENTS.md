@@ -46,7 +46,7 @@
 
 ## Cluster Access
 - Do not assume local `kubectl` or Docker reaches the lab cluster. The K3s master is reached over SSH at `ubuntu@192.168.122.100` with password `ubuntu`; use `python tools/gns3/ssh_k3s.py "kubectl get pods -n sdn-controller"` for remote commands.
-- K3s `--node-ip` is the node's fabric loopback (`10.255.x`, from `machine-id`). The server runs `--flannel-backend=none --disable-network-policy` (Calico BGP provides CNI); agents join with `--node-ip=<loopback>` only. SSH to Master-1 is still its edge IP `192.168.122.100`.
+- K3s `--node-ip` is the node's fabric loopback (`10.255.x`, from `machine-id`). The server runs `--flannel-backend=none --disable-network-policy` (Calico provides the CNI: VXLAN dataplane + its own BGP mesh); agents join with `--node-ip=<loopback>` only. SSH to Master-1 is still its edge IP `192.168.122.100`.
 - Never commit a K3s join token. `k3s_worker_command.sh` is ignored and should take `K3S_NODE_TOKEN` from the environment.
 - Use `sudo kubectl` until `~/.kube/config` is copied from `/etc/rancher/k3s/k3s.yaml` with user-readable permissions and rewritten to the API VIP `https://10.255.255.1:6443` (kube-vip BGP; fabric-internal).
 

@@ -133,8 +133,13 @@ direct gateway ping): it provides internet, NATs the fabric (`10.255/16` → MAS
 and originates the OSPF default. Workers have **no** `192.168.122.x` address. NAT1
 bridges the GNS3 L2 to the host's `virbr0` via a TAP interface (`gns3tap0-0`).
 
-Overlay (kube-vip BGP for the API VIP `10.255.255.1`, Calico BGP for pod routes) peers
-with the local FRR (`127.0.0.1`). Manifests in `deploy/k8s/l3-fabric/`.
+FRR runs **only `ospfd`** (no `bgpd`): the host's BGP `:179` belongs to Calico. Calico is
+the CNI — **VXLAN** dataplane over the loopbacks (native/no-encap routing is NOT viable on
+this multi-hop fabric) plus its own node-to-node **BGP mesh** (BIRD) so `calico-node` is
+`1/1`. The `calico-apiserver` (`APIServer` CR) is required for the operator to manage IPPools.
+The kube-vip BGP VIP (`10.255.255.1`) propagates via **OSPF** (kube-vip adds it to `lo`, which
+is OSPF-enabled), not via FRR BGP. Manifests in `deploy/k8s/l3-fabric/` (`kube-vip-{arp,bgp}.yaml`,
+`calico-fabric.yaml`). See memory `vip-hibrido-bgp-arp`.
 
 ### Control Plane: Ryu (distributed)
 

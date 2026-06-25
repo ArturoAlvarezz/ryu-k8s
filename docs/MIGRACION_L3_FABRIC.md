@@ -53,7 +53,7 @@ storm-guards, kube-vip ARP/L2. **Cero casos por hostname, cero workers especiale
   (OSPF unnumbered + BGP listen-range), arranca FRR.
 - `tools/gns3/l3-fabric/fabric-bootstrap.service` — oneshot, corre **antes** de K3s.
 - `deploy/k8s/l3-fabric/kube-vip-bgp.yaml` — kube-vip BGP (solo control-planes).
-- `deploy/k8s/l3-fabric/calico-bgp.yaml` — Calico BGP (mesh nativa OFF, peer = FRR local).
+- `deploy/k8s/l3-fabric/calico-fabric.yaml` — Calico (operador): Installation VXLAN + APIServer. (El `calico-bgp.yaml` planeado, peer a FRR, se descartó — ver ACTUALIZACIÓN abajo.)
 
 ## Runbook de reconstrucción (corte por reconstrucción, sin proyecto paralelo)
 
@@ -83,7 +83,7 @@ storm-guards, kube-vip ARP/L2. **Cero casos por hostname, cero workers especiale
 2. Re-desplegar la imagen nueva en cada VM (control-planes primero).
 3. Reinstalar K3s HA con los flags de loopback (Fase A.4).
 4. `kubectl apply -f deploy/k8s/l3-fabric/kube-vip-bgp.yaml`.
-5. Instalar Calico (operador) + `kubectl apply -f deploy/k8s/l3-fabric/calico-bgp.yaml`.
+5. Instalar Calico: `tigera-operator.yaml` + `kubectl apply -f deploy/k8s/l3-fabric/calico-fabric.yaml`.
 6. Join de workers (la golden image ya auto-join contra `10.255.255.1`).
 
 ### Fase D — Validar K8s + datos
@@ -109,8 +109,25 @@ storm-guards, kube-vip ARP/L2. **Cero casos por hostname, cero workers especiale
   vuelve al estado L2 funcional (7/7 Ready).
 
 ## Puntos abiertos a afinar durante la reconstrucción
-- Integración exacta kube-vip↔FRR (router-id por `status.hostIP`) y Calico↔FRR
-  (que el `redistribute connected` de FRR no reanuncie las /32 de pods de Calico
-  en bucle — usar route-maps si hace falta).
 - Tiempo de reconvergencia OSPF objetivo (ajustar `hello/dead` o usar BFD).
 - `etcd` peer-urls sobre loopback (K3s lo deriva de `--node-ip`; verificar).
+
+## ACTUALIZACIÓN — estado REAL desplegado (2026-06-25)
+
+El plano L3 (loopbacks/OSPF, `--node-ip`, flannel off) se aplicó. Pero la **capa BGP
+divergió del plan de arriba**; lo realmente desplegado y validado es:
+
+- **kube-vip ↔ FRR: NO.** FRR corre **solo `ospfd`** (`bgpd=no`). El VIP `10.255.255.1`
+  se propaga por **OSPF** (kube-vip lo añade a `lo`, que es OSPF-enabled), no por BGP.
+- **VIP HÍBRIDO:** además del BGP `10.255.255.1` (interno al fabric), se mantiene un
+  kube-vip **ARP** `192.168.122.10` para acceso del host. `deploy/k8s/l3-fabric/kube-vip-arp.yaml`
+  + `kube-vip-bgp.yaml`; `deploy-kube-vip.sh all` despliega ambos.
+- **Calico ↔ FRR: NO (inviable).** El routing nativo de Calico **no funciona** en este
+  fabric multi-salto (sin encap, el kernel no instala rutas de pod a nodos no
+  L2-adyacentes). Se usa **VXLAN** + la **malla BGP propia de Calico (BIRD)** sobre las
+  loopbacks → `calico-node` 1/1. Por eso FRR va sin `bgpd` (BIRD necesita el `:179`).
+  El `calico-bgp.yaml` (peer a FRR, sin VXLAN) se **eliminó**; usar
+  `deploy/k8s/l3-fabric/calico-fabric.yaml` (Installation VXLAN + **APIServer**, este
+  último imprescindible para que el operador gestione IPPools).
+
+Ver memoria `vip-hibrido-bgp-arp` para el detalle operativo.

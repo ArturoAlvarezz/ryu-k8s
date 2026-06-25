@@ -93,10 +93,14 @@ de K3s. Motivación e historia: [`MIGRACION_L3_FABRIC.md`](MIGRACION_L3_FABRIC.m
   `sha256(/etc/machine-id)` (sin DHCP, sin caso por hostname). Es el `--node-ip`
   de K3s y el router-id de OSPF/BGP.
 - **OSPF unnumbered** (FRR, área 0) sobre cada `ens3`-`ens6` con carrier →
-  alcanzabilidad loopback-a-loopback + **ECMP** (`maximum-paths 8`).
-- **BGP** (FRR, AS 64512, iBGP por `listen range`): kube-vip anuncia el VIP del
-  API `10.255.255.1/32` y Calico las rutas de pods; ambos peeran con el FRR
-  local (`127.0.0.1`).
+  alcanzabilidad loopback-a-loopback + **ECMP** (`maximum-paths 8`). FRR corre
+  **solo `ospfd`** (sin `bgpd`): el `:179` del host es para Calico.
+- **VIP del API**: kube-vip lo añade a `lo` (OSPF-enabled) y **OSPF** lo propaga
+  fabric-wide (`10.255.255.1/32`). NO usa BGP en FRR. Además un kube-vip ARP
+  mantiene `192.168.122.10` para acceso del host (ver §5).
+- **Calico (CNI)**: red de pods en **VXLAN** (el routing nativo no es viable en
+  este fabric multi-salto) + su propia malla **BGP** (BIRD) sobre las loopbacks
+  → `calico-node` 1/1. Requiere `bgpd=no` en FRR (para que BIRD tome el `:179`).
 - **cloud-init de red deshabilitado** (`99-disable-network-config.cfg`) y netplan
   reducido a `ens*` sueltas; `fabric-bootstrap` erradica cualquier `br0` heredado.
 - Dependencia circular resuelta por diseño: Ryu/K3s viven sobre el fabric, pero el
@@ -204,13 +208,19 @@ Ver `AGENTS.md` "VXLAN topology is neighbor-only, NOT full mesh".
 | `loki`            | Agregación de logs                                |
 | `promtail`        | Recolección de logs desde pods                    |
 
-## 5. HA / VIP
+## 5. HA / VIP (híbrido)
 
-- **VIP API server**: `https://10.255.255.1:6443`, anunciado por **kube-vip en
-  modo BGP** desde los 3 control planes (peer = FRR local). Es interno al fabric;
-  con ECMP no hay "líder" ni failover ARP. Si un CP cae, los demás lo siguen
-  anunciando.
-- Configurar `kubeconfig` con `server: https://10.255.255.1:6443`.
+Dos VIPs del API coexisten (DaemonSets `kube-vip-bgp` y `kube-vip`, IP/interfaz/
+lease distintos):
+
+- **`10.255.255.1` — kube-vip BGP** (`vip_interface: lo`): kube-vip lo añade a `lo`
+  y **OSPF** lo propaga fabric-wide (lo usan los agentes/servidores). Líder por lease
+  `plndr-cp-lock-bgp`; si cae, otro CP lo toma y OSPF reanuncia. **Interno al fabric**
+  (el host no lo alcanza).
+- **`192.168.122.10` — kube-vip ARP** (`vip_interface: ens3`): flota entre los 3 CP por
+  el L2 del Mgmt-Switch (lease `plndr-cp-lock`). Para **acceso del host** + dashboards.
+- `kubeconfig`: en un nodo, `server: https://10.255.255.1:6443`; desde el host, usar
+  `https://192.168.122.10:6443` (o `ssh_k3s.py`).
 
 ## 6. Telemetría Smart Meter
 
