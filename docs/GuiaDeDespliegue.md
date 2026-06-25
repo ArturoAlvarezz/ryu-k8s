@@ -1,9 +1,18 @@
 # Guía de Despliegue: RYU SDN Framework sobre K3s
 
-> **Stack:** RYU Controller · K3s HA · Open vSwitch · Redis Sentinel · Docker
-> **Entorno:** Ubuntu QEMU/KVM en GNS3 · Red de gestión `192.168.122.0/24` · Plano de datos SDN `10.0.0.0/24`
+> **Stack:** RYU Controller · K3s HA · Open vSwitch · FRR (OSPF/BGP) · Calico · Redis Sentinel · Docker
+> **Entorno:** Ubuntu QEMU/KVM en GNS3 · **Fabric L3 enrutado** (loopbacks `10.255.0.0/16`, OSPF/BGP) · Plano de datos SDN `10.0.0.0/24`
 
 Guía genérica para desplegar el laboratorio desde cero. El cableado y la cantidad de nodos son libres: sirve para cualquier topología siempre que se respeten los roles, el mapa de interfaces y el orden de despliegue.
+
+> **Arquitectura L3 (importante).** La red de gestión ya **no** es un bridge L2 plano
+> (`br0` + DHCP + STP). Es un **fabric L3 enrutado**: cada cable `ensX` es un enlace OSPF
+> *unnumbered* punto a punto y cada nodo tiene una **loopback `/32`** estable
+> (`10.255.B1.B2`, derivada de `sha256(/etc/machine-id)`). Lo monta
+> `fabric-bootstrap.service` (`tools/gns3/l3-fabric/`) antes de K3s. OSPF da
+> alcanzabilidad + ECMP (es el failover; no hay daemons), kube-vip BGP anuncia el VIP del
+> API `10.255.255.1` y Calico BGP las rutas de pods. Detalle y motivación en
+> [`docs/MIGRACION_L3_FABRIC.md`](MIGRACION_L3_FABRIC.md).
 
 ---
 
@@ -23,7 +32,7 @@ Guía genérica para desplegar el laboratorio desde cero. El cableado y la canti
 
 **Parte III — Workers**
 9. [Preparar la Golden Image de workers](#9-preparar-la-golden-image-de-workers)
-10. [Configurar auto-join del worker](#10-configurar-auto-join-del-worker)
+10. [Configurar auto-join del worker (fabric L3)](#10-configurar-auto-join-del-worker-fabric-l3)
 11. [Sellar la Golden Image](#11-sellar-la-golden-image)
 12. [Importar y arrancar workers en GNS3](#12-importar-y-arrancar-workers-en-gns3)
 
@@ -37,7 +46,7 @@ Guía genérica para desplegar el laboratorio desde cero. El cableado y la canti
 17. [Monitoreo y endpoints](#17-monitoreo-y-endpoints)
 18. [Debugging post-despliegue](#18-debugging-post-despliegue)
 19. [Operaciones de mantenimiento](#19-operaciones-de-mantenimiento)
-20. [Resiliencia de la red de gestión](#20-resiliencia-de-la-red-de-gestión)
+20. [Resiliencia del fabric L3](#20-resiliencia-del-fabric-l3)
 
 ---
 
@@ -45,21 +54,25 @@ Guía genérica para desplegar el laboratorio desde cero. El cableado y la canti
 
 ## 1. Roles de nodos
 
-| Rol | Cantidad | IP | Instalación K3s |
-| --- | --- | --- | --- |
-| Primer control-plane | 1 | `192.168.122.100` fija | `server --cluster-init` |
-| Control-plane adicional | 2 | DHCP en `br0` | `server` unido al primero |
-| Worker | Según topología | DHCP en `br0` | `agent` con auto-join |
-| Smart Meter (guest) | Según topología | DHCP en `br-sdn` (`10.0.0.0/24`) | No es nodo del cluster |
-| VIP API Server | 1 | `192.168.122.10` | Anunciado por `kube-vip` |
+| Rol | Cantidad | `--node-ip` | IP de gestión (edge) | Instalación K3s |
+| --- | --- | --- | --- | --- |
+| Primer control-plane | 1 | loopback `10.255.x` | `192.168.122.100` fija | `server --cluster-init` |
+| Control-plane adicional | 2 | loopback `10.255.x` | `192.168.122.x` fija | `server` unido al primero |
+| Worker | Según topología | loopback `10.255.x` | — (sin IP de gestión) | `agent` con auto-join |
+| Smart Meter (guest) | Según topología | DHCP en `br-sdn` (`10.0.0.0/24`) | — | No es nodo del cluster |
+| VIP API Server | 1 | `10.255.255.1` | — | Anunciado por `kube-vip` (BGP) |
 
-El endpoint final del cluster es siempre:
+El endpoint final del cluster es siempre el VIP del API (interno al fabric):
 
 ```text
-https://192.168.122.10:6443
+https://10.255.255.1:6443
 ```
 
-El primer servidor `192.168.122.100` se usa solo para inicializar el cluster y para que los servidores adicionales encuentren el primer miembro etcd durante el join. Después, todo apunta al VIP.
+La **loopback `/32`** de cada nodo (`--node-ip`) se deriva sola de `/etc/machine-id`; no se
+asigna a mano ni por DHCP. Solo los control-planes conectados al `Mgmt-Switch`/`NAT1`
+conservan una **IP de gestión `192.168.122.x`** en su interfaz *edge* (da internet, NAT del
+fabric y origina la default en OSPF); los workers no tienen ninguna. El primer servidor
+inicializa etcd; los CP adicionales se unen vía el VIP (o la loopback del primero).
 
 Recursos mínimos validados para las VMs control-plane:
 
@@ -74,34 +87,28 @@ Recursos mínimos validados para las VMs control-plane:
 
 | Interfaz | Uso |
 | --- | --- |
-| `ens3` | Gestión principal hacia Cloud `virbr0` o enlace de gestión |
-| `ens4`-`ens6` | Extensión de la red de gestión entre nodos |
-| `ens7`-`ens8` | Puertos de guests SDN (Smart Meters), fuera de `br0` |
-| `br0` | Bridge Linux de gestión `192.168.122.0/24` |
+| `ens3`-`ens6` | Enlaces del **fabric L3** (OSPF *unnumbered* P2P). Todo cable con carrier entra al fabric |
+| `ens7`-`ens8` | Puertos de guests SDN (Smart Meters), fuera del fabric (los toma OVS) |
+| `lo` | Loopback `/32` del fabric (`10.255.x`, `--node-ip`); en CPs *edge* además la IP de gestión |
 | `br-sdn` | Bridge Open vSwitch del plano de datos `10.0.0.0/24` (lo crea el DaemonSet SDN) |
 
-`br0` (gestión) y `br-sdn` (datos SDN) nunca se mezclan. Los puertos de guests (`ens7`-`ens8`) quedan fuera de `br0` y los toma OVS.
+No hay `br0`: el fabric es L3 enrutado. Las interfaces del fabric (`ens3`-`ens6`) y el plano
+de datos SDN (`br-sdn`, `ens7`-`ens8`) nunca se mezclan. Un cable del fabric **no** debe
+enslavarse a ningún bridge: debe quedar como interfaz L3 suelta para que OSPF *unnumbered*
+levante en ella.
 
-### 2.1 Configurar el switch de gestión en GNS3
+### 2.1 Switch de gestión / NAT (solo borde a internet)
 
-| Campo | Valor |
-| --- | --- |
-| Template | Docker container / Open vSwitch |
-| Imagen | `gns3/openvswitch:latest` |
-| Nombre del nodo | `Mgmt-Switch` o equivalente |
-| Adaptadores | 16 Ethernet, o al menos tantos como enlaces de gestión vayas a conectar |
-| Consola | Telnet o none |
+En el fabric L3 **no** existe un switch L2 de gestión que una a todos los nodos. La función
+del antiguo `Mgmt-Switch` se reduce a dar **acceso a internet** al laboratorio: un
+`Mgmt-Switch` (OVS) + `NAT1` conectan a la(s) interfaz(es) *edge* de los control-planes con
+el `virbr0` del host (`192.168.122.0/24`). El control-plane que reciba el gateway por esa
+interfaz la detecta como *edge* (`fabric-bootstrap`), conserva su IP `192.168.122.x`, hace
+NAT del fabric (`10.255/16`) y origina la default en OSPF, dando internet a todo el cluster.
 
-```bash
-ovs-vsctl --may-exist add-br br0
-for port in $(ls /sys/class/net | grep -E "^eth[0-9]+$"); do
-  ovs-vsctl --may-exist add-port br0 "$port"
-  ip link set "$port" up
-done
-ip link set br0 up
-```
-
-El control de bucles no se delega al switch de gestión; se mantiene con el árbol determinístico de puertos aplicado en cada nodo K3s (ver [Sección 20](#20-resiliencia-de-la-red-de-gestión)).
+Los workers y los enlaces internos del fabric **no** se conectan a este switch: van
+directo nodo-a-nodo por `ens3`-`ens6`. No hay loops L2 que controlar (cada cable es un
+enlace L3); por eso desaparecen STP, el árbol `ACTIVE_BR0_PORTS` y los daemons de failover.
 
 ---
 
@@ -133,38 +140,47 @@ cd ~/ryu-k8s
 
 ### 3.2 Ejecutar preparación automática
 
-`tools/gns3/prepare-k3s-control-plane.sh` expande `/dev/vda1` si puede, instala utilidades y Docker, fija hostname, configura `netplan` con `br0`, instala `gns3-br0-tree.service`, habilita forwarding y deja persistentes las reglas necesarias para K3s.
+`tools/gns3/prepare-k3s-control-plane.sh` expande `/dev/vda1` si puede, instala utilidades,
+Docker y **FRR**, fija hostname, escribe un netplan L3 (sin `br0`), instala y habilita
+`fabric-bootstrap.service` (+ `frr.service`), y **persiste la IP de gestión del edge** en
+`/etc/l3-fabric/mgmt.env` (para NAT + default-origination). Elimina cualquier resto L2
+(`gns3-br0-tree`, `uplink-failover`, etc.).
 
 ```bash
 cd ~/ryu-k8s
+# arg2 = hostname, arg3 = IP de gestion del EDGE (192.168.122.x hacia el Mgmt-Switch/NAT)
 sudo ./tools/gns3/prepare-k3s-control-plane.sh first master 192.168.122.100
 ```
 
 Para evitar `apt upgrade` en una reinstalación rápida: `RYU_K3S_SKIP_APT_UPGRADE=true`.
 
-La sesión SSH puede cortarse cuando `ens3` pasa a `br0`. Es esperado. Reconecta a `192.168.122.100` y valida:
+**Reinicia la VM** (o `sudo systemctl start fabric-bootstrap.service`) para que el fabric se
+monte. La sesión por consola puede parpadear mientras se reorganiza la red. Reconecta y valida:
 
 ```bash
 hostname
-ip -br addr show br0
-systemctl is-active gns3-br0-tree.service
+ip -br -4 addr show lo            # debe mostrar la loopback 10.255.x/32
+ip -br -4 addr show              # la interfaz edge conserva 192.168.122.100/24
+systemctl is-active fabric-bootstrap.service frr.service
+sudo vtysh -c 'show ip ospf neighbor'   # adyacencias FULL en cada cable con vecino
 df -h /
 ```
 
 ## 4. Instalar K3s en el primer servidor
 
-Solo en `master` (`192.168.122.100`):
+Solo en `master`, **después** de que `fabric-bootstrap` haya asignado la loopback (paso 3.2).
+El `--node-ip` se toma solo de la loopback del fabric; no se pasa IP de gestión.
 
 ```bash
 cd ~/ryu-k8s
 
 sudo RYU_K3S_CLUSTER_INIT=true \
-  RYU_K3S_API_ENDPOINT=192.168.122.10 \
-  RYU_K3S_NODE_IP=192.168.122.100 \
+  RYU_K3S_API_ENDPOINT=10.255.255.1 \
   ./tools/gns3/k3s-server-ha-install.sh
 ```
 
-Espera a que el nodo quede estable (puede aparecer `Ready` con rol `<none>` unos segundos):
+El script instala K3s con `--flannel-backend=none --disable-network-policy` (la CNI la dará
+Calico) y `--tls-san=10.255.255.1`. Espera a que el nodo quede estable y guarda el token:
 
 ```bash
 for i in $(seq 1 30); do
@@ -174,6 +190,9 @@ for i in $(seq 1 30); do
 done
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
+
+> Con `--flannel-backend=none` los nodos quedan `NotReady` hasta instalar la CNI (Calico,
+> paso 7). Es esperado.
 
 ## 5. Preparar permisos de kube-vip
 
@@ -201,30 +220,27 @@ cd ~/ryu-k8s
 
 ### 6.2 Ejecutar preparación automática
 
-Usa `control-2` en el segundo y `control-3` en el tercero. El script configura DHCP temporal en `br0`; `gns3-br0-tree.service` captura esa IP como `NODE_IP` estática para reinicios.
+Usa `control-2` en el segundo y `control-3` en el tercero. Cada CP adicional necesita su
+**hostname** y su **IP de gestión del edge** (la `192.168.122.x` reservada de esa VM hacia el
+`Mgmt-Switch`/`NAT`):
 
 ```bash
 cd ~/ryu-k8s
-sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-2
+sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-2 192.168.122.106
 ```
 
 ```bash
 cd ~/ryu-k8s
-sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-3
+sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-3 192.168.122.130
 ```
 
-Para fijar una IP reservada explícita, pásala como tercer argumento:
-
-```bash
-sudo ./tools/gns3/prepare-k3s-control-plane.sh additional control-2 192.168.122.X
-```
-
-Tras `netplan apply` la IP puede cambiar (pasa de `ens3` a `br0`). Si pierdes SSH, busca la IP nueva en la consola GNS3 o por escaneo de `192.168.122.0/24`, reconecta y valida antes de seguir:
+**Reinicia** cada VM (o arranca `fabric-bootstrap.service`) y valida el fabric antes de unir:
 
 ```bash
 hostname
-ip -br addr show br0
-systemctl is-active gns3-br0-tree.service
+ip -br -4 addr show lo            # loopback 10.255.x/32
+systemctl is-active fabric-bootstrap.service frr.service
+sudo vtysh -c 'show ip ospf neighbor'
 df -h /
 ```
 
@@ -236,33 +252,50 @@ Ejecuta el join en cada uno de los dos servidores adicionales con el token real 
 sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
+El primer servidor aún no anuncia el VIP (kube-vip se despliega abajo), así que los CP
+adicionales se unen vía la **loopback del primer server** (`RYU_K3S_FIRST_SERVER_IP`). Obtén
+la loopback de `master` con `ip -br -4 addr show lo` (p.ej. `10.255.227.204`):
+
 ```bash
 cd ~/ryu-k8s
 
 sudo RYU_K3S_NODE_TOKEN='<TOKEN_REAL_DEL_CLUSTER_HA>' \
-  RYU_K3S_API_ENDPOINT=192.168.122.10 \
-  RYU_K3S_FIRST_SERVER_IP=192.168.122.100 \
+  RYU_K3S_API_ENDPOINT=10.255.255.1 \
+  RYU_K3S_FIRST_SERVER_IP=<LOOPBACK_DE_MASTER> \
   ./tools/gns3/k3s-server-ha-install.sh
 ```
 
-Valida que los 3 nodos estén listos con rol `control-plane,etcd`:
+Valida que los 3 nodos aparezcan con rol `control-plane,etcd` (aún `NotReady`, sin CNI):
 
 ```bash
 sudo kubectl get nodes -o wide
 sudo kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide
 ```
 
-Con los 3 control-plane como miembros etcd, despliega `kube-vip` una sola vez como DaemonSet. No habilites `services`; solo se necesita que anuncie `192.168.122.10` para el API Server.
+Con los 3 control-plane como miembros etcd, despliega **kube-vip en modo BGP** (peerea con el
+FRR local y anuncia el VIP del API `10.255.255.1/32`) e instala **Calico** (CNI) con peering
+BGP al FRR local:
 
 ```bash
 cd ~/ryu-k8s
-sudo ./tools/gns3/deploy-kube-vip.sh daemonset
-curl -k https://192.168.122.10:6443/readyz
+sudo ./tools/gns3/deploy-kube-vip.sh all        # RBAC + DaemonSet BGP (deploy/k8s/l3-fabric/kube-vip-bgp.yaml)
+
+# Calico (operador Tigera) + el BGPConfiguration/peers del fabric:
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+kubectl apply -f deploy/k8s/l3-fabric/calico-bgp.yaml
+
+# Tras unos segundos los nodos pasan a Ready y el VIP responde (desde un CP):
+sudo kubectl get nodes -o wide
+curl -k https://10.255.255.1:6443/readyz
 ```
 
-`ok` = credenciales locales válidas. `401 Unauthorized` = el VIP funciona (el API respondió sin credenciales). Lo que NO debe ocurrir es timeout, conexión rechazada o ruta inalcanzable.
+`ok` = credenciales locales válidas. `401 Unauthorized` = el VIP funciona (el API respondió sin
+credenciales). Lo que NO debe ocurrir es timeout, conexión rechazada o ruta inalcanzable.
+Verifica el peering BGP con `sudo vtysh -c 'show bgp ipv4 summary'` (kube-vip y Calico
+establecidos contra `127.0.0.1`).
 
-El bloque `hostAliases` del DaemonSet fuerza a cada pod de `kube-vip` a hablar con el API local en `127.0.0.1`. Sin eso, `control-2`/`control-3` pueden quedarse sin failover cuando cae `master`.
+> Ajusta la versión del operador de Calico (`v3.28.0`) a la del cluster si difiere. El
+> `calico-bgp.yaml` del repo desactiva la malla nativa y fija el peer al FRR local.
 
 ## 8. Configurar kubeconfig
 
@@ -273,8 +306,7 @@ mkdir -p ~/.kube
 sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
 sudo chown $(id -u):$(id -g) ~/.kube/config
 chmod 600 ~/.kube/config
-sed -i 's#https://127.0.0.1:6443#https://192.168.122.10:6443#g' ~/.kube/config
-sed -i 's#https://192.168.122.100:6443#https://192.168.122.10:6443#g' ~/.kube/config
+sed -i 's#https://127.0.0.1:6443#https://10.255.255.1:6443#g' ~/.kube/config
 grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.bashrc || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.bashrc
 grep -qxF 'export KUBECONFIG=$HOME/.kube/config' ~/.profile || echo 'export KUBECONFIG=$HOME/.kube/config' >> ~/.profile
 export KUBECONFIG=$HOME/.kube/config
@@ -441,7 +473,7 @@ kubectl get node <worker-name> -o jsonpath='{.metadata.annotations.k3s\.io/node-
 
 ## 13. Desplegar servicios SDN en Kubernetes
 
-Ejecuta desde un control-plane con `kubectl` apuntando a `https://192.168.122.10:6443`. Idealmente con los workers esperados ya en `Ready` (los DaemonSets solo corren en nodos existentes; los nuevos se cubren al unirse).
+Ejecuta desde un control-plane con `kubectl` apuntando a `https://10.255.255.1:6443`. Idealmente con los workers esperados ya en `Ready` (los DaemonSets solo corren en nodos existentes; los nuevos se cubren al unirse).
 
 ```bash
 cd ~
@@ -511,7 +543,7 @@ Manifiestos aplicados:
 
 ## 14. Incorporar Smart Meters
 
-Los Smart Meters son **guests del plano de datos SDN** (`10.0.0.0/24`), no nodos del cluster. Se incorporan como contenedores Docker en GNS3 conectados a un puerto de guest de un worker (fuera de `br0`). Obtienen IP del DaemonSet `sdn-dhcp-server`, publican telemetría UDP firmada con HMAC hacia el colector local `10.0.0.1:5555`, y deben autorizarse en la consola AMI (deny-default).
+Los Smart Meters son **guests del plano de datos SDN** (`10.0.0.0/24`), no nodos del cluster. Se incorporan como contenedores Docker en GNS3 conectados a un puerto de guest de un worker (fuera del fabric). Obtienen IP del DaemonSet `sdn-dhcp-server`, publican telemetría UDP firmada con HMAC hacia el colector local `10.0.0.1:5555`, y deben autorizarse en la consola AMI (deny-default).
 
 ### 14.1 Importar el appliance en GNS3 (si no está presente)
 
@@ -561,7 +593,7 @@ Esto garantiza la **misma IP tras recrear o reiniciar la VM**, lo que evita re-r
 ### 14.3 Conexión en la topología
 
 1. Arrastra el nodo Smart Meter al canvas.
-2. Conecta su `eth0` a un **puerto de guest de un worker** (`ens7`/`ens8`, fuera de `br0`). **No** lo conectes a `br0`, al switch de gestión ni a `NAT1`.
+2. Conecta su `eth0` a un **puerto de guest de un worker** (`ens7`/`ens8`, fuera del fabric). **No** lo conectes a un cable del fabric, al switch de gestión ni a `NAT1`.
 3. El worker debe estar `Ready` y con `br-sdn` creado (`ovs-sdn-initializer`). OVS aprende el puerto del guest y el DHCP responde.
 4. Enciende el Smart Meter.
 
@@ -571,12 +603,12 @@ El medidor pertenece al worker al que está cableado; `10.0.0.1` es la IP de `br
 
 La telemetría es deny-default: un medidor nuevo queda en `pending` y su telemetría se descarta hasta autorizarlo.
 
-1. Abre la consola AMI: `http://192.168.122.10:8081` → sección **Seguridad**.
+1. Abre la consola AMI: `http://192.168.122.100:8081` → sección **Seguridad**.
 2. El medidor aparece como guest observado (correlación por `topology:guest_ips`). Pulsa **Registrar** o cambia su estado a `authorized`.
 3. Verifica que la telemetría fluye:
 
 ```bash
-curl http://192.168.122.10:8081/api/stats
+curl http://192.168.122.100:8081/api/stats
 ```
 
 Las VMs recreadas que ya estaban `authorized` conservan el estado si mantienen su MAC/IP determinista (sección 14.2).
@@ -606,28 +638,27 @@ kubectl get nodes -o wide
 
 Debe haber 3 nodos `control-plane,etcd` y el resto workers.
 
+La `InternalIP` de cada nodo debe ser su **loopback del fabric** (`10.255.x`):
+
 ```bash
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" internal="}{.status.addresses[?(@.type=="InternalIP")].address}{" flannel="}{.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}{"\n"}{end}'
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" node-ip="}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
 ```
 
-La IP `internal` y la IP `flannel` deben coincidir en cada nodo.
+CNI (Calico) y BGP sanos:
 
 ```bash
-kubectl -n kube-system get pods -o wide
+kubectl -n calico-system get pods -o wide
+kubectl -n kube-system get pods -l app=kube-vip -o wide
+# Peering BGP (kube-vip + Calico contra el FRR local) desde un control-plane:
+sudo vtysh -c 'show bgp ipv4 summary'
+sudo vtysh -c 'show ip route 10.255.255.1'   # el VIP del API por BGP
 ```
 
-Qué control-plane anuncia el VIP:
+El VIP del API (`10.255.255.1`) lo anuncia kube-vip por BGP desde cada control-plane; con
+ECMP no depende de un "líder" L2. Para ver kube-vip:
 
 ```bash
-kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
-kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide
-kubectl -n kube-system logs -l app.kubernetes.io/name=kube-vip-ds --tail=50 --prefix
-```
-
-Desde la máquina local del repositorio puedes consultarlo por SSH contra el master:
-
-```bash
-python3 tools/gns3/ssh_k3s.py "kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{\"\n\"}'"
+kubectl -n kube-system logs -l app=kube-vip --tail=50 --prefix
 ```
 
 ## 16. Verificación de servicios SDN
@@ -659,26 +690,30 @@ kubectl -n sdn-controller exec <ovs-sdn-initializer-pod> -- ovs-vsctl show
 
 ## 17. Monitoreo y endpoints
 
-| Servicio | URL (VIP) | Directo (cualquier nodo) |
-| --- | --- | --- |
-| API Server K3s | `https://192.168.122.10:6443` | — |
-| Operaciones / Seguridad AMI / Topología | `http://192.168.122.10:8081` | `http://192.168.122.100:8081` |
-| Prometheus | `http://192.168.122.10:9090` | `http://192.168.122.100:9090` |
-| Grafana | `http://192.168.122.10:3000` | `http://192.168.122.100:3000` |
+| Servicio | URL (desde el host, vía un control-plane edge) |
+| --- | --- |
+| API Server K3s | `https://10.255.255.1:6443` (interno al fabric; desde el host usa `ssh_k3s.py`) |
+| Operaciones / Seguridad AMI / Topología | `http://192.168.122.100:8081` |
+| Prometheus | `http://192.168.122.100:9090` |
+| Grafana | `http://192.168.122.100:3000` |
 
-El servicio `meter-collector` corre con pods `hostNetwork` y **sirve el dashboard/API directamente en el puerto `8081` de cada nodo**. El acceso externo es `VIP:8081 → nodo:8081 → meter-collector local`, sin depender del ServiceLB de K3s. Su Service es `ClusterIP` (solo DNS/ClusterIP interno): no uses `LoadBalancer` ni `externalTrafficPolicy` aquí. Cualquier nodo vivo (y el VIP cuando lo sostiene un control-plane) responde en `:8081`; si el VIP no responde, usa la IP directa de un nodo.
+El VIP `10.255.255.1` (kube-vip BGP) front-ea **solo el API** (`:6443`) y es interno al
+fabric. Los dashboards corren en pods `hostNetwork` y **sirven directamente en el puerto de
+cada nodo**; desde el host se alcanzan en la IP de gestión de **cualquier control-plane edge**
+(`192.168.122.100/.106/.130`). Los workers no tienen IP de gestión, así que no se acceden
+directamente desde el host. Su Service es `ClusterIP`: no uses `LoadBalancer`.
 
 La telemetría AMI es deny-default. `/api/stats` muestra solo medidores autorizados con telemetría aceptada; `/api/telemetry-security` muestra los contadores de rechazo por fuente no registrada, cuarentena, bloqueo o errores de HMAC/replay.
 
 Consultas rápidas:
 
 ```bash
-curl http://192.168.122.10:8081/api/sdn-topology
-curl http://192.168.122.10:8081/api/stats
-curl http://192.168.122.10:8081/api/guests
-curl http://192.168.122.10:8081/api/telemetry-security
-curl http://192.168.122.10:9090/api/v1/targets
-curl -s 'http://192.168.122.10:9090/api/v1/query?query=ryu_topology_edge_info'
+curl http://192.168.122.100:8081/api/sdn-topology
+curl http://192.168.122.100:8081/api/stats
+curl http://192.168.122.100:8081/api/guests
+curl http://192.168.122.100:8081/api/telemetry-security
+curl http://192.168.122.100:9090/api/v1/targets
+curl -s 'http://192.168.122.100:9090/api/v1/query?query=ryu_topology_edge_info'
 ```
 
 Grafana usuario/contraseña inicial: `admin / admin`.
@@ -696,18 +731,26 @@ systemctl status k3s-agent --no-pager -l
 journalctl -u k3s-agent -n 120 --no-pager
 ```
 
-El endpoint configurado debe ser el VIP, y el archivo no debe contener el token:
+Primero, ¿montó el fabric? Sin loopback no hay `--node-ip` ni ruta al VIP:
+
+```bash
+ip -br -4 addr show lo                     # loopback 10.255.x/32
+systemctl status fabric-bootstrap.service --no-pager -l
+sudo vtysh -c 'show ip ospf neighbor'      # adyacencias FULL
+```
+
+El endpoint configurado debe ser el VIP del fabric, y el archivo no debe contener el token:
 
 ```bash
 sudo grep RYU_K3S_API_ENDPOINT /etc/systemd/system/k3s-autojoin.service.d/token.conf
 sudo grep -q K3S_NODE_TOKEN /etc/systemd/system/k3s-autojoin.service.d/token.conf && echo ERROR_TOKEN_ENV || echo OK
 ```
 
-Conectividad al API Server:
+Conectividad al API Server (el VIP es interno al fabric; esto se prueba **en el nodo**):
 
 ```bash
-ping -c 2 192.168.122.10
-timeout 2 bash -c '</dev/tcp/192.168.122.10/6443' && echo OK
+ping -c 2 10.255.255.1
+timeout 2 bash -c '</dev/tcp/10.255.255.1/6443' && echo OK
 ```
 
 Si el worker se instaló con una IP antigua, bórralo y reinstala el agent:
@@ -721,29 +764,34 @@ sudo /usr/local/bin/k3s-agent-uninstall.sh
 sudo systemctl restart k3s-autojoin.service
 ```
 
-### 18.2 VIP no responde
+### 18.2 VIP del API no responde (kube-vip BGP)
 
 ```bash
-kubectl -n kube-system get lease plndr-cp-lock -o yaml
-kubectl -n kube-system get pods -l app.kubernetes.io/name=kube-vip-ds -o wide
-kubectl -n kube-system logs <kube-vip-pod-name> --tail=120
+kubectl -n kube-system get pods -l app=kube-vip -o wide
+kubectl -n kube-system logs -l app=kube-vip --tail=120 --prefix
 ```
 
-`spec.holderIdentity` indica qué control-plane anuncia el VIP. Verifica que el DaemonSet use `br0`, `192.168.122.10`, el kubeconfig de K3s y el alias local del API:
+El VIP `10.255.255.1/32` se anuncia por **BGP** desde cada control-plane hacia su FRR local
+(`127.0.0.1`). Verifica el peering y la ruta (en un control-plane):
 
 ```bash
-kubectl -n kube-system get daemonset kube-vip-ds -o yaml | grep -E 'vip_interface|address:|192.168.122.10|br0|/etc/rancher/k3s/k3s.yaml|hostAliases|127.0.0.1'
+sudo vtysh -c 'show bgp ipv4 summary'        # vecino 127.0.0.1 Established
+sudo vtysh -c 'show ip route 10.255.255.1'   # /32 presente (vía BGP/OSPF)
+kubectl -n kube-system get ds kube-vip -o yaml | grep -E 'bgp_|vip_address|address'
 ```
 
-Si `control-2`/`control-3` muestran `context deadline exceeded` al leer el lease, revisa que exista `hostAliases` con `kubernetes -> 127.0.0.1`. Sin ese alias el failover puede no ocurrir cuando cae `master`.
+Si no aparece la ruta: revisa que `bgpd` esté activo (`/etc/frr/daemons`) y que el manifiesto
+`kube-vip-bgp.yaml` tenga `bgp_peeraddress=127.0.0.1` y el ASN del fabric (64512).
 
-### 18.3 IP interna y Flannel no coinciden
+### 18.3 InternalIP no es la loopback del fabric
 
 ```bash
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" internal="}{.status.addresses[?(@.type=="InternalIP")].address}{" flannel="}{.metadata.annotations.flannel\.alpha\.coreos\.com/public-ip}{"\n"}{end}'
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" node-ip="}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
 ```
 
-Para un worker afectado: `kubectl delete node <worker>`, luego en el worker `sudo /usr/local/bin/k3s-agent-uninstall.sh` y `sudo systemctl restart k3s-autojoin.service`.
+La `InternalIP` debe ser la loopback `10.255.x` del nodo. Si un nodo se registró con otra IP
+(p.ej. tras regenerar `machine-id`): `kubectl delete node <nodo>`, y en el nodo
+`sudo /usr/local/bin/k3s-agent-uninstall.sh` (worker) y `sudo systemctl restart k3s-autojoin.service`.
 
 ### 18.4 Redis Sentinel
 
@@ -770,9 +818,9 @@ kubectl logs -n sdn-controller -l app=sdn-dhcp --tail=200 --prefix
 ### 18.6 Smart Meter no reporta telemetría
 
 ```bash
-curl http://192.168.122.10:8081/api/stats
-curl http://192.168.122.10:8081/api/guests
-curl http://192.168.122.10:8081/api/telemetry-security
+curl http://192.168.122.100:8081/api/stats
+curl http://192.168.122.100:8081/api/guests
+curl http://192.168.122.100:8081/api/telemetry-security
 ```
 
 Un medidor nuevo NO se autoriza solo: al observarse queda en `pending` (rechazo `status_pending`) y su telemetría se descarta hasta aprobarlo con **Registrar** en la consola AMI (o estado `authorized`). Si `/api/telemetry-security` muestra `unregistered_source`, registra el medidor con la IP/MAC/DPID observados en `/api/guests`. Si muestra `status_quarantine` o `security_status_blocked`, cambia el estado a `authorized`. Los registros sin telemetría reciente se marcan `stale` en `/api/guests` (`offline_registered`).
@@ -844,88 +892,76 @@ Después del reset, reinicia o recrea los Smart Meters para que pidan DHCP otra 
 
 ### 19.4 Prueba de fallo del primer master
 
-Solo con 3 control-plane `Ready`. Apaga `master` en GNS3 y, desde otro control-plane:
+Solo con 3 control-plane `Ready`. Apaga `master` en GNS3 y, **desde otro control-plane**:
 
 ```bash
 for i in $(seq 1 30); do
-  curl -k --max-time 3 https://192.168.122.10:6443/readyz && break
+  curl -k --max-time 3 https://10.255.255.1:6443/readyz && break
   sleep 2
 done
 kubectl get nodes
-kubectl -n kube-system get lease plndr-cp-lock -o jsonpath='{.spec.holderIdentity}{"\n"}'
-curl http://192.168.122.10:8081/api/sdn-topology
+sudo vtysh -c 'show ip route 10.255.255.1'   # el VIP sigue anunciado por los CP vivos
+# El dashboard sigue en la IP edge de un control-plane VIVO (p.ej. control-2):
+curl http://192.168.122.106:8081/api/sdn-topology
 ```
 
 Resultado esperado:
 
-- `kubectl` sigue funcionando contra `192.168.122.10`.
-- El lease `plndr-cp-lock` cambia a un control-plane vivo (30-60 s mientras convergen ARP, kube-vip y etcd).
+- `kubectl` sigue funcionando contra `10.255.255.1` (kube-vip BGP lo anuncia desde los CP vivos; con ECMP no hay "líder" ni espera de failover ARP).
 - Redis Sentinel mantiene o elige un master.
 - Los DaemonSets críticos siguen activos en los nodos vivos.
 
 ---
 
-## 20. Resiliencia de la red de gestión
+## 20. Resiliencia del fabric L3
 
-La red de gestión (`br0`, `192.168.122.0/24`) es una sola L2 plana sin STP. Se mantiene libre de loops y tolerante a fallos con tres mecanismos coordinados, todos sin STP y auto-reparables ante tormentas de broadcast. El endpoint que mide "plano de gestión sano" es siempre el VIP HA `192.168.122.10` (kube-vip), no un control-plane concreto: así un master caído con el VIP flotando a otro nodo no se confunde con pérdida de red.
+El fabric L3 **elimina la clase entera de fallo** del diseño L2 anterior (tormenta de
+broadcast por loop): no hay dominio de broadcast multi-cable ni STP, y **OSPF es el
+failover**. Cada cable es un enlace L3; si uno cae, OSPF reconverge por otro camino (ECMP
+usa todos los cables a la vez, no respaldo en frío). Por eso desaparecen los tres daemons
+del modelo viejo (`gns3-br0-tree`, `uplink-failover`, `worker-mgmt-failover`) y sus
+guards de tormenta: ya no hacen falta.
 
-### 20.1 Árbol determinístico de `br0` (`gns3-br0-tree.service`)
+### 20.1 Cómo da tolerancia el fabric
 
-`tools/gns3/configure-br0-tree.sh` enslava a `br0` solo un subconjunto de puertos físicos por nodo (`ACTIVE_BR0_PORTS`), dejando el resto de cables conectados pero fuera del bridge. Eso da un árbol sin ciclos con STP deshabilitado; los enlaces redundantes quedan como respaldo en frío que se activa bajo demanda (20.2 y 20.3).
+- **Reachability + ECMP:** OSPF *unnumbered* sobre cada `ensX` con carrier. `maximum-paths 8`
+  → varios cables entre dos nodos se usan en paralelo; la caída de uno no corta la loopback.
+- **Internet redundante:** cualquier control-plane conectado al `Mgmt-Switch`/`NAT` se
+  autodetecta como *edge* (ping directo al gateway), hace NAT del fabric y **origina la
+  default en OSPF**. Si hay varios edges, hay varias salidas (sin daemon de uplink).
+- **VIP del API por BGP:** kube-vip anuncia `10.255.255.1/32` desde cada control-plane; si
+  uno cae, los demás lo siguen anunciando (sin lease ni failover ARP).
+- **Sin loops L2:** no hay bridge de gestión que pueda formar bucle, así que no hay
+  storm-guards ni árbol de puertos por hostname.
 
-- El subconjunto activo se define por nodo en `/etc/default/gns3-br0-tree` con `ACTIVE_BR0_PORTS`. Sin esa variable, el script aplica un default por hostname. Para un clon nuevo, fija `ACTIVE_BR0_PORTS` en su config en vez de depender del default.
-- **Excepción documentada:** un control-plane estable (p.ej. `control-3`) puede llevar `ens4` permanentemente en `br0` como extremo fijo del cable de respaldo hacia un worker (20.3). No forma loop porque el extremo del worker mantiene su `ens4` fuera de `br0` mientras el camino primario está sano.
-- Tras editar el árbol, el script regenera `netplan`/`networkd` para que un reinicio no re-enslave un puerto viejo y dispare una tormenta.
-
-```bash
-systemctl is-active gns3-br0-tree.service
-ip -br link show master br0
-```
-
-### 20.2 Failover del uplink a internet (`uplink-failover.service`)
-
-Solo `master` enslava su uplink hacia `NAT1`/gateway (`192.168.122.1`); es un punto único de fallo para salir a internet. El daemon `tools/gns3/uplink-failover.sh` corre en los control-plane de respaldo (`control-2` = prioridad 1, `control-3` = prioridad 2) y enslava su uplink local cuando `master` deja de responder, liberándolo al regresar `master` o ante una tormenta.
-
-- Solo se activa con `master` INALCANZABLE: si master no responde, su enlace está abajo y enslavar no crea un segundo camino activo (no hay loop).
-- Un guard de tormenta libera el puerto si se formara un loop en el failback.
-- El uplink es puro plano de gestión; `br-sdn`/VXLAN/Smart Meters no lo usan.
-
-Instalación (en `control-2` y `control-3`):
+Comprobaciones (en cualquier nodo):
 
 ```bash
-sudo install -m 0755 tools/gns3/uplink-failover.sh /usr/local/bin/uplink-failover.sh
-sudo install -m 0644 tools/gns3/uplink-failover.service /etc/systemd/system/uplink-failover.service
-echo 'PRIORITY=1' | sudo tee /etc/default/uplink-failover    # PRIORITY=2 en control-3
-sudo systemctl enable --now uplink-failover.service
+sudo vtysh -c 'show ip ospf neighbor'        # FULL en cada cable con vecino
+sudo vtysh -c 'show ip route 10.255.0.0/16'  # loopbacks alcanzables; multipath = ECMP
+sudo vtysh -c 'show bgp ipv4 summary'        # kube-vip + Calico Established (127.0.0.1)
 ```
 
-### 20.3 Failover de la ruta de gestión de un worker (`worker-mgmt-failover.service`)
-
-Cuando los workers cuelgan en cadena de un único worker-hub, apagar ese hub deja sin ruta de gestión a todos los workers aguas abajo (cascada: todos `NotReady`). Para romperla, un worker con un segundo cable hacia un control-plane corre `tools/gns3/worker-mgmt-failover.sh`, que enslava su puerto de respaldo (`BACKUP_PORT`, por defecto `ens4`) a `br0` cuando el VIP deja de responder.
-
-- **Disparo por salud del VIP** (`MGMT_VIP=192.168.122.10`): mientras el hub esté caído, el extremo primario del posible loop también está abajo, así que enslavar no forma bucle activo.
-- **Failback solo por tormenta:** cuando el hub vuelve, primario (`ens3`) y backup (`ens4`) quedan activos a la vez → loop → el guard libera `ens4`. No se libera por ping al VIP (estando enslavado el VIP es alcanzable por el propio backup).
-- **Sin IPs de worker hardcodeadas:** el único valor fijo es el VIP. Qué worker corre el daemon, su `BACKUP_PORT` y el cableado se definen por config.
-
-Requisito de cableado: el worker que corre el daemon debe tener un cable de su `ens4` al `ens4` de un control-plane que lleve ese puerto permanentemente en `br0` (excepción de 20.1).
-
-Instalación (en el worker con cable de respaldo a un control-plane):
+### 20.2 Prueba de caída de un enlace
 
 ```bash
-sudo install -m 0755 tools/gns3/worker-mgmt-failover.sh /usr/local/bin/worker-mgmt-failover.sh
-sudo install -m 0644 tools/gns3/worker-mgmt-failover.service /etc/systemd/system/worker-mgmt-failover.service
-# Opcional: override de BACKUP_PORT/MGMT_VIP en /etc/default/worker-mgmt-failover
-sudo systemctl enable --now worker-mgmt-failover.service
+sudo vtysh -c 'show ip route <loopback-remota>'   # antes: ruta (idealmente multipath)
 ```
 
-### 20.4 Prueba de no-cascada de workers
+Suspende un cable en GNS3 (link → Suspend). OSPF reconverge en pocos segundos:
+
+- La loopback remota sigue alcanzable (`ping <loopback>` continúa) si hay otro camino.
+- `ip -s link` **no** muestra explosión de pps (sin tormenta de broadcast).
+- Al restaurar el cable, OSPF lo reincorpora y el ECMP se rehace solo.
+
+### 20.3 Prueba de no-cascada de workers
 
 ```bash
 # Baseline: todos Ready
 kubectl get nodes --no-headers | awk '{print $1, $2}'
 ```
 
-Apaga el worker-hub en GNS3. A los 45 s, 90 s y 150 s:
+Apaga un worker-hub (uno del que cuelgan otros) en GNS3. A los 45 s, 90 s y 150 s:
 
 ```bash
 kubectl get nodes --no-headers | grep -c ' Ready'
@@ -934,6 +970,10 @@ kubectl get nodes --no-headers | grep ' NotReady'
 
 Resultado esperado:
 
-- Solo el worker-hub apagado aparece `NotReady`; los demás siguen `Ready`.
-- En el worker de respaldo, `journalctl -u worker-mgmt-failover` muestra un único `ENSLAVE` durante el outage y un único `TORMENTA → RELEASE` al reencender el hub.
-- Al reencender el hub, el cluster reconverge a todos `Ready` en 30-60 s.
+- Solo el worker apagado aparece `NotReady`; los demás reconvergen por OSPF y siguen `Ready`
+  (siempre que tengan otro cable de fabric hacia un nodo vivo).
+- No hay cascada: la ruta de gestión de los demás no dependía de un enslave L2 a ese hub.
+- Al reencender, el nodo rederiva su loopback, OSPF readyace y vuelve a `Ready`.
+
+> Para más matriz de fallos (enlace, worker, master, blackout) ver la nota de pruebas de
+> resiliencia del fabric L3 y `docs/RequisitosResiliencia.md`.
