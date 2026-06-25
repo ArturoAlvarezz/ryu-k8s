@@ -189,6 +189,10 @@ Description=Instalacion automatica de K3S Worker (fabric L3)
 After=fabric-bootstrap.service network-online.target
 Requires=fabric-bootstrap.service
 Wants=network-online.target
+# Reintentar para siempre (plug-and-play): si el fabric/VIP aun no esta listo (p.ej.
+# el watcher de enlaces aun no formo la adyacencia OSPF del cable nuevo), reintenta
+# sin que el rate-limit de systemd lo bloquee.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

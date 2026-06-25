@@ -198,6 +198,58 @@ systemctl enable fabric-forward-guard.service 2>/dev/null || true
 # --no-block: arrancar sin BLOQUEAR el bootstrap (evita cualquier espera circular).
 systemctl --no-block start fabric-forward-guard.service 2>/dev/null || true
 
+# --- PLUG-AND-PLAY: watcher de enlaces del fabric --------------------------------
+# fabric-bootstrap clasifica las ensX UNA sola vez al boot (las que tienen carrier en
+# la ventana inicial). Eso rompe el "cablear un nodo a un fabric YA encendido": el
+# puerto del nodo existente estaba sin carrier en SU boot, y el nodo nuevo puede
+# arrancar antes de que el cable este listo -> esa ensX nunca entra a OSPF -> sin
+# adyacencia. Este watcher RECONCILIA en continuo: cualquier ensX (3-6) que gane
+# carrier y NO sea el edge (sin IP de gestion 192.168.122.x) entra al fabric sola
+# (loopback /32 unnumbered + OSPF point-to-point area 0 + rp_filter=0), via vtysh en
+# caliente (sin reiniciar FRR). Asi agregar nodos es plug-and-play, sin ejecutar nada.
+cat > /usr/local/bin/fabric-link-watch.sh <<WATCH
+#!/bin/sh
+SUPERNET="${FABRIC_SUPERNET}"
+loopback() {
+    ip -4 -o addr show dev lo 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 \\
+        | grep "^\${SUPERNET}\\." | grep -vx 10.255.255.1 | head -1
+}
+while true; do
+    LB="\$(loopback)"
+    if [ -n "\$LB" ]; then
+        for i in ens3 ens4 ens5 ens6; do
+            [ -e "/sys/class/net/\$i" ] || continue
+            [ "\$(cat /sys/class/net/\$i/carrier 2>/dev/null)" = "1" ] || continue
+            # Edge (IP de gestion 192.168.122.x): no tocar.
+            ip -4 -o addr show dev "\$i" 2>/dev/null | grep -q '192\\.168\\.122\\.' && continue
+            # Ya reconciliada si tiene la loopback /32 (se anade junto con OSPF).
+            ip -4 -o addr show dev "\$i" 2>/dev/null | grep -q "\${LB}/32" && continue
+            ip link set "\$i" up 2>/dev/null || true
+            ip addr replace "\${LB}/32" dev "\$i" 2>/dev/null || true
+            sysctl -wq "net.ipv4.conf.\${i}.rp_filter=0" 2>/dev/null || true
+            vtysh -c 'conf t' -c "interface \$i" -c 'ip ospf network point-to-point' -c 'ip ospf area 0' -c 'end' 2>/dev/null || true
+            logger -t fabric-link-watch "carrier nuevo en \$i -> al fabric (loopback \${LB}/32 + OSPF)"
+        done
+    fi
+    sleep 4
+done
+WATCH
+chmod +x /usr/local/bin/fabric-link-watch.sh
+cat > /etc/systemd/system/fabric-link-watch.service <<'UNIT'
+[Unit]
+Description=Watcher de enlaces del fabric L3 (plug-and-play OSPF en cables nuevos)
+After=frr.service
+[Service]
+Restart=always
+RestartSec=5
+ExecStart=/usr/local/bin/fabric-link-watch.sh
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable fabric-link-watch.service 2>/dev/null || true
+systemctl --no-block start fabric-link-watch.service 2>/dev/null || true
+
 # 3b. Edge (solo CP): la interfaz por la que el gateway responde DIRECTO (1 salto).
 edge_iface=""
 if [ "$IS_CP" = yes ] && [ -n "${MGMT_GW:-}" ] && [ -n "${MGMT_IP:-}" ]; then

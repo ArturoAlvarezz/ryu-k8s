@@ -458,19 +458,16 @@ Exporta el `.qcow2` sellado y úsalo como appliance de worker en GNS3.
 4. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN (fuera del fabric).
 5. Enciende los workers. No asignes IP manualmente: `fabric-bootstrap.service` deriva la loopback `/32` única (de `machine-id`), levanta OSPF en cada cable **con carrier**, y luego `k3s-autojoin.service` une el worker con `--node-ip=<loopback>`. El DNS estático (para resolver `get.k3s.io` y los registros de imágenes) lo deja la golden image (`/etc/systemd/resolved.conf.d/fabric-dns.conf`).
 
-> **CARRERA DE CARRIER (importante al añadir nodos a un fabric YA encendido).**
-> `fabric-bootstrap` clasifica como enlaces de fabric solo los `ensX` que tienen
-> **carrier** al arrancar. Si cableas un nodo nuevo a un nodo ya encendido, el puerto
-> del **nodo existente** estaba sin carrier en SU arranque y quedó fuera de OSPF; y si el
-> nodo nuevo arrancó antes de que el cable estuviera listo, le pasa igual. Resultado: el
-> worker arranca, deriva su loopback pero **no forma adyacencia OSPF** → no alcanza el VIP
-> → `k3s-autojoin` se queda esperando. **Fix:** re-ejecuta el bootstrap en **AMBOS
-> extremos** del cable nuevo (es idempotente):
-> ```bash
-> sudo systemctl restart fabric-bootstrap.service   # en el worker nuevo Y en el nodo al que se cableó
-> ```
-> Tras eso, `vtysh -c 'show ip ospf neighbor'` muestra la adyacencia `Full` y el autojoin
-> reintenta solo (o `sudo systemctl restart k3s-autojoin.service`).
+> **PLUG-AND-PLAY (añadir nodos a un fabric YA encendido).** No hace falta ejecutar nada:
+> el servicio **`fabric-link-watch.service`** (que instala `fabric-bootstrap`, corre en
+> TODOS los nodos) reconcilia en continuo — cualquier `ensX` (3-6) que gane **carrier** y
+> no sea el edge entra al fabric solo (loopback `/32` + OSPF, en caliente, ~4s). Así, al
+> cablear un nodo nuevo a un nodo existente, **ambos extremos** detectan el carrier y forman
+> la adyacencia OSPF automáticamente; el nodo nuevo obtiene ruta al VIP y `k3s-autojoin`
+> se une solo (reintenta hasta lograrlo). Solo asegúrate de cablear a `ens3`-`ens6`.
+>
+> Si quisieras forzarlo igualmente, `sudo systemctl restart fabric-bootstrap.service` en el
+> nodo es idempotente, pero **no debería ser necesario**.
 
 Cableado válido mínimo (un worker con un solo enlace de fabric):
 
@@ -766,9 +763,16 @@ ip route get 10.255.255.1                   # ruta al VIP (via un vecino del fab
 ```
 
 **Síntoma típico (autojoin colgado en "Esperando API Server HA…"):** tiene loopback pero
-`show ip ospf neighbor` está **vacío** → es la **carrera de carrier** (§12.2): re-ejecuta
-`sudo systemctl restart fabric-bootstrap.service` en **el worker Y en el nodo al que se
-cableó**. Tras formar adyacencia, comprueba la ruta y el VIP (abajo).
+`show ip ospf neighbor` está **vacío**. Normalmente se resuelve **solo** en ~4s por
+`fabric-link-watch.service` (plug-and-play, §12.2). Si no, comprueba que el watcher corre en
+**ambos extremos** del cable nuevo y que el `ensX` tiene carrier:
+
+```bash
+systemctl is-active fabric-link-watch.service        # debe estar 'active' (en ambos nodos)
+cat /sys/class/net/ens3/carrier                      # 1 = cable arriba
+ip -br -4 addr show ens3                              # debe tener la loopback 10.255.x/32
+journalctl -t fabric-link-watch -n 5 --no-pager
+```
 
 **Si llega al VIP pero el autojoin falla con `status=6` (`curl: couldn't resolve host`):** es
 **DNS** (un worker L3 no tiene DHCP). La golden image deja `/etc/systemd/resolved.conf.d/fabric-dns.conf`;
