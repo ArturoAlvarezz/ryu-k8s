@@ -645,16 +645,22 @@ data:
           }
         },
         {
-          "type": "timeseries",
-          "title": "Eventos de Seguridad (por tipo)",
+          "type": "bargauge",
+          "title": "Eventos de Seguridad por tipo (ventana seleccionada)",
+          "description": "Conteo de eventos por tipo dentro del rango de tiempo del dashboard. max by(type) colapsa las 7 series identicas por nodo (contador Redis cluster-wide replicado en cada pod); increase[$__range] cuenta solo lo ocurrido en la ventana.",
           "gridPos": {"x": 0, "y": 34, "w": 18, "h": 8},
-          "targets": [{"expr": "sum by (type) (rate(ryu_security_events_by_type_total[1m]))", "legendFormat": "{{type}}"}]
+          "targets": [{"expr": "round(max by (type) (increase(ryu_security_events_by_type_total[$__range])))", "legendFormat": "{{type}}", "instant": true}],
+          "fieldConfig": {"defaults": {"min": 0, "unit": "short", "color": {"mode": "palette-classic"}}, "overrides": []},
+          "options": {"orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true, "valueMode": "color", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
         },
         {
           "type": "stat",
-          "title": "Ataques Totales",
+          "title": "Ataques Totales (ventana seleccionada)",
+          "description": "Total de eventos de seguridad en el rango de tiempo del dashboard (p.ej. ultimos 15 min). max(increase[$__range]) evita multiplicar por los 7 nodos que reportan el mismo contador.",
           "gridPos": {"x": 18, "y": 34, "w": 6, "h": 8},
-          "targets": [{"expr": "max(ryu_security_events_total)", "legendFormat": "Eventos detectados"}]
+          "targets": [{"expr": "round(max(increase(ryu_security_events_total[$__range])))", "legendFormat": "Ataques", "instant": true}],
+          "fieldConfig": {"defaults": {"min": 0, "unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 10}]}}, "overrides": []},
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center"}
         },
         {
           "type": "timeseries",
