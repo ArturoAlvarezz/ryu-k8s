@@ -14,7 +14,9 @@ python tools/gns3/ssh_k3s.py "kubectl -n sdn-controller get pods -o wide"
 ssh ubuntu@192.168.122.100   # password: ubuntu
 ```
 
-The API HA VIP is `10.255.255.1` (kube-vip in **BGP** mode, announced into the L3 fabric). It is reachable from **inside** the fabric (i.e. on the nodes), not from the host — that is why all kubectl goes through `ssh_k3s.py` to run on Master-1. The cluster uses `sudo kubectl` unless `~/.kube/config` is configured for the current user.
+The API HA VIP is `10.255.255.1` (kube-vip in **BGP** mode, announced into the L3 fabric — DaemonSet `kube-vip-bgp`). It is reachable from **inside** the fabric (i.e. on the nodes), not from the host — that is why all kubectl goes through `ssh_k3s.py` to run on Master-1. The cluster uses `sudo kubectl` unless `~/.kube/config` is configured for the current user.
+
+**Hybrid VIP:** a second kube-vip in **ARP** mode (DaemonSet `kube-vip`) still fronts the API at `192.168.122.10` over the Mgmt-Switch L2, kept for **host access** (the host can't reach the fabric-internal `10.255.255.1`). Both coexist (distinct IP/interface/lease/port). Cluster agents bootstrap against the BGP VIP; the host reaches the API at `192.168.122.10` and dashboards at `192.168.122.100`. See memory `vip-hibrido-bgp-arp`.
 
 ## Hot Reload (no image rebuild needed)
 
