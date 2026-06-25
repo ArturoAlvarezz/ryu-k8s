@@ -454,9 +454,23 @@ Exporta el `.qcow2` sellado y úsalo como appliance de worker en GNS3.
 
 1. Mantén encendidos los 3 control-plane y activo el VIP del API `10.255.255.1`.
 2. Arrastra la appliance `SDN-Worker` tantas veces como necesites.
-3. Conecta los workers solo a puertos `ens3`-`ens6` de control-planes (o de otros workers como hub). Cada cable es un **enlace L3 punto a punto** del fabric (OSPF *unnumbered*). **No** conectes workers al switch de gestión, al switch básico de GNS3 ni a `NAT1`.
+3. **Cablea ANTES de encender.** Conecta los workers solo a puertos `ens3`-`ens6` de control-planes (o de otros workers como hub). Cada cable es un **enlace L3 punto a punto** del fabric (OSPF *unnumbered*). **No** conectes workers al switch de gestión, al switch básico de GNS3 ni a `NAT1`.
 4. Reserva `ens7`-`ens8` para Smart Meters u otros guests SDN (fuera del fabric).
-5. Enciende los workers. No asignes IP manualmente: `fabric-bootstrap.service` deriva la loopback `/32` única (de `machine-id`), levanta OSPF en cada cable con carrier, y luego `k3s-autojoin.service` une el worker con `--node-ip=<loopback>`.
+5. Enciende los workers. No asignes IP manualmente: `fabric-bootstrap.service` deriva la loopback `/32` única (de `machine-id`), levanta OSPF en cada cable **con carrier**, y luego `k3s-autojoin.service` une el worker con `--node-ip=<loopback>`. El DNS estático (para resolver `get.k3s.io` y los registros de imágenes) lo deja la golden image (`/etc/systemd/resolved.conf.d/fabric-dns.conf`).
+
+> **CARRERA DE CARRIER (importante al añadir nodos a un fabric YA encendido).**
+> `fabric-bootstrap` clasifica como enlaces de fabric solo los `ensX` que tienen
+> **carrier** al arrancar. Si cableas un nodo nuevo a un nodo ya encendido, el puerto
+> del **nodo existente** estaba sin carrier en SU arranque y quedó fuera de OSPF; y si el
+> nodo nuevo arrancó antes de que el cable estuviera listo, le pasa igual. Resultado: el
+> worker arranca, deriva su loopback pero **no forma adyacencia OSPF** → no alcanza el VIP
+> → `k3s-autojoin` se queda esperando. **Fix:** re-ejecuta el bootstrap en **AMBOS
+> extremos** del cable nuevo (es idempotente):
+> ```bash
+> sudo systemctl restart fabric-bootstrap.service   # en el worker nuevo Y en el nodo al que se cableó
+> ```
+> Tras eso, `vtysh -c 'show ip ospf neighbor'` muestra la adyacencia `Full` y el autojoin
+> reintenta solo (o `sudo systemctl restart k3s-autojoin.service`).
 
 Cableado válido mínimo (un worker con un solo enlace de fabric):
 
@@ -747,6 +761,23 @@ Primero, ¿montó el fabric? Sin loopback no hay `--node-ip` ni ruta al VIP:
 ip -br -4 addr show lo                     # loopback 10.255.x/32
 systemctl status fabric-bootstrap.service --no-pager -l
 sudo vtysh -c 'show ip ospf neighbor'      # adyacencias FULL
+sudo vtysh -c 'show ip ospf interface' | grep -E 'ens|UNNUMBERED'   # ens del fabric en OSPF
+ip route get 10.255.255.1                   # ruta al VIP (via un vecino del fabric)
+```
+
+**Síntoma típico (autojoin colgado en "Esperando API Server HA…"):** tiene loopback pero
+`show ip ospf neighbor` está **vacío** → es la **carrera de carrier** (§12.2): re-ejecuta
+`sudo systemctl restart fabric-bootstrap.service` en **el worker Y en el nodo al que se
+cableó**. Tras formar adyacencia, comprueba la ruta y el VIP (abajo).
+
+**Si llega al VIP pero el autojoin falla con `status=6` (`curl: couldn't resolve host`):** es
+**DNS** (un worker L3 no tiene DHCP). La golden image deja `/etc/systemd/resolved.conf.d/fabric-dns.conf`;
+si falta, créalo y reintenta:
+
+```bash
+ping -c2 8.8.8.8 && getent hosts get.k3s.io   # internet OK pero DNS falla?
+printf '[Resolve]\nDNS=8.8.8.8 1.1.1.1\n' | sudo tee /etc/systemd/resolved.conf.d/fabric-dns.conf
+sudo systemctl restart systemd-resolved k3s-autojoin.service
 ```
 
 El endpoint configurado debe ser el VIP del fabric, y el archivo no debe contener el token:

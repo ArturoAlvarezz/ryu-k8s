@@ -10,6 +10,7 @@ set -euo pipefail
 JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-${1:-}}}"
 API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-10.255.255.1}}"
 K3S_VERSION="${RYU_K3S_VERSION:-v1.35.5+k3s1}"
+NODE_DNS="${RYU_K3S_NODE_DNS:-8.8.8.8 1.1.1.1}"
 REPO_DIR="${RYU_K3S_REPO_DIR:-$PWD}"
 SKIP_APT_UPGRADE="${RYU_K3S_SKIP_APT_UPGRADE:-false}"
 
@@ -143,6 +144,19 @@ install_fabric_service() {
   systemctl enable fabric-bootstrap.service
 }
 
+configure_dns() {
+  # Un worker del fabric L3 NO tiene DHCP (ni IP de gestion), asi que systemd-resolved
+  # se queda SIN DNS upstream -> falla resolver get.k3s.io en el auto-join y los pulls de
+  # imagenes de containerd. Fijar un DNS estatico publico via drop-in de resolved.
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat >/etc/systemd/resolved.conf.d/fabric-dns.conf <<EOF
+[Resolve]
+DNS=$NODE_DNS
+FallbackDNS=9.9.9.9
+EOF
+  systemctl enable systemd-resolved 2>/dev/null || true
+}
+
 configure_network_wait() {
   mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d/
   cat >/etc/systemd/system/systemd-networkd-wait-online.service.d/override.conf <<'EOF'
@@ -216,6 +230,7 @@ upgrade_packages
 install_docker
 configure_hostname
 write_l3_netplan
+configure_dns
 install_fabric_service
 configure_network_wait
 configure_forwarding
