@@ -1,54 +1,35 @@
 #!/bin/bash
-# Instala o une un nodo K3s server HA usando embedded etcd y VIP estable.
+# Instala o une un nodo K3s server HA (embedded etcd) sobre el fabric L3.
+#
+# El --node-ip/--advertise-address es la LOOPBACK /32 del fabric (la monta antes
+# fabric-bootstrap.service). flannel va DESHABILITADO (Calico BGP da la CNI) y el
+# VIP del API (10.255.255.1) lo anuncia kube-vip en modo BGP. Requiere que
+# fabric-bootstrap.sh ya haya corrido (loopback presente en lo).
 set -euo pipefail
 
 JOIN_TOKEN="${RYU_K3S_NODE_TOKEN:-${K3S_NODE_TOKEN:-}}"
-API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-192.168.122.10}}"
-FIRST_SERVER_IP="${RYU_K3S_FIRST_SERVER_IP:-${K3S_FIRST_SERVER_IP:-192.168.122.100}}"
+API_ENDPOINT="${RYU_K3S_API_ENDPOINT:-${K3S_API_ENDPOINT:-10.255.255.1}}"
+# Para CPs adicionales: IP del primer server para el join. Por defecto el VIP
+# (ya activo cuando se agrega el 2.o/3.er CP); si el VIP aun no existe, pasar la
+# loopback del primer CP en RYU_K3S_FIRST_SERVER_IP.
+FIRST_SERVER_IP="${RYU_K3S_FIRST_SERVER_IP:-${K3S_FIRST_SERVER_IP:-$API_ENDPOINT}}"
 NODE_IP="${RYU_K3S_NODE_IP:-${K3S_NODE_IP:-}}"
 CLUSTER_INIT="${RYU_K3S_CLUSTER_INIT:-${K3S_CLUSTER_INIT:-false}}"
 NODE_NAME="${RYU_K3S_NODE_NAME:-${K3S_NODE_NAME:-$(hostname)}}"
+FABRIC_SUPERNET="${FABRIC_SUPERNET:-10.255}"
 
-install_br0_forwarding_service() {
-  cat >/usr/local/bin/k3s-br0-forwarding.sh <<'EOF'
-#!/bin/sh
-set -eu
-
-iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || \
-  iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT
-EOF
-  chmod +x /usr/local/bin/k3s-br0-forwarding.sh
-
-  cat >/etc/systemd/system/k3s-iptables.service <<'EOF'
-[Unit]
-Description=Regla iptables de forwarding para br0
-After=network-online.target k3s.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/bin/sleep 5
-ExecStart=/usr/local/bin/k3s-br0-forwarding.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now k3s-iptables.service
-}
-
-if [ -z "$NODE_IP" ] && [ -x /usr/local/bin/configure-br0-tree.sh ]; then
-  /usr/local/bin/configure-br0-tree.sh || true
-fi
-
+# --- Loopback del fabric como node-ip ----------------------------------------
 if [ -z "$NODE_IP" ]; then
-  NODE_IP=$(ip -4 addr show br0 | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
+  for _ in $(seq 1 60); do
+    NODE_IP=$(ip -4 -o addr show dev lo 2>/dev/null \
+      | awk '{print $4}' | cut -d/ -f1 | grep "^${FABRIC_SUPERNET}\." \
+      | grep -vx "10.255.255.1" | head -1 || true)
+    [ -n "$NODE_IP" ] && break
+    sleep 2
+  done
 fi
-
 if [ -z "$NODE_IP" ]; then
-  echo "ERROR: no se pudo detectar RYU_K3S_NODE_IP en br0" >&2
+  echo "ERROR: no aparece la loopback ${FABRIC_SUPERNET}.x en lo. ¿Corrio fabric-bootstrap.service?" >&2
   exit 1
 fi
 
@@ -57,7 +38,9 @@ if [ "$CLUSTER_INIT" != "true" ] && [ -z "$JOIN_TOKEN" ]; then
   exit 1
 fi
 
-COMMON_ARGS="server --node-name=${NODE_NAME} --node-ip=${NODE_IP} --advertise-address=${NODE_IP} --flannel-iface=br0 --tls-san=${API_ENDPOINT} --tls-san=${NODE_IP} --etcd-arg=heartbeat-interval=500 --etcd-arg=election-timeout=5000"
+# Flags identicos al cluster vivo: flannel off (Calico BGP), tls-san al VIP +
+# loopback, etcd holgado para 1 vCPU.
+COMMON_ARGS="server --node-name=${NODE_NAME} --node-ip=${NODE_IP} --advertise-address=${NODE_IP} --flannel-backend=none --disable-network-policy --tls-san=${API_ENDPOINT} --tls-san=${NODE_IP} --etcd-arg=heartbeat-interval=500 --etcd-arg=election-timeout=5000"
 
 if [ "$CLUSTER_INIT" = "true" ]; then
   curl -sfL https://get.k3s.io | \
@@ -83,49 +66,40 @@ else
     sh -
 fi
 
-cat >/usr/local/bin/k3s-gns3-boot-guard.sh <<'EOF'
+# K3s debe arrancar DESPUES de fabric-bootstrap (necesita la loopback como node-ip)
+# y darse un margen tras el boot en GNS3 (1 vCPU) para que OSPF converja.
+cat >/usr/local/bin/k3s-gns3-boot-guard.sh <<EOF
 #!/bin/sh
 set -eu
-
-for _ in $(seq 1 120); do
-  NODE_IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -1)
-  [ -n "${NODE_IP:-}" ] && break
+for _ in \$(seq 1 120); do
+  NODE_IP=\$(ip -4 -o addr show dev lo 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 \
+    | grep "^${FABRIC_SUPERNET}\\." | grep -vx "10.255.255.1" | head -1 || true)
+  [ -n "\${NODE_IP:-}" ] && break
   sleep 2
 done
-
-if [ -z "${NODE_IP:-}" ]; then
-  echo "k3s-gns3-boot-guard: br0 has no IPv4 address" >&2
+if [ -z "\${NODE_IP:-}" ]; then
+  echo "k3s-gns3-boot-guard: sin loopback del fabric en lo" >&2
   exit 1
 fi
-
-UPTIME_SECONDS=$(cut -d. -f1 /proc/uptime)
-BOOT_DELAY=${K3S_BOOT_DELAY_SECONDS:-120}
-if [ "$UPTIME_SECONDS" -lt 600 ] && [ "$BOOT_DELAY" -gt 0 ]; then
-  sleep "$BOOT_DELAY"
+UPTIME_SECONDS=\$(cut -d. -f1 /proc/uptime)
+BOOT_DELAY=\${K3S_BOOT_DELAY_SECONDS:-120}
+if [ "\$UPTIME_SECONDS" -lt 600 ] && [ "\$BOOT_DELAY" -gt 0 ]; then
+  sleep "\$BOOT_DELAY"
 fi
 EOF
 chmod +x /usr/local/bin/k3s-gns3-boot-guard.sh
 
 mkdir -p /etc/systemd/system/k3s.service.d
-if [ -f /etc/systemd/system/gns3-br0-tree.service ]; then
-  cat >/etc/systemd/system/k3s.service.d/10-gns3-boot-guard.conf <<'EOF'
+cat >/etc/systemd/system/k3s.service.d/10-fabric-boot-guard.conf <<'EOF'
 [Unit]
-Requires=gns3-br0-tree.service
-After=gns3-br0-tree.service
+Requires=fabric-bootstrap.service
+After=fabric-bootstrap.service
 
 [Service]
 ExecStartPre=/usr/local/bin/k3s-gns3-boot-guard.sh
 RestartSec=15s
 EOF
-else
-  cat >/etc/systemd/system/k3s.service.d/10-gns3-boot-guard.conf <<'EOF'
-[Service]
-ExecStartPre=/usr/local/bin/k3s-gns3-boot-guard.sh
-RestartSec=15s
-EOF
-fi
 systemctl daemon-reload
-install_br0_forwarding_service
 
 mkdir -p /etc/kubernetes
 ln -sf /etc/rancher/k3s/k3s.yaml /etc/kubernetes/admin.conf
@@ -135,3 +109,8 @@ cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
 cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
 sed -i "s#https://127.0.0.1:6443#https://${API_ENDPOINT}:6443#g; s#https://${NODE_IP}:6443#https://${API_ENDPOINT}:6443#g" /root/.kube/config /home/ubuntu/.kube/config
 chown -R ubuntu:ubuntu /home/ubuntu/.kube
+
+echo "k3s-server-ha-install: $NODE_NAME server listo (node-ip=$NODE_IP, VIP=$API_ENDPOINT)."
+echo "  Tras el PRIMER server: aplica kube-vip BGP y Calico:"
+echo "    sudo ./tools/gns3/deploy-kube-vip.sh all"
+echo "    kubectl apply -f deploy/k8s/l3-fabric/calico-bgp.yaml"

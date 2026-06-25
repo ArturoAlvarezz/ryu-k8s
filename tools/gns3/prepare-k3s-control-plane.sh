@@ -1,28 +1,38 @@
 #!/bin/bash
-# Prepare a GNS3 VM to run as a K3s control-plane node.
+# Prepare a GNS3 VM to run as a K3s control-plane node on the L3 routed fabric.
+#
+# El control-plane arranca en el fabric L3 (FRR/OSPF unnumbered + loopback /32
+# derivada de /etc/machine-id), igual que el worker, SALVO que CONSERVA su IP de
+# gestion 192.168.122.x en la interfaz EDGE hacia el Mgmt-Switch/NAT: por ahi sale
+# a internet, hace NAT del fabric (10.255/16) y origina la default en OSPF. La
+# interfaz edge la DETECTA fabric-bootstrap.sh en runtime (ping directo al gateway);
+# aqui solo se PERSISTE la IP/gw de gestion en /etc/l3-fabric/mgmt.env para que el
+# bootstrap la reclame aunque ya no exista br0/netplan.
 set -euo pipefail
 
 ROLE="${RYU_K3S_CP_ROLE:-${1:-}}"
 NODE_NAME="${RYU_K3S_NODE_NAME:-${K3S_NODE_NAME:-${2:-}}}"
-NODE_IP="${RYU_K3S_NODE_IP:-${K3S_NODE_IP:-${3:-}}}"
-NODE_PREFIX="${RYU_K3S_NODE_PREFIX:-24}"
-NODE_GATEWAY="${RYU_K3S_NODE_GATEWAY:-192.168.122.1}"
-NODE_DNS="${RYU_K3S_NODE_DNS:-8.8.8.8 1.1.1.1}"
-ALL_PORTS="${RYU_K3S_BR0_PORTS:-ens3 ens4 ens5 ens6}"
+MGMT_IP="${RYU_K3S_MGMT_IP:-${RYU_K3S_NODE_IP:-${K3S_NODE_IP:-${3:-}}}}"
+MGMT_PREFIX="${RYU_K3S_MGMT_PREFIX:-24}"
+MGMT_GATEWAY="${RYU_K3S_MGMT_GATEWAY:-192.168.122.1}"
 REPO_DIR="${RYU_K3S_REPO_DIR:-$PWD}"
 SKIP_APT_UPGRADE="${RYU_K3S_SKIP_APT_UPGRADE:-false}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./tools/gns3/prepare-k3s-control-plane.sh first [node-name] [node-ip]
-  sudo ./tools/gns3/prepare-k3s-control-plane.sh additional <node-name> [node-ip]
+  sudo ./tools/gns3/prepare-k3s-control-plane.sh first       [node-name] [mgmt-ip]
+  sudo ./tools/gns3/prepare-k3s-control-plane.sh additional  <node-name> <mgmt-ip>
+
+mgmt-ip = IP de gestion 192.168.122.x del EDGE hacia el Mgmt-Switch/NAT (da internet
+y NAT del fabric). El fabric (loopback /32 + OSPF) se monta solo desde machine-id.
 
 Environment overrides:
-  RYU_K3S_CP_ROLE              first | additional
-  RYU_K3S_NODE_NAME            Hostname to configure
-  RYU_K3S_NODE_IP              Static br0 IP. Required for first, optional for additional
-  RYU_K3S_SKIP_APT_UPGRADE     true to skip apt upgrade
+  RYU_K3S_CP_ROLE        first | additional
+  RYU_K3S_NODE_NAME      Hostname del nodo
+  RYU_K3S_MGMT_IP        IP de gestion del edge (192.168.122.x). first default .100
+  RYU_K3S_MGMT_GATEWAY   Gateway de gestion, default 192.168.122.1
+  RYU_K3S_SKIP_APT_UPGRADE  true para omitir apt upgrade
 EOF
 }
 
@@ -37,11 +47,11 @@ validate_inputs() {
   case "$ROLE" in
     first)
       NODE_NAME="${NODE_NAME:-master}"
-      NODE_IP="${NODE_IP:-192.168.122.100}"
+      MGMT_IP="${MGMT_IP:-192.168.122.100}"
       ;;
     additional)
-      if [ -z "$NODE_NAME" ]; then
-        echo "ERROR: additional control-plane nodes need RYU_K3S_NODE_NAME or argument 2" >&2
+      if [ -z "$NODE_NAME" ] || [ -z "$MGMT_IP" ]; then
+        echo "ERROR: additional necesita node-name y mgmt-ip (192.168.122.x del edge)" >&2
         usage >&2
         exit 1
       fi
@@ -51,6 +61,10 @@ validate_inputs() {
       exit 1
       ;;
   esac
+  if [ ! -f "$REPO_DIR/tools/gns3/l3-fabric/fabric-bootstrap.sh" ]; then
+    echo "ERROR: no encuentro tools/gns3/l3-fabric/fabric-bootstrap.sh bajo RYU_K3S_REPO_DIR=$REPO_DIR" >&2
+    exit 1
+  fi
 }
 
 resize_root_if_possible() {
@@ -65,7 +79,8 @@ resize_root_if_possible() {
 install_base_packages() {
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    ca-certificates curl git net-tools cloud-guest-utils
+    ca-certificates curl git net-tools cloud-guest-utils \
+    frr frr-pythontools iptables
 }
 
 upgrade_packages() {
@@ -100,179 +115,65 @@ configure_hostname() {
   printf '127.0.1.1 %s\n' "$NODE_NAME" >>/etc/hosts
   mkdir -p /etc/cloud/cloud.cfg.d
   printf 'preserve_hostname: true\n' >/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
-  # Evitar que cloud-init regenere /etc/netplan/50-cloud-init.yaml en cada boot.
-  # Si no se deshabilita, cloud-init sobrescribe el netplan del arbol loop-free
-  # con un br0 por defecto (interfaces: [ens3], el uplink al Mgmt-Switch), lo que
-  # tras un corte de energia recrea un loop L2 / tormenta de broadcast.
+  # La red del fabric L3 la gestiona fabric-bootstrap; cloud-init no debe
+  # regenerar netplan ni reintroducir br0.
   printf 'network: {config: disabled}\n' >/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
 }
 
-yaml_list() {
-  printf '['
-  first_item=true
-  for item in $1; do
-    if [ "$first_item" = true ]; then
-      first_item=false
-    else
-      printf ', '
-    fi
-    printf '%s' "$item"
-  done
-  printf ']'
-}
-
-default_active_ports() {
-  case "$NODE_NAME" in
-    master) echo "ens3 ens4 ens5" ;;
-    control-2) echo "ens5 ens6" ;;
-    control-3) echo "ens5" ;;
-    *) echo "ens3" ;;
-  esac
-}
-
-# Prioridad del failover de uplink: solo los control planes de respaldo lo
-# corren. master no (siempre enslava su propio ens3 al Mgmt-Switch via
-# gns3-br0-tree). Vacio = no instalar el daemon.
-uplink_failover_priority() {
-  case "$NODE_NAME" in
-    control-2) echo 1 ;;
-    control-3) echo 2 ;;
-    *) echo "" ;;
-  esac
-}
-
-write_netplan() {
-  dns_list=$(yaml_list "$NODE_DNS")
-  active_ports=${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}
-  port_list=$(yaml_list "$active_ports")
-
-  cat >/etc/netplan/50-cloud-init.yaml <<EOF
+write_l3_netplan() {
+  # ens* como interfaces L3 sueltas (sin br0, sin DHCP). fabric-bootstrap les
+  # asigna la loopback /32 unnumbered y reclama la IP de gestion en el edge.
+  rm -f /etc/netplan/50-cloud-init.yaml
+  cat >/etc/netplan/50-l3-fabric.yaml <<'EOF'
 network:
   version: 2
+  renderer: networkd
   ethernets:
-    ens3:
-      dhcp4: false
+    fabric-ens:
+      match: {name: "ens*"}
       optional: true
-    ens4:
-      dhcp4: false
-      optional: true
-    ens5:
-      dhcp4: false
-      optional: true
-    ens6:
-      dhcp4: false
-      optional: true
-    ens7:
-      dhcp4: false
-      optional: true
-    ens8:
-      dhcp4: false
-      optional: true
-  bridges:
-    br0:
-      interfaces: $port_list
 EOF
-
-  if [ -n "$NODE_IP" ]; then
-    cat >>/etc/netplan/50-cloud-init.yaml <<EOF
-      dhcp4: false
-      addresses:
-        - $NODE_IP/$NODE_PREFIX
-      routes:
-        - to: default
-          via: $NODE_GATEWAY
-      nameservers:
-        addresses: $dns_list
-EOF
-  else
-    cat >>/etc/netplan/50-cloud-init.yaml <<'EOF'
-      dhcp4: true
-      dhcp-identifier: mac
-EOF
-  fi
-
-  cat >>/etc/netplan/50-cloud-init.yaml <<'EOF'
-      parameters:
-        stp: false
-EOF
-  chmod 600 /etc/netplan/50-cloud-init.yaml
-  netplan apply
+  chmod 600 /etc/netplan/50-l3-fabric.yaml
+  netplan generate >/dev/null 2>&1 || true
 }
 
-install_br0_service() {
-  install -m 0755 "$REPO_DIR/tools/gns3/configure-br0-tree.sh" /usr/local/bin/configure-br0-tree.sh
-
-  if [ -n "$NODE_IP" ]; then
-    cat >/etc/default/gns3-br0-tree <<EOF
-NODE_IP=$NODE_IP
-NODE_PREFIX=$NODE_PREFIX
-NODE_GATEWAY=$NODE_GATEWAY
-NODE_DNS=${NODE_DNS%% *}
-ALL_PORTS="$ALL_PORTS"
-ACTIVE_BR0_PORTS="${RYU_K3S_ACTIVE_BR0_PORTS:-$(default_active_ports)}"
-BR0_TREE_APPLIED=1
+persist_mgmt_env() {
+  # fabric-bootstrap deriva MGMT_IP de: br0 (legacy) -> netplan -> este archivo.
+  # En un nodo nuevo sin br0 es la unica fuente: sin el, el CP no reclama su edge
+  # ni su IP de gestion (se queda sin internet / sin VIP del API).
+  mkdir -p /etc/l3-fabric
+  cat >/etc/l3-fabric/mgmt.env <<EOF
+MGMT_IP=${MGMT_IP}/${MGMT_PREFIX}
+MGMT_GW=${MGMT_GATEWAY}
 EOF
-  else
-    rm -f /etc/default/gns3-br0-tree
-  fi
-
-  cat >/etc/systemd/system/gns3-br0-tree.service <<'EOF'
-[Unit]
-Description=Configurar br0 de gestion GNS3 sin STP
-DefaultDependencies=no
-After=systemd-udev-settle.service systemd-networkd.service
-Before=network-online.target k3s.service
-Wants=systemd-udev-settle.service systemd-networkd.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/configure-br0-tree.sh
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now gns3-br0-tree.service
+  chmod 600 /etc/l3-fabric/mgmt.env
 }
 
-install_uplink_failover_service() {
-  priority=$(uplink_failover_priority)
-  if [ -z "$priority" ]; then
-    # master (u otro nodo): no corre el failover. Asegurar que no quede activo.
-    systemctl disable --now uplink-failover.service 2>/dev/null || true
-    rm -f /etc/systemd/system/uplink-failover.service /etc/default/uplink-failover \
-          /etc/systemd/network/05-uplink-ens3-unmanaged.network
-    return 0
+install_fabric_service() {
+  install -m 0755 "$REPO_DIR/tools/gns3/l3-fabric/fabric-bootstrap.sh" \
+    /usr/local/bin/fabric-bootstrap.sh
+  install -m 0644 "$REPO_DIR/tools/gns3/l3-fabric/fabric-bootstrap.service" \
+    /etc/systemd/system/fabric-bootstrap.service
+
+  # Erradicar el plano L2 antiguo si la imagen base lo trae.
+  systemctl disable --now gns3-br0-tree.service uplink-failover.service \
+    worker-mgmt-failover.service 2>/dev/null || true
+  rm -f /etc/systemd/system/gns3-br0-tree.service \
+        /etc/systemd/system/uplink-failover.service \
+        /etc/systemd/system/worker-mgmt-failover.service \
+        /etc/default/gns3-br0-tree /etc/default/uplink-failover \
+        /etc/default/worker-mgmt-failover \
+        /etc/systemd/network/05-uplink-ens3-unmanaged.network \
+        /etc/systemd/system/k3s-iptables.service \
+        /usr/local/bin/k3s-br0-forwarding.sh
+  if [ -f /usr/local/bin/configure-br0-tree.sh ]; then
+    printf '#!/bin/bash\n# L3-FABRIC-NEUTRALIZED.\nexit 0\n' >/usr/local/bin/configure-br0-tree.sh
+    chmod +x /usr/local/bin/configure-br0-tree.sh
   fi
 
-  install -m 0755 "$REPO_DIR/tools/gns3/uplink-failover.sh" /usr/local/bin/uplink-failover.sh
-  cat >/etc/default/uplink-failover <<EOF
-UPLINK_PORT=ens3
-MASTER_IP=192.168.122.100
-GATEWAY=$NODE_GATEWAY
-PRIORITY=$priority
-EOF
-
-  # El uplink ens3 (hacia el Mgmt-STP-Switch) queda bajo control exclusivo del
-  # daemon; networkd no debe gestionarlo para que el enslave/nomaster persista.
-  mkdir -p /etc/systemd/network
-  cat >/etc/systemd/network/05-uplink-ens3-unmanaged.network <<'EOF'
-[Match]
-Name=ens3
-
-[Link]
-Unmanaged=yes
-EOF
-
-  install -m 0644 "$REPO_DIR/tools/gns3/uplink-failover.service" \
-    /etc/systemd/system/uplink-failover.service
-  networkctl reload 2>/dev/null || true
   systemctl daemon-reload
-  systemctl enable --now uplink-failover.service
+  systemctl enable frr.service 2>/dev/null || true
+  systemctl enable fabric-bootstrap.service
 }
 
 configure_network_wait() {
@@ -286,44 +187,15 @@ EOF
 }
 
 configure_forwarding() {
+  # fabric-bootstrap reafirma rp_filter=0, ip_forward, el ACCEPT de transito y el
+  # MASQUERADE del edge en runtime. Aqui solo base de k8s + bridge para docker.
   cat >/etc/sysctl.d/99-sdn.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.bridge.bridge-nf-call-iptables=1
 net.bridge.bridge-nf-call-ip6tables=1
 EOF
-  sysctl --system
-
-  cat >/usr/local/bin/k3s-br0-forwarding.sh <<'EOF'
-#!/bin/sh
-set -eu
-
-iptables -C FORWARD -i br0 -o br0 -j ACCEPT 2>/dev/null || \
-  iptables -I FORWARD 1 -i br0 -o br0 -j ACCEPT
-iptables -C FORWARD -i ens3 -j ACCEPT 2>/dev/null || \
-  iptables -I FORWARD 1 -i ens3 -j ACCEPT
-iptables -C FORWARD -o ens3 -j ACCEPT 2>/dev/null || \
-  iptables -I FORWARD 1 -o ens3 -j ACCEPT
-EOF
-  chmod +x /usr/local/bin/k3s-br0-forwarding.sh
-
-  cat >/etc/systemd/system/k3s-iptables.service <<'EOF'
-[Unit]
-Description=Reglas iptables para SDN/K3s
-After=network-online.target k3s.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=/bin/sleep 1
-ExecStart=/usr/local/bin/k3s-br0-forwarding.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now k3s-iptables.service
+  modprobe br_netfilter 2>/dev/null || true
+  sysctl --system || true
 }
 
 require_root
@@ -333,10 +205,12 @@ resize_root_if_possible
 upgrade_packages
 install_docker
 configure_hostname
-write_netplan
-install_br0_service
-install_uplink_failover_service
+write_l3_netplan
+persist_mgmt_env
+install_fabric_service
 configure_network_wait
 configure_forwarding
 
-echo "prepare-k3s-control-plane: $NODE_NAME ready; br0=$(ip -4 addr show br0 | awk '/inet / {print $2}' | head -1)"
+echo "prepare-k3s-control-plane: $NODE_NAME listo (fabric L3, mgmt=$MGMT_IP/$MGMT_PREFIX)."
+echo "  Siguiente: reinicia (o arranca fabric-bootstrap) y luego instala K3s server"
+echo "  con tools/gns3/k3s-server-ha-install.sh (usa la loopback del fabric)."
